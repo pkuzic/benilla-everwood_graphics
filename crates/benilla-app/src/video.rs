@@ -39,6 +39,15 @@ pub(crate) fn requested_window_size() -> Option<UVec2> {
     Some(UVec2::new(w.parse().ok()?, h.parse().ok()?))
 }
 
+// MONKEY (second screen): `$WOW_WINPOS=X,Y` in physical px of the whole desktop (a value past the
+// primary's edge lands on another monitor). The window is BORN there, so a test client never opens
+// on the player's main screen first and is then moved off it; the probe park leaves it alone.
+pub(crate) fn requested_window_pos() -> Option<IVec2> {
+    let v = std::env::var("WOW_WINPOS").ok()?;
+    let (x, y) = v.split_once(',')?;
+    Some(IVec2::new(x.trim().parse().ok()?, y.trim().parse().ok()?))
+}
+
 /// `$WOW_DPI=<f32>`: render at another display's pixel grid, since text rasterizing and snapping
 /// quantize in device pixels. It overrides the window's scale factor, so `WOW_WIN` then means
 /// physical pixels and a capture is the framebuffer that display would show.

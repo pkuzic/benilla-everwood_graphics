@@ -414,6 +414,9 @@ fn launch(build: BuildId, extend: Option<Extension<'_>>) -> AppExit {
         // frame cost, not the vsync ceiling; otherwise the player's `gxVSync` takes over from
         // `Startup` ([`crate::video`]).
         present_mode: video::present_mode(!video::novsync_env()),
+        // MONKEY (second screen): `$WOW_WINPOS` births the window on another monitor.
+        position: video::requested_window_pos()
+            .map_or(bevy::window::WindowPosition::Automatic, bevy::window::WindowPosition::At),
         // A background run opens unfocused, so it cannot take keystrokes meant for another app, and
         // is born `AlwaysOnBottom` (`kCGNormalWindowLevel - 1`), so winit's two raises before the
         // first frame cannot flash it on top. `BgWinPlugin` promotes it to Normal once the launch
