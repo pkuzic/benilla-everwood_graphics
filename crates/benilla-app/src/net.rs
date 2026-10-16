@@ -26,6 +26,10 @@ mod motion;
 mod objects;
 pub(crate) use objects::tear_down;
 mod session;
+// MONKEY (voxel): P1b multiplayer terrain-edit relay over a hidden chat channel, behind the
+// `voxel` feature (off by default), so the shipped player build is byte-unchanged.
+#[cfg(feature = "voxel")]
+pub(crate) mod voxel_relay;
 mod world;
 
 pub(crate) use apply::apply_net_updates;
@@ -80,6 +84,9 @@ impl Plugin for NetPlugin {
         session::register(app);
         objects::register(app);
         crate::names::net::register(app);
+        // MONKEY (voxel): the P1b terrain-edit relay (join channel, send outbox, decode inbox).
+        #[cfg(feature = "voxel")]
+        voxel_relay::register(app);
         app.insert_resource(NetEvents(handles.events))
             .insert_resource(NetCommands(handles.commands))
             .insert_resource(CharPick(handles.pick))

@@ -58,12 +58,114 @@ pub struct MonkeyVoxelVolume;
 #[derive(Component)]
 pub struct MonkeyVoxelData(pub benilla_voxel::VoxelVolume);
 
+/// One terrain edit, in the volume's LOCAL voxel coords, for multiplayer relay. Every client starts
+/// from the same base slab, so applying the same local-coord edit reproduces the same shape — the
+/// deformation syncs even though each client's patch sits at its own world position.
+#[derive(Clone, Copy, Debug)]
+pub struct MonkeyVoxelEdit {
+    pub center: [f32; 3],
+    pub radius: f32,
+    /// 0 = carve, 1 = build, 2 = smooth.
+    pub mode: u8,
+}
+
+/// Cross-crate mailbox between the voxel brush (benilla-world) and the chat-channel relay
+/// (benilla-app, behind the `voxel` feature): local edits to broadcast go in `outbox`; edits
+/// received from other players land in `inbox`. benilla-app drains the outbox and sends each as a
+/// `MonkeyVoxel` channel message, and pushes decoded remote edits into the inbox.
+#[derive(Resource, Default)]
+pub struct MonkeyVoxelNet {
+    pub outbox: Vec<MonkeyVoxelEdit>,
+    pub inbox: Vec<MonkeyVoxelEdit>,
+}
+
+impl MonkeyVoxelEdit {
+    /// Encode to hex for a chat-channel payload (center 3×f32 LE, radius f32 LE, mode u8 → 34 hex).
+    pub fn to_hex(&self) -> String {
+        let mut b = Vec::with_capacity(17);
+        for v in self.center {
+            b.extend_from_slice(&v.to_le_bytes());
+        }
+        b.extend_from_slice(&self.radius.to_le_bytes());
+        b.push(self.mode);
+        b.iter().map(|x| format!("{x:02x}")).collect()
+    }
+
+    /// Decode from the hex payload; `None` if malformed.
+    pub fn from_hex(s: &str) -> Option<Self> {
+        if s.len() != 34 {
+            return None;
+        }
+        let b: Vec<u8> = (0..17)
+            .map(|i| u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).ok())
+            .collect::<Option<Vec<u8>>>()?;
+        let f = |o: usize| f32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
+        Some(Self {
+            center: [f(0), f(4), f(8)],
+            radius: f(12),
+            mode: b[16],
+        })
+    }
+
+    fn as_bytes(&self) -> [u8; 17] {
+        let mut b = [0u8; 17];
+        b[0..4].copy_from_slice(&self.center[0].to_le_bytes());
+        b[4..8].copy_from_slice(&self.center[1].to_le_bytes());
+        b[8..12].copy_from_slice(&self.center[2].to_le_bytes());
+        b[12..16].copy_from_slice(&self.radius.to_le_bytes());
+        b[16] = self.mode;
+        b
+    }
+}
+
+/// Persistence: every applied edit is appended to a journal file so terraforming survives relog.
+/// Lives under `$BENILLA_HOME` (the profile dir) so it travels with the account; falls back to CWD.
+fn monkey_voxel_journal_path() -> std::path::PathBuf {
+    std::env::var_os("BENILLA_HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join("monkey_voxel_journal.bin")
+}
+
+/// Append one edit (17 bytes) to the journal. Cheap; the brush can call it per stroke-frame.
+fn monkey_voxel_journal_append(edit: &MonkeyVoxelEdit) {
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(monkey_voxel_journal_path())
+    {
+        let _ = f.write_all(&edit.as_bytes());
+    }
+}
+
+/// Load all journalled edits to replay onto the base slab at spawn (so prior terraforming returns).
+fn monkey_voxel_journal_load() -> Vec<MonkeyVoxelEdit> {
+    let Ok(bytes) = std::fs::read(monkey_voxel_journal_path()) else {
+        return Vec::new();
+    };
+    bytes
+        .chunks_exact(17)
+        .filter_map(|c| MonkeyVoxelEdit::from_hex(&c.iter().map(|x| format!("{x:02x}")).collect::<String>()))
+        .collect()
+}
+
+/// Apply an edit to a volume by its `mode` code. Returns whether anything changed.
+fn monkey_voxel_apply_one(v: &mut benilla_voxel::VoxelVolume, e: &MonkeyVoxelEdit) -> bool {
+    match e.mode {
+        2 => v.smooth_sphere(e.center, e.radius, 0.5),
+        1 => v.edit_sphere(e.center, e.radius, BrushMode::Add),
+        _ => v.edit_sphere(e.center, e.radius, BrushMode::Subtract),
+    }
+}
+
 /// P0 render: spawn one static voxel volume in front of the player, once a world is live.
 pub struct MonkeyVoxelPlugin;
 
 impl Plugin for MonkeyVoxelPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<MonkeyVoxelBrushRadius>();
+        app.init_resource::<MonkeyVoxelNet>();
         // Spawn once, in front of the camera, so it is guaranteed on-screen on any login — gated on
         // a live world (a `WorldCamera` with a real pose) and a `Local` one-shot latch.
         app.add_systems(
@@ -72,6 +174,7 @@ impl Plugin for MonkeyVoxelPlugin {
                 spawn_monkey_voxel_volume,
                 monkey_voxel_capture_follow,
                 monkey_voxel_brush_edit,
+                monkey_voxel_apply_remote,
                 monkey_voxel_capture_demo_edit,
             )
                 .run_if(crate::schedule::world_is_live),
@@ -137,8 +240,16 @@ fn spawn_monkey_voxel_volume(
         return; // ~0.5 s of a still camera
     }
 
-    // Build the terraform sandbox: a multi-chunk flat-topped ground patch (slab) → combined mesh.
-    let volume = benilla_voxel::VoxelVolume::slab(VOL_CHUNKS, VOL_SURFACE);
+    // Build the terraform sandbox: a multi-chunk flat-topped ground patch (slab) → combined mesh,
+    // then replay the edit journal so prior terraforming returns after a relog (persistence).
+    let mut volume = benilla_voxel::VoxelVolume::slab(VOL_CHUNKS, VOL_SURFACE);
+    let saved = monkey_voxel_journal_load();
+    for e in &saved {
+        monkey_voxel_apply_one(&mut volume, e);
+    }
+    if !saved.is_empty() {
+        info!("MONKEY (voxel): replayed {} journalled edit(s)", saved.len());
+    }
     let voxel_mesh = volume.mesh();
     let tri_count = voxel_mesh.tri_count();
     let vert_count = voxel_mesh.positions.len();
@@ -222,6 +333,7 @@ fn monkey_voxel_brush_edit(
     mut meshes: ResMut<Assets<Mesh>>,
     camera: Query<&GlobalTransform, With<WorldCamera>>,
     mut volume: Query<(&mut MonkeyVoxelData, &Mesh3d, &Transform), With<MonkeyVoxelVolume>>,
+    mut net: ResMut<MonkeyVoxelNet>,
 ) {
     // Brush size: `-` shrinks, `=` grows (clamped 1..14 voxels).
     if keys.just_pressed(KeyCode::Minus) {
@@ -258,7 +370,43 @@ fn monkey_voxel_brush_edit(
         m => data.0.edit_sphere(local, r, m),
     };
     if changed {
+        let mode_code = match mode {
+            BrushMode::Subtract => 0,
+            BrushMode::Add => 1,
+            BrushMode::Smooth => 2,
+        };
+        let edit = MonkeyVoxelEdit { center: local, radius: r, mode: mode_code };
+        monkey_voxel_journal_append(&edit); // persist (survives relog)
+        net.outbox.push(edit); // broadcast to other players (net relay drains the outbox)
         // insert returns a prior-asset Result we don't need; the handle stays the same.
+        let _ = meshes.insert(&mesh3d.0, monkey_voxel_mesh_to_bevy(&data.0.mesh()));
+    }
+}
+
+/// Apply edits received from other players (the net relay fills the inbox) to the local volume and
+/// re-mesh. Because every client's base slab is identical and edits are in local voxel coords, this
+/// reproduces the same deformation the sender made.
+fn monkey_voxel_apply_remote(
+    mut net: ResMut<MonkeyVoxelNet>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut volume: Query<(&mut MonkeyVoxelData, &Mesh3d), With<MonkeyVoxelVolume>>,
+) {
+    if net.inbox.is_empty() {
+        return;
+    }
+    let Ok((mut data, mesh3d)) = volume.single_mut() else {
+        net.inbox.clear();
+        return;
+    };
+    let edits: Vec<MonkeyVoxelEdit> = net.inbox.drain(..).collect();
+    let mut changed = false;
+    for e in edits {
+        if monkey_voxel_apply_one(&mut data.0, &e) {
+            monkey_voxel_journal_append(&e); // persist remote edits too
+            changed = true;
+        }
+    }
+    if changed {
         let _ = meshes.insert(&mesh3d.0, monkey_voxel_mesh_to_bevy(&data.0.mesh()));
     }
 }
@@ -293,6 +441,18 @@ fn monkey_voxel_capture_demo_edit(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn monkey_voxel_edit_hex_roundtrips() {
+        let e = MonkeyVoxelEdit { center: [13.5, 16.0, 22.25], radius: 4.0, mode: 1 };
+        let hex = e.to_hex();
+        assert_eq!(hex.len(), 34, "17 bytes = 34 hex chars");
+        let d = MonkeyVoxelEdit::from_hex(&hex).expect("decode");
+        assert_eq!(d.center, e.center);
+        assert_eq!(d.radius, e.radius);
+        assert_eq!(d.mode, e.mode);
+        assert!(MonkeyVoxelEdit::from_hex("short").is_none(), "malformed rejected");
+    }
 
     #[test]
     fn voxel_mesh_converts_with_matching_counts() {
