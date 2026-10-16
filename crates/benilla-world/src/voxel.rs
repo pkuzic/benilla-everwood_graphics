@@ -175,6 +175,7 @@ impl Plugin for MonkeyVoxelPlugin {
                 monkey_voxel_capture_follow,
                 monkey_voxel_brush_edit,
                 monkey_voxel_apply_remote,
+                monkey_voxel_autoedit,
                 monkey_voxel_capture_demo_edit,
             )
                 .run_if(crate::schedule::world_is_live),
@@ -395,10 +396,19 @@ fn monkey_voxel_apply_remote(
         return;
     }
     let Ok((mut data, mesh3d)) = volume.single_mut() else {
-        net.inbox.clear();
+        // The volume hasn't spawned yet (a remote edit can arrive before our own patch settles).
+        // KEEP the inbox buffered so those edits apply the moment the volume exists, rather than
+        // dropping them — the race the 2-client test caught. Cap it so an idle pre-world client
+        // can't grow it without bound.
+        const MAX_BUFFERED: usize = 8192;
+        if net.inbox.len() > MAX_BUFFERED {
+            let overflow = net.inbox.len() - MAX_BUFFERED;
+            net.inbox.drain(0..overflow);
+        }
         return;
     };
     let edits: Vec<MonkeyVoxelEdit> = net.inbox.drain(..).collect();
+    let n = edits.len();
     let mut changed = false;
     for e in edits {
         if monkey_voxel_apply_one(&mut data.0, &e) {
@@ -407,8 +417,41 @@ fn monkey_voxel_apply_remote(
         }
     }
     if changed {
+        info!("MONKEY (voxel): applied {n} remote edit(s) from other players");
         let _ = meshes.insert(&mesh3d.0, monkey_voxel_mesh_to_bevy(&data.0.mesh()));
     }
+}
+
+/// Test/dev hook: when `$WOW_VOXEL_AUTOEDIT` is set, make one build edit ~8 s after the patch
+/// spawns, through the SAME path as the brush (apply locally + journal + push to the outbox so it
+/// broadcasts). Lets a headless client exercise the multiplayer relay without keyboard input. No-op
+/// unless the env var is present.
+fn monkey_voxel_autoedit(
+    mut done: Local<bool>,
+    mut elapsed: Local<f32>,
+    time: Res<Time>,
+    mut net: ResMut<MonkeyVoxelNet>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut volume: Query<(&mut MonkeyVoxelData, &Mesh3d), With<MonkeyVoxelVolume>>,
+) {
+    if *done || std::env::var_os("WOW_VOXEL_AUTOEDIT").is_none() {
+        return;
+    }
+    *elapsed += time.delta_secs();
+    if *elapsed < 8.0 {
+        return; // let the world settle and the channel join land first
+    }
+    let Ok((mut data, mesh3d)) = volume.single_mut() else {
+        return;
+    };
+    let edit = MonkeyVoxelEdit { center: [33.0, 20.0, 33.0], radius: 8.0, mode: 1 };
+    if monkey_voxel_apply_one(&mut data.0, &edit) {
+        monkey_voxel_journal_append(&edit);
+        net.outbox.push(edit); // broadcast to other players
+        let _ = meshes.insert(&mesh3d.0, monkey_voxel_mesh_to_bevy(&data.0.mesh()));
+        info!("MONKEY (voxel): AUTOEDIT fired — broadcast a build mound");
+    }
+    *done = true;
 }
 
 /// Capture-only proof that the edit → re-mesh → render chain works headlessly: once the volume

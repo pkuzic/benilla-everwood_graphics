@@ -131,12 +131,9 @@ fn chat(
     net_commands: &NetCommands,
     server_said: &mut MessageWriter<ServerSaidMessage>,
 ) {
-    // MONKEY (voxel): the P1b terrain-edit relay rides a hidden channel; its lines are consumed by
-    // `net::voxel_relay` and must never render in the visible chat log.
-    #[cfg(feature = "voxel")]
-    if m.channel.as_deref() == Some(crate::net::voxel_relay::MONKEY_VOXEL_CHANNEL) {
-        return;
-    }
+    // MONKEY (voxel): the P1b terrain-edit relay rides *guild addon* messages (`MV:<hex>`), which
+    // `net::voxel_relay` consumes. They are addon traffic, so the `m.is_addon()` branch below
+    // already keeps them out of the visible chat log — no voxel-specific suppression needed here.
     // Addon traffic: 1.12 has no addon opcode or chat type, so `LANG_ADDON` on any lane is the
     // whole test (`0x49a89e`, in the display function `0x49a870`). The line never renders
     // (`0x49a970`); it fires `CHAT_MSG_ADDON` once the sender's name resolves (`0x49d7ba`,
