@@ -15,6 +15,7 @@ use bevy::prelude::*;
 
 use crate::view::WorldCamera;
 use benilla_assets::coords::bevy_to_wow;
+use benilla_voxel::BrushMode;
 
 /// Converts the engine-neutral [`benilla_voxel::VoxelMesh`] (triangle list; `[f32; 3]`
 /// positions/normals already scaled to world yards local to the chunk origin) into a Bevy [`Mesh`].
@@ -37,6 +38,11 @@ pub fn monkey_voxel_mesh_to_bevy(vm: &benilla_voxel::VoxelMesh) -> Mesh {
 #[derive(Component)]
 pub struct MonkeyVoxelVolume;
 
+/// Keeps the volume's editable density field on the entity so the P1 brush can mutate it and
+/// re-mesh live. The chunk origin is the entity's `Transform.translation` (world yards).
+#[derive(Component)]
+pub struct MonkeyVoxelChunk(pub benilla_voxel::Chunk);
+
 /// P0 render: spawn one static voxel torus in front of the player, once a world is live.
 pub struct MonkeyVoxelPlugin;
 
@@ -46,7 +52,12 @@ impl Plugin for MonkeyVoxelPlugin {
         // a live world (a `WorldCamera` with a real pose) and a `Local` one-shot latch.
         app.add_systems(
             Update,
-            (spawn_monkey_voxel_torus, monkey_voxel_capture_follow)
+            (
+                spawn_monkey_voxel_torus,
+                monkey_voxel_capture_follow,
+                monkey_voxel_brush_edit,
+                monkey_voxel_capture_demo_edit,
+            )
                 .run_if(crate::schedule::world_is_live),
         );
     }
@@ -103,6 +114,7 @@ fn spawn_monkey_voxel_torus(
         MeshMaterial3d(material),
         Transform::from_translation(origin),
         MonkeyVoxelVolume,
+        MonkeyVoxelChunk(chunk),
         Name::new("MONKEY voxel torus (P0)"),
     ));
 
@@ -135,6 +147,61 @@ fn monkey_voxel_capture_follow(
     };
     let centre = cam.translation() + *cam.forward() * SPAWN_AHEAD_YARDS;
     tf.translation = centre - Vec3::splat(TORUS_LOCAL_CENTRE);
+}
+
+/// P1 local voxel brush (dev/GM): hold **`[`** to carve, **`]`** to build, aimed at the voxel volume
+/// along your view. Mutates the chunk's density field and re-meshes live. Client-only for now —
+/// server authority, GM-gating and multiplayer sync arrive in P1b (`DESIGN-VoxelTerrain.md`).
+fn monkey_voxel_brush_edit(
+    keys: Res<ButtonInput<KeyCode>>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    camera: Query<&GlobalTransform, With<WorldCamera>>,
+    mut volume: Query<(&mut MonkeyVoxelChunk, &Mesh3d, &Transform), With<MonkeyVoxelVolume>>,
+) {
+    let mode = if keys.pressed(KeyCode::BracketLeft) {
+        BrushMode::Subtract
+    } else if keys.pressed(KeyCode::BracketRight) {
+        BrushMode::Add
+    } else {
+        return;
+    };
+    let (Ok(cam), Ok((mut chunk, mesh3d, tf))) = (camera.single(), volume.single_mut()) else {
+        return;
+    };
+
+    // Aim the brush at the volume's depth along the view ray, so looking at the volume always lands
+    // on it and turning your view sweeps the brush across its face.
+    let vol_centre = tf.translation + Vec3::splat(TORUS_LOCAL_CENTRE);
+    let dist = (vol_centre - cam.translation()).length();
+    let world = cam.translation() + *cam.forward() * dist;
+    let local = (world - tf.translation) / benilla_voxel::VOXEL_SIZE;
+
+    const BRUSH_RADIUS_VOXELS: f32 = 4.0; // ~2 yd
+    if chunk.0.edit_sphere(local.to_array(), BRUSH_RADIUS_VOXELS, mode) {
+        // insert returns a prior-asset Result we don't need; the handle stays the same.
+        let _ = meshes.insert(&mesh3d.0, monkey_voxel_mesh_to_bevy(&chunk.0.mesh()));
+    }
+}
+
+/// Capture-only proof that the edit → re-mesh → render chain works headlessly: once the volume
+/// exists, carve two bites out of the torus so the baseline screenshot shows a *deformed* volume.
+/// No-op in live play (env unset) — there the brush drives edits.
+fn monkey_voxel_capture_demo_edit(
+    mut done: Local<bool>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut volume: Query<(&mut MonkeyVoxelChunk, &Mesh3d), With<MonkeyVoxelVolume>>,
+) {
+    if *done || std::env::var_os("WOW_CAPTURE").is_none() {
+        return;
+    }
+    let Ok((mut chunk, mesh3d)) = volume.single_mut() else {
+        return;
+    };
+    // Two holes on the ring (local voxel coords on the tube: centre [17,17,17], major radius 10).
+    chunk.0.edit_sphere([27.0, 17.0, 17.0], 5.0, BrushMode::Subtract);
+    chunk.0.edit_sphere([17.0, 27.0, 17.0], 4.0, BrushMode::Subtract);
+    let _ = meshes.insert(&mesh3d.0, monkey_voxel_mesh_to_bevy(&chunk.0.mesh()));
+    *done = true;
 }
 
 #[cfg(test)]
