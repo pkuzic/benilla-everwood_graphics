@@ -183,5 +183,25 @@ compaction bakes the journal into a new base snapshot to cap replay cost.
 
 ---
 
-*Next: P0 — stand up the `benilla-voxel` format + `benilla-world` mesher behind a feature, render one
-static volume. No gameplay/server work until the renderer is proven.*
+## P0 — DONE (2026-10-16)
+
+The renderer is proven: a `benilla-voxel` SDF → surface-nets `VoxelMesh` → Bevy mesh renders in-engine.
+
+**Run it live (GPU box):**
+```
+CARGO_TARGET_DIR=G:\mangos\disposable\voxel-target cargo run -p benilla --features voxel
+```
+Enter the world with a character; a bright voxel **torus** spawns ~22 yd in front of the camera on
+the first live frame and stays fixed in the world. Its WoW coords are logged (`MONKEY (voxel):
+spawned P0 torus …`). The `voxel` feature is **off by default**, so the normal client is unchanged.
+
+**Offline screenshot (server-less capture):**
+```
+WOW_DATA=G:/tw_experiment/beverwood/Data BENILLA_HOME=<scratch> \
+WOW_CAPTURE=felwood-noon WOW_CAPTURE_OUT=<out>.png \
+  <voxel-target>/debug/benilla.exe
+```
+Scenes: `WOW_CAPTURE=list` (felwood-noon/-night, water-noon/-night). In capture the scenario camera
+settles after the one-shot spawn, so a capture-only system keeps the torus framed (no-op in live play).
+
+*Next: P1 — in-game GM brush + server-authoritative edit-op sync over MonkeyNet.*

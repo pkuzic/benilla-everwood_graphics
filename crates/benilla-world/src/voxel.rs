@@ -46,7 +46,8 @@ impl Plugin for MonkeyVoxelPlugin {
         // a live world (a `WorldCamera` with a real pose) and a `Local` one-shot latch.
         app.add_systems(
             Update,
-            spawn_monkey_voxel_torus.run_if(crate::schedule::world_is_live),
+            (spawn_monkey_voxel_torus, monkey_voxel_capture_follow)
+                .run_if(crate::schedule::world_is_live),
         );
     }
 }
@@ -115,6 +116,25 @@ fn spawn_monkey_voxel_torus(
         wow[2],
     );
     *done = true;
+}
+
+/// Capture-only framing aid. In `$WOW_CAPTURE` mode the scenario camera settles to its framing a
+/// few frames AFTER the one-shot spawn, which would leave the torus off-screen (both baselines log
+/// the identical spawn centre yet frame differently). While capturing, keep the torus glued ~22 yd
+/// in front of the CURRENT camera so the shot always frames it. In a live session the env is unset,
+/// so this is a no-op and the spawned torus stays fixed in the world as intended.
+fn monkey_voxel_capture_follow(
+    camera: Query<&GlobalTransform, With<WorldCamera>>,
+    mut volume: Query<&mut Transform, With<MonkeyVoxelVolume>>,
+) {
+    if std::env::var_os("WOW_CAPTURE").is_none() {
+        return;
+    }
+    let (Ok(cam), Ok(mut tf)) = (camera.single(), volume.single_mut()) else {
+        return;
+    };
+    let centre = cam.translation() + *cam.forward() * SPAWN_AHEAD_YARDS;
+    tf.translation = centre - Vec3::splat(TORUS_LOCAL_CENTRE);
 }
 
 #[cfg(test)]
