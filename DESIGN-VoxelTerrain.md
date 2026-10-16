@@ -1,6 +1,6 @@
 # DESIGN — Voxel Terrain (Everwood)
 
-**Status:** design / not started · **Branch:** `everwood-voxel_terrain` (this repo, `pkuzic/benilla-everwood_graphics`)
+**Status:** design settled / ready for P0 · **Branch:** `everwood-voxel_terrain` (this repo, `pkuzic/benilla-everwood_graphics`)
 **Decided 2026-10-16:** Option **C** (voxel / SDF) for live networked terraforming. Editor is a benilla
 mod, **voxel-first**, NOT a Noggit rewrite.
 
@@ -37,9 +37,13 @@ collision, navmesh, streaming, persistence, memory — to just those volumes.
   stored as `i8`/`i16` fixed-point for determinism and compactness.
 - **Material:** per-voxel material id (which ground texture / splat set the surface uses). Triplanar
   texturing (no UVs) because voxel surfaces aren't a heightmap.
-- **Meshing:** **surface nets / dual contouring** for the body (smooth, few verts), moving to
-  **transvoxel** at LOD boundaries so chunk LOD levels stitch without cracks. Candidate crates:
-  `fast-surface-nets`, `block-mesh`, or a vendored transvoxel — evaluate in P0.
+- **Resolution (settled):** **0.5 yd voxels, 32³ chunks** (= 16 yd chunks). Beats native heightmap
+  (~4.17 yd) by ~8×; ~8 MB dense per 100×100×50 yd volume (sparse/near-surface storage cuts that).
+  Voxel size is **sticky** (baked into stored data) — confirm with a P0 benchmark before mass use.
+- **Meshing (settled):** **`fast-surface-nets`** for the body (smooth, few verts, deterministic),
+  moving to **transvoxel** at LOD boundaries in P4 so chunk LOD levels stitch without cracks. The
+  mesher sits behind the density field, so it is swappable with zero content cost — **dual contouring
+  is a potential later test** if crisp sharp edges (cliff lips) become a must.
 - Meshing is **deterministic**: same density field → same mesh, so the client (render) and server
   (collision) agree on the surface. Fixed-point density + a fixed algorithm guarantee this.
 
@@ -155,16 +159,18 @@ compaction bakes the journal into a new base snapshot to cap replay cost.
 - **P4 — Polish.** LOD + transvoxel seams, streaming, memory, `benilla-editor` offline editor-mode
   UX (free camera, big brushes, undo), and the first Noggit-ladder pickup (MCCV).
 
-## 11. Open decisions (owner)
+## 11. Settled decisions (owner, 2026-10-16)
 
-1. **Voxel size / chunk size** — fidelity vs memory/perf (e.g. 0.33 yd @ 32³). Pick in P0 with a
-   benchmark.
-2. **Who can sculpt live** — GM-only at first? Players in sanctioned zones later? (permission + rate
-   limits).
-3. **Meshing crate** — `fast-surface-nets` / `block-mesh` / vendored transvoxel — decide in P0.
-4. **Material model** — reuse the existing terrain splat set, or a dedicated voxel material palette?
-5. **Volume authoring** — in-game brush only at first, or stand up the `benilla-editor` offline mode
-   early?
+1. **Voxel / chunk size** → **0.5 yd voxels, 32³ chunks.** Sticky — verify with a P0 benchmark.
+2. **Who can sculpt live** → **GM-only.** Built as a per-volume capability flag so "players in
+   sanctioned zones" can be enabled later by config, not a rearchitecture.
+3. **Meshing** → **`fast-surface-nets`**, transvoxel at LOD boundaries in P4. **Dual contouring is a
+   potential later test** (crisp sharp edges) — reversible, the mesher is isolated behind the density
+   field.
+4. **Material** → **reuse the existing terrain splat set** (triplanar, no new art), with a
+   **dedicated voxel palette as a potential later test** for vertical/overhang faces (P4+).
+5. **Authoring** → **both, phased:** in-game GM brush first (P1), stand up the `benilla-editor`
+   offline mode later (P4) for heavy sculpting.
 
 ## 12. Risks
 
