@@ -91,8 +91,10 @@ fn volume_half_extent() -> Vec3 {
         * (benilla_voxel::CHUNK as f32 * benilla_voxel::VOXEL_SIZE * 0.5)
 }
 
-/// Yards in front of the camera to place the volume centre.
-const SPAWN_AHEAD_YARDS: f32 = 34.0;
+/// Yards in front of the camera to place the volume centre (close, so it's right there to sculpt).
+const SPAWN_AHEAD_YARDS: f32 = 12.0;
+/// Approx. eye height above the feet (yards), to drop the patch's flat top to ground level.
+const EYE_HEIGHT_YARDS: f32 = 3.0;
 
 /// Current brush radius in voxels (adjustable live with `-`/`=`). Default ~2 yd.
 #[derive(Resource)]
@@ -106,10 +108,13 @@ impl Default for MonkeyVoxelBrushRadius {
 
 fn spawn_monkey_voxel_volume(
     mut done: Local<bool>,
+    mut settle_frames: Local<u32>,
+    mut last_cam: Local<Option<Vec3>>,
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     camera: Query<&GlobalTransform, With<WorldCamera>>,
+    world: crate::world_point::WorldPoint,
 ) {
     if *done {
         return;
@@ -121,6 +126,15 @@ fn spawn_monkey_voxel_volume(
     let cam_pos = cam.translation();
     if cam_pos == Vec3::ZERO {
         return; // camera not yet placed in the world
+    }
+    // World-enter keeps moving the camera for a second or two as it settles behind the player. Spawn
+    // only once it has held still, so the one-shot patch lands in front of the SETTLED view rather
+    // than the transient load-in pose (the same settle trap capture mode hit).
+    let settled = last_cam.is_some_and(|p| p.distance(cam_pos) < 0.5);
+    *last_cam = Some(cam_pos);
+    *settle_frames = if settled { *settle_frames + 1 } else { 0 };
+    if *settle_frames < 30 {
+        return; // ~0.5 s of a still camera
     }
 
     // Build the terraform sandbox: a multi-chunk flat-topped ground patch (slab) → combined mesh.
@@ -139,10 +153,22 @@ fn spawn_monkey_voxel_volume(
         ..default()
     });
 
-    // Place the volume centre ~22 yd ahead and a little below eye level so you look down onto the
-    // flat top; the mesh is local to the volume origin, so offset by the half-extent.
-    let centre = cam_pos + *cam.forward() * SPAWN_AHEAD_YARDS - Vec3::Y * 3.0;
-    let origin = centre - volume_half_extent();
+    // Place the patch a short way ahead along the SETTLED view (in front of the player, in the
+    // look direction), with its flat top a touch above the real ground so it's a clearly visible
+    // low platform rather than flush (which z-fights and hides under the terrain). Fall back to
+    // foot level if the ground there isn't loaded.
+    let ahead = cam_pos + *cam.forward() * SPAWN_AHEAD_YARDS;
+    let half = volume_half_extent();
+    let ground = world
+        .terrain_height_under(ahead)
+        .unwrap_or(cam_pos.y - EYE_HEIGHT_YARDS);
+    let top_y = ground + 1.5;
+    let origin = Vec3::new(
+        ahead.x - half.x,
+        top_y - VOL_SURFACE * benilla_voxel::VOXEL_SIZE,
+        ahead.z - half.z,
+    );
+    let centre = origin + half;
 
     commands.spawn((
         Mesh3d(mesh),
