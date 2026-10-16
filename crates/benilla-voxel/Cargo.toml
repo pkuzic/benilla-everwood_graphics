@@ -1,0 +1,15 @@
+[package]
+name = "benilla-voxel"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Voxel terrain (option C): i8 SDF density field, 32³ chunking, and fast-surface-nets meshing"
+
+[lints]
+workspace = true
+
+[dependencies]
+# Owner decision (2026-10-16): fast-surface-nets. It re-exports `ndshape`, so no separate dep.
+# The mesher sits behind the density field (VoxelMesh contract), so it is swappable with zero
+# content cost — a dual-contouring test can replace it later without touching callers.
+fast-surface-nets = "0.2"
