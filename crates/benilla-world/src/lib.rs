@@ -161,6 +161,9 @@ pub mod terrain_stream;
 pub mod thread_qos;
 pub mod view;
 pub mod vis_chain;
+// MONKEY (voxel): P0 static voxel-volume render, behind the `voxel` feature (off by default).
+#[cfg(feature = "voxel")]
+pub mod voxel;
 pub mod water_fx;
 pub use water_fx::{WaterFoamKind, WaterFoamSpawn}; // MONKEY: plugin foam messages.
 pub mod wdl;

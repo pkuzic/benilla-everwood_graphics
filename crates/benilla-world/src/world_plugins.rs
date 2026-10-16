@@ -11,8 +11,11 @@ use benilla_assets::materials::{TerrainMaterial, WowModelMaterial};
 pub struct WorldPlugins;
 
 impl PluginGroup for WorldPlugins {
+    // With the `voxel` feature off the body is `let group = …; group`; the binding is deliberate so
+    // the feature-gated `.add` can shadow it, so quiet clippy's let-and-return in that config.
+    #[allow(clippy::let_and_return)]
     fn build(self) -> PluginGroupBuilder {
-        PluginGroupBuilder::start::<Self>()
+        let group = PluginGroupBuilder::start::<Self>()
             // The engine's WGSL first: every material below specializes against it, and an
             // unregistered shader fails silently.
             .add(crate::shaders::plugin)
@@ -123,7 +126,12 @@ impl PluginGroup for WorldPlugins {
             .add(crate::layout_keys::LayoutKeysPlugin)
             // Terrain streaming (`AdtTile` through the `AssetServer`): tiles with their doodads,
             // WMOs, liquid and clutter.
-            .add(crate::terrain_stream::TerrainPlugin)
+            .add(crate::terrain_stream::TerrainPlugin);
+        // MONKEY (voxel): P0 static voxel-volume render, compiled in only under the `voxel` feature
+        // so the shipped player build is byte-unchanged.
+        #[cfg(feature = "voxel")]
+        let group = group.add(crate::voxel::MonkeyVoxelPlugin);
+        group
     }
 }
 

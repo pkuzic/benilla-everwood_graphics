@@ -12,6 +12,8 @@ workspace = true
 # The dev/player seam: `cargo build -p benilla --no-default-features` is the player build.
 default = ["dev"]
 dev = ["benilla-app/dev"]
+# MONKEY (voxel): forwards the P0 voxel-render feature down to benilla-app. OFF by default.
+voxel = ["benilla-app/voxel"]
 # Profiling switches, forwarded so `cargo run -p benilla --features tracy` works.
 tracy = ["benilla-app/tracy"]
 trace_chrome = ["benilla-app/trace_chrome"]
