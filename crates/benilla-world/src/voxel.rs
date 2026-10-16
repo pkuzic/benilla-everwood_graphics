@@ -53,10 +53,10 @@ pub fn monkey_voxel_mesh_to_bevy(vm: &benilla_voxel::VoxelMesh) -> Mesh {
 #[derive(Component)]
 pub struct MonkeyVoxelVolume;
 
-/// Keeps the volume's editable density field on the entity so the P1 brush can mutate it and
-/// re-mesh live. The chunk origin is the entity's `Transform.translation` (world yards).
+/// Keeps the volume's editable multi-chunk density field on the entity so the P1 brush can mutate it
+/// and re-mesh live. The volume origin is the entity's `Transform.translation` (world yards).
 #[derive(Component)]
-pub struct MonkeyVoxelChunk(pub benilla_voxel::Chunk);
+pub struct MonkeyVoxelData(pub benilla_voxel::VoxelVolume);
 
 /// P0 render: spawn one static voxel volume in front of the player, once a world is live.
 pub struct MonkeyVoxelPlugin;
@@ -79,11 +79,20 @@ impl Plugin for MonkeyVoxelPlugin {
     }
 }
 
-/// The volume centre in the mesher's local space: voxel coord `[17, 17, 17]` × `VOXEL_SIZE` yards.
-const VOLUME_LOCAL_CENTRE: f32 = 17.0 * benilla_voxel::VOXEL_SIZE;
+/// Terraform sandbox size: chunks per axis. `[2,1,2]` = a 32 × 16 × 32 yd ground patch (4 chunks).
+const VOL_CHUNKS: [u32; 3] = [2, 1, 2];
+/// Flat-top height within the volume, in voxels (solid below, air above).
+const VOL_SURFACE: f32 = 16.0;
+
+/// Half the volume's world size (yards) — offsets the entity origin so the volume centre lands on a
+/// target point, and is the aim reference for the brush.
+fn volume_half_extent() -> Vec3 {
+    Vec3::new(VOL_CHUNKS[0] as f32, VOL_CHUNKS[1] as f32, VOL_CHUNKS[2] as f32)
+        * (benilla_voxel::CHUNK as f32 * benilla_voxel::VOXEL_SIZE * 0.5)
+}
 
 /// Yards in front of the camera to place the volume centre.
-const SPAWN_AHEAD_YARDS: f32 = 22.0;
+const SPAWN_AHEAD_YARDS: f32 = 34.0;
 
 /// Current brush radius in voxels (adjustable live with `-`/`=`). Default ~2 yd.
 #[derive(Resource)]
@@ -114,17 +123,15 @@ fn spawn_monkey_voxel_volume(
         return; // camera not yet placed in the world
     }
 
-    // Build the terraform sandbox: a flat-topped ground block (slab) → Bevy mesh. One 32³ chunk at
-    // 0.5 yd = a 16 yd cube; solid in the lower half, flat top at the chunk mid-height.
-    let chunk = benilla_voxel::slab(17.0);
-    let voxel_mesh = chunk.mesh();
+    // Build the terraform sandbox: a multi-chunk flat-topped ground patch (slab) → combined mesh.
+    let volume = benilla_voxel::VoxelVolume::slab(VOL_CHUNKS, VOL_SURFACE);
+    let voxel_mesh = volume.mesh();
     let tri_count = voxel_mesh.tri_count();
     let vert_count = voxel_mesh.positions.len();
     let mesh = meshes.add(monkey_voxel_mesh_to_bevy(&voxel_mesh));
 
     // Unlit + double-sided; the earthy shading rides in the mesh's vertex colours (see
-    // monkey_voxel_mesh_to_bevy), which unlit renders as base_color * vertex_colour. White base =
-    // the baked colour shows through. Unlit dodges benilla's custom light (a lit material = black).
+    // monkey_voxel_mesh_to_bevy). Unlit dodges benilla's custom light (a lit material = black).
     let material = materials.add(StandardMaterial {
         base_color: Color::WHITE,
         unlit: true,
@@ -132,25 +139,26 @@ fn spawn_monkey_voxel_volume(
         ..default()
     });
 
-    // Place the volume centre ~22 yd in front of the camera; the mesh is local to its chunk origin,
-    // so offset the transform by the local centre to put the ring on that point.
-    let centre = cam_pos + *cam.forward() * SPAWN_AHEAD_YARDS;
-    let origin = centre - Vec3::splat(VOLUME_LOCAL_CENTRE);
+    // Place the volume centre ~22 yd ahead and a little below eye level so you look down onto the
+    // flat top; the mesh is local to the volume origin, so offset by the half-extent.
+    let centre = cam_pos + *cam.forward() * SPAWN_AHEAD_YARDS - Vec3::Y * 3.0;
+    let origin = centre - volume_half_extent();
 
     commands.spawn((
         Mesh3d(mesh),
         MeshMaterial3d(material),
         Transform::from_translation(origin),
         MonkeyVoxelVolume,
-        MonkeyVoxelChunk(chunk),
+        MonkeyVoxelData(volume),
         Name::new("MONKEY voxel sandbox"),
     ));
 
     let wow = bevy_to_wow(centre);
     info!(
-        "MONKEY (voxel): spawned terraform slab — {vert_count} verts, {tri_count} tris. \
-         Bevy centre {:.1?}, WoW centre [{:.1}, {:.1}, {:.1}] (x,y,z). Look ~{SPAWN_AHEAD_YARDS} yd ahead; \
-         brush [ dig / ] build / \\ smooth, -/= size.",
+        "MONKEY (voxel): spawned terraform patch {:?} chunks — {vert_count} verts, {tri_count} tris. \
+         Bevy centre {:.1?}, WoW centre [{:.1}, {:.1}, {:.1}] (x,y,z). Look ~{SPAWN_AHEAD_YARDS} yd \
+         ahead (and down); brush [ dig / ] build / \\ smooth, -/= size.",
+        VOL_CHUNKS,
         centre.to_array(),
         wow[0],
         wow[1],
@@ -174,8 +182,8 @@ fn monkey_voxel_capture_follow(
     let (Ok(cam), Ok(mut tf)) = (camera.single(), volume.single_mut()) else {
         return;
     };
-    let centre = cam.translation() + *cam.forward() * SPAWN_AHEAD_YARDS;
-    tf.translation = centre - Vec3::splat(VOLUME_LOCAL_CENTRE);
+    let centre = cam.translation() + *cam.forward() * SPAWN_AHEAD_YARDS - Vec3::Y * 3.0;
+    tf.translation = centre - volume_half_extent();
 }
 
 /// P1 local voxel brush (dev/GM). Hold **`[`** carve · **`]`** build · **`\`** smooth, aimed at the
@@ -187,7 +195,7 @@ fn monkey_voxel_brush_edit(
     mut radius: ResMut<MonkeyVoxelBrushRadius>,
     mut meshes: ResMut<Assets<Mesh>>,
     camera: Query<&GlobalTransform, With<WorldCamera>>,
-    mut volume: Query<(&mut MonkeyVoxelChunk, &Mesh3d, &Transform), With<MonkeyVoxelVolume>>,
+    mut volume: Query<(&mut MonkeyVoxelData, &Mesh3d, &Transform), With<MonkeyVoxelVolume>>,
 ) {
     // Brush size: `-` shrinks, `=` grows (clamped 1..14 voxels).
     if keys.just_pressed(KeyCode::Minus) {
@@ -207,25 +215,25 @@ fn monkey_voxel_brush_edit(
     } else {
         return;
     };
-    let (Ok(cam), Ok((mut chunk, mesh3d, tf))) = (camera.single(), volume.single_mut()) else {
+    let (Ok(cam), Ok((mut data, mesh3d, tf))) = (camera.single(), volume.single_mut()) else {
         return;
     };
 
-    // Aim the brush at the volume's depth along the view ray, so looking at the volume always lands
-    // on it and turning your view sweeps the brush across its face.
-    let vol_centre = tf.translation + Vec3::splat(VOLUME_LOCAL_CENTRE);
+    // Aim the brush at the volume centre's depth along the view ray, so looking at the patch always
+    // lands on it and turning your view sweeps the brush across it.
+    let vol_centre = tf.translation + volume_half_extent();
     let dist = (vol_centre - cam.translation()).length();
     let world = cam.translation() + *cam.forward() * dist;
     let local = ((world - tf.translation) / benilla_voxel::VOXEL_SIZE).to_array();
 
     let r = radius.0;
     let changed = match mode {
-        BrushMode::Smooth => chunk.0.smooth_sphere(local, r, 0.5),
-        m => chunk.0.edit_sphere(local, r, m),
+        BrushMode::Smooth => data.0.smooth_sphere(local, r, 0.5),
+        m => data.0.edit_sphere(local, r, m),
     };
     if changed {
         // insert returns a prior-asset Result we don't need; the handle stays the same.
-        let _ = meshes.insert(&mesh3d.0, monkey_voxel_mesh_to_bevy(&chunk.0.mesh()));
+        let _ = meshes.insert(&mesh3d.0, monkey_voxel_mesh_to_bevy(&data.0.mesh()));
     }
 }
 
@@ -235,20 +243,24 @@ fn monkey_voxel_brush_edit(
 fn monkey_voxel_capture_demo_edit(
     mut done: Local<bool>,
     mut meshes: ResMut<Assets<Mesh>>,
-    mut volume: Query<(&mut MonkeyVoxelChunk, &Mesh3d), With<MonkeyVoxelVolume>>,
+    mut volume: Query<(&mut MonkeyVoxelData, &Mesh3d), With<MonkeyVoxelVolume>>,
 ) {
     if *done || std::env::var_os("WOW_CAPTURE").is_none() {
         return;
     }
-    let Ok((mut chunk, mesh3d)) = volume.single_mut() else {
+    let Ok((mut data, mesh3d)) = volume.single_mut() else {
         return;
     };
-    // Terraform the slab for the baseline shot: carve a pit + a tunnel, raise a mound, then smooth.
-    chunk.0.edit_sphere([13.0, 17.0, 13.0], 6.0, BrushMode::Subtract);
-    chunk.0.edit_sphere([22.0, 17.0, 20.0], 5.0, BrushMode::Subtract);
-    chunk.0.edit_sphere([24.0, 22.0, 12.0], 6.0, BrushMode::Add);
-    chunk.0.smooth_sphere([18.0, 18.0, 16.0], 8.0, 0.5);
-    let _ = meshes.insert(&mesh3d.0, monkey_voxel_mesh_to_bevy(&chunk.0.mesh()));
+    // Terraform the patch for the baseline shot (global voxel coords; top surface at y=VOL_SURFACE):
+    // two craters, a trench across the chunk seam, a raised mound, then a smooth pass.
+    let v = &mut data.0;
+    v.edit_sphere([20.0, 16.0, 22.0], 7.0, BrushMode::Subtract);
+    v.edit_sphere([46.0, 16.0, 42.0], 6.0, BrushMode::Subtract);
+    v.edit_sphere([32.0, 14.0, 12.0], 5.0, BrushMode::Subtract);
+    v.edit_sphere([32.0, 14.0, 30.0], 5.0, BrushMode::Subtract);
+    v.edit_sphere([34.0, 22.0, 46.0], 8.0, BrushMode::Add);
+    v.smooth_sphere([30.0, 18.0, 30.0], 12.0, 0.5);
+    let _ = meshes.insert(&mesh3d.0, monkey_voxel_mesh_to_bevy(&v.mesh()));
     *done = true;
 }
 
@@ -258,8 +270,7 @@ mod tests {
 
     #[test]
     fn voxel_mesh_converts_with_matching_counts() {
-        let chunk = benilla_voxel::volume(10.0, 4.0, [17.0, 17.0, 17.0]);
-        let vm = chunk.mesh();
+        let vm = benilla_voxel::VoxelVolume::slab([1, 1, 1], 16.0).mesh();
         assert!(!vm.is_empty(), "volume produced no geometry");
 
         let mesh = monkey_voxel_mesh_to_bevy(&vm);

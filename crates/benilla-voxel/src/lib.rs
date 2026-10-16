@@ -243,6 +243,180 @@ pub fn torus(major: f32, minor: f32, center: [f32; 3]) -> Chunk {
     })
 }
 
+/// A multi-chunk voxel volume: a grid of `chunks` chunks sharing **one global density field**, so
+/// neighbouring chunks mesh seamlessly (their 34³ surface-nets windows overlap by the shared
+/// padding, meshing the seam identically). Meshes to a single combined [`VoxelMesh`]. The interior
+/// spans `chunks * CHUNK` voxels per axis; the global grid carries a 1-voxel pad on each side.
+#[derive(Clone)]
+pub struct VoxelVolume {
+    chunks: [u32; 3],
+    gdim: [usize; 3], // global sample grid dims = chunks*CHUNK + 2
+    density: Vec<i8>, // negative = solid
+}
+
+impl VoxelVolume {
+    fn dims(chunks: [u32; 3]) -> [usize; 3] {
+        [
+            (chunks[0] * CHUNK + 2) as usize,
+            (chunks[1] * CHUNK + 2) as usize,
+            (chunks[2] * CHUNK + 2) as usize,
+        ]
+    }
+
+    #[inline]
+    fn gidx(&self, x: usize, y: usize, z: usize) -> usize {
+        x + y * self.gdim[0] + z * self.gdim[0] * self.gdim[1]
+    }
+
+    /// Chunks per axis.
+    pub fn chunk_dims(&self) -> [u32; 3] {
+        self.chunks
+    }
+
+    /// Interior size in world yards per axis (the footprint you can sculpt).
+    pub fn world_size(&self) -> [f32; 3] {
+        [
+            self.chunks[0] as f32 * CHUNK as f32 * VOXEL_SIZE,
+            self.chunks[1] as f32 * CHUNK as f32 * VOXEL_SIZE,
+            self.chunks[2] as f32 * CHUNK as f32 * VOXEL_SIZE,
+        ]
+    }
+
+    /// Build by sampling an SDF over global voxel coords (negative = solid).
+    pub fn from_sdf(chunks: [u32; 3], mut f: impl FnMut([u32; 3]) -> f32) -> Self {
+        let gdim = Self::dims(chunks);
+        let mut density = vec![0i8; gdim[0] * gdim[1] * gdim[2]];
+        let mut i = 0;
+        for z in 0..gdim[2] {
+            for y in 0..gdim[1] {
+                for x in 0..gdim[0] {
+                    let v = (f([x as u32, y as u32, z as u32]) * DENSITY_SCALE).round();
+                    density[i] = v.clamp(i8::MIN as f32, i8::MAX as f32) as i8;
+                    i += 1;
+                }
+            }
+        }
+        Self { chunks, gdim, density }
+    }
+
+    /// A flat ground block across the whole volume: solid below `surface` on the Y (up) axis.
+    pub fn slab(chunks: [u32; 3], surface: f32) -> Self {
+        Self::from_sdf(chunks, move |[_, y, _]| y as f32 - surface)
+    }
+
+    /// Sphere brush over the whole volume (`center`/`radius` in global voxel coords). Spans chunk
+    /// boundaries freely since the density is one grid. Returns whether anything changed.
+    pub fn edit_sphere(&mut self, center: [f32; 3], radius: f32, mode: BrushMode) -> bool {
+        let lo = |c: f32| (c - radius - 1.0).floor().max(0.0) as usize;
+        let hi = |c: f32, d: usize| ((c + radius + 1.0).ceil() as i64).clamp(0, d as i64 - 1) as usize;
+        let mut changed = false;
+        for z in lo(center[2])..=hi(center[2], self.gdim[2]) {
+            for y in lo(center[1])..=hi(center[1], self.gdim[1]) {
+                for x in lo(center[0])..=hi(center[0], self.gdim[0]) {
+                    let brush = ((x as f32 - center[0]).powi(2)
+                        + (y as f32 - center[1]).powi(2)
+                        + (z as f32 - center[2]).powi(2))
+                    .sqrt()
+                        - radius;
+                    let i = self.gidx(x, y, z);
+                    let old = self.density[i] as f32 / DENSITY_SCALE;
+                    let new = match mode {
+                        BrushMode::Subtract => old.max(-brush),
+                        BrushMode::Add => old.min(brush),
+                        BrushMode::Smooth => old,
+                    };
+                    let q = (new * DENSITY_SCALE)
+                        .round()
+                        .clamp(i8::MIN as f32, i8::MAX as f32) as i8;
+                    if q != self.density[i] {
+                        self.density[i] = q;
+                        changed = true;
+                    }
+                }
+            }
+        }
+        changed
+    }
+
+    /// Smooth brush over the whole volume (global voxel coords). Keeps a 1-voxel border.
+    pub fn smooth_sphere(&mut self, center: [f32; 3], radius: f32, strength: f32) -> bool {
+        let lo = |c: f32| (c - radius).floor().max(1.0) as usize;
+        let hi = |c: f32, d: usize| ((c + radius).ceil() as i64).clamp(1, d as i64 - 2) as usize;
+        let r2 = radius * radius;
+        let mut updates: Vec<(usize, i8)> = Vec::new();
+        for z in lo(center[2])..=hi(center[2], self.gdim[2]) {
+            for y in lo(center[1])..=hi(center[1], self.gdim[1]) {
+                for x in lo(center[0])..=hi(center[0], self.gdim[0]) {
+                    let d2 = (x as f32 - center[0]).powi(2)
+                        + (y as f32 - center[1]).powi(2)
+                        + (z as f32 - center[2]).powi(2);
+                    if d2 > r2 {
+                        continue;
+                    }
+                    let avg = (self.density[self.gidx(x + 1, y, z)] as f32
+                        + self.density[self.gidx(x - 1, y, z)] as f32
+                        + self.density[self.gidx(x, y + 1, z)] as f32
+                        + self.density[self.gidx(x, y - 1, z)] as f32
+                        + self.density[self.gidx(x, y, z + 1)] as f32
+                        + self.density[self.gidx(x, y, z - 1)] as f32)
+                        / 6.0;
+                    let i = self.gidx(x, y, z);
+                    let old = self.density[i] as f32;
+                    let new = (old * (1.0 - strength) + avg * strength)
+                        .round()
+                        .clamp(i8::MIN as f32, i8::MAX as f32) as i8;
+                    if new != self.density[i] {
+                        updates.push((i, new));
+                    }
+                }
+            }
+        }
+        let changed = !updates.is_empty();
+        for (i, v) in updates {
+            self.density[i] = v;
+        }
+        changed
+    }
+
+    /// Mesh every chunk and combine into one [`VoxelMesh`]. Positions are world yards relative to the
+    /// volume origin; adjacent chunk windows share global samples, so the seams line up.
+    pub fn mesh(&self) -> VoxelMesh {
+        let mut out = VoxelMesh::default();
+        let mut sdf = vec![0f32; ChunkShape::USIZE];
+        for cz in 0..self.chunks[2] {
+            for cy in 0..self.chunks[1] {
+                for cx in 0..self.chunks[0] {
+                    let (ox, oy, oz) =
+                        ((cx * CHUNK) as usize, (cy * CHUNK) as usize, (cz * CHUNK) as usize);
+                    for li in 0..ChunkShape::USIZE {
+                        let [lx, ly, lz] = ChunkShape::delinearize(li as u32);
+                        sdf[li] = self.density
+                            [self.gidx(ox + lx as usize, oy + ly as usize, oz + lz as usize)]
+                            as f32
+                            / DENSITY_SCALE;
+                    }
+                    let mut buffer = SurfaceNetsBuffer::default();
+                    surface_nets(&sdf, &ChunkShape {}, [0; 3], [SAMPLES - 1; 3], &mut buffer);
+                    if buffer.positions.is_empty() {
+                        continue;
+                    }
+                    let base = out.positions.len() as u32;
+                    for p in &buffer.positions {
+                        out.positions.push([
+                            (p[0] + ox as f32) * VOXEL_SIZE,
+                            (p[1] + oy as f32) * VOXEL_SIZE,
+                            (p[2] + oz as f32) * VOXEL_SIZE,
+                        ]);
+                    }
+                    out.normals.extend_from_slice(&buffer.normals);
+                    out.indices.extend(buffer.indices.iter().map(|i| i + base));
+                }
+            }
+        }
+        out
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -349,6 +523,30 @@ mod tests {
         let mut c = slab(20.0);
         c.edit_sphere([17.0, 20.0, 17.0], 4.0, BrushMode::Subtract); // dig a sharp pit
         assert!(c.smooth_sphere([17.0, 20.0, 17.0], 6.0, 0.5), "smooth changed nothing");
+    }
+
+    #[test]
+    fn volume_slab_meshes() {
+        let v = VoxelVolume::slab([2, 1, 2], 16.0);
+        assert_eq!(v.world_size(), [32.0, 16.0, 32.0]); // 2 * 32 * 0.5 yd
+        let m = v.mesh();
+        assert!(!m.is_empty(), "volume slab produced no surface");
+        assert_eq!(m.indices.len() % 3, 0, "indices not a triangle list");
+        assert_eq!(m.normals.len(), m.positions.len(), "one normal per vertex");
+    }
+
+    #[test]
+    fn volume_scales_with_chunk_count() {
+        let one = VoxelVolume::slab([1, 1, 1], 16.0).mesh().positions.len();
+        let four = VoxelVolume::slab([2, 1, 2], 16.0).mesh().positions.len();
+        assert!(four > one * 2, "a 2x2 footprint should have well more surface verts than 1x1");
+    }
+
+    #[test]
+    fn volume_edit_spans_chunk_boundary() {
+        // An edit centred on the seam between chunk 0 and chunk 1 (global x = 32) must change it.
+        let mut v = VoxelVolume::slab([2, 1, 1], 16.0);
+        assert!(v.edit_sphere([32.0, 16.0, 16.0], 6.0, BrushMode::Subtract));
     }
 
     #[test]
