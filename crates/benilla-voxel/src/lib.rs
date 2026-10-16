@@ -103,6 +103,8 @@ impl Chunk {
                     let new = match mode {
                         BrushMode::Subtract => old.max(-brush),
                         BrushMode::Add => old.min(brush),
+                        // Smoothing is a blur, not CSG — it goes through `smooth_sphere`; no-op here.
+                        BrushMode::Smooth => old,
                     };
                     let q = (new * DENSITY_SCALE)
                         .round()
@@ -116,6 +118,52 @@ impl Chunk {
         }
         changed
     }
+
+    /// Smooth the density field inside a sphere toward the local average (a box blur of the 6-
+    /// neighbourhood, lerped by `strength` in 0..1). Softens sharp dig/build edges. Keeps a 1-voxel
+    /// border so neighbour reads stay in-bounds. Returns whether anything changed.
+    pub fn smooth_sphere(&mut self, center: [f32; 3], radius: f32, strength: f32) -> bool {
+        let dim = SAMPLES as i32;
+        let at = |x: i32, y: i32, z: i32| {
+            ChunkShape::linearize([x as u32, y as u32, z as u32]) as usize
+        };
+        let lo = |c: f32| ((c - radius).floor() as i32).max(1);
+        let hi = |c: f32| ((c + radius).ceil() as i32).min(dim - 2);
+        let r2 = radius * radius;
+        let mut updates: Vec<(usize, i8)> = Vec::new();
+        for z in lo(center[2])..=hi(center[2]) {
+            for y in lo(center[1])..=hi(center[1]) {
+                for x in lo(center[0])..=hi(center[0]) {
+                    let d2 = (x as f32 - center[0]).powi(2)
+                        + (y as f32 - center[1]).powi(2)
+                        + (z as f32 - center[2]).powi(2);
+                    if d2 > r2 {
+                        continue;
+                    }
+                    let avg = (self.density[at(x + 1, y, z)] as f32
+                        + self.density[at(x - 1, y, z)] as f32
+                        + self.density[at(x, y + 1, z)] as f32
+                        + self.density[at(x, y - 1, z)] as f32
+                        + self.density[at(x, y, z + 1)] as f32
+                        + self.density[at(x, y, z - 1)] as f32)
+                        / 6.0;
+                    let i = at(x, y, z);
+                    let old = self.density[i] as f32;
+                    let new = (old * (1.0 - strength) + avg * strength)
+                        .round()
+                        .clamp(i8::MIN as f32, i8::MAX as f32) as i8;
+                    if new != self.density[i] {
+                        updates.push((i, new));
+                    }
+                }
+            }
+        }
+        let changed = !updates.is_empty();
+        for (i, v) in updates {
+            self.density[i] = v;
+        }
+        changed
+    }
 }
 
 /// What a brush stroke does to the density field.
@@ -125,6 +173,15 @@ pub enum BrushMode {
     Subtract,
     /// Deposit solid (build up terrain).
     Add,
+    /// Smooth / soften the surface toward the local average.
+    Smooth,
+}
+
+/// A flat ground block: solid below `surface` on the **Y (up) axis** in voxel coords, air above — a
+/// terraform sandbox with a flat top you can dig pits into and pile mounds onto. (Bevy +Y is up:
+/// WoW z-up maps to Bevy Y.)
+pub fn slab(surface: f32) -> Chunk {
+    Chunk::from_sdf(move |[_, y, _]| y as f32 - surface) // negative below the surface = solid
 }
 
 /// A plain triangle mesh — the contract between the mesher and every consumer (benilla-world render,
@@ -277,6 +334,21 @@ mod tests {
         let mut c = sphere(12.0, [17.0, 17.0, 17.0]);
         // A tiny brush far in the air (corner) touches nothing solid and must report no change.
         assert!(!c.edit_sphere([2.0, 2.0, 2.0], 1.0, BrushMode::Subtract));
+    }
+
+    #[test]
+    fn slab_is_solid_below_air_above() {
+        let c = slab(20.0);
+        assert!(c.density[ChunkShape::linearize([17, 10, 17]) as usize] < 0, "below surface = solid");
+        assert!(c.density[ChunkShape::linearize([17, 30, 17]) as usize] > 0, "above surface = air");
+        assert!(!c.mesh().is_empty(), "slab produced no surface");
+    }
+
+    #[test]
+    fn smooth_changes_a_sharp_edit() {
+        let mut c = slab(20.0);
+        c.edit_sphere([17.0, 20.0, 17.0], 4.0, BrushMode::Subtract); // dig a sharp pit
+        assert!(c.smooth_sphere([17.0, 20.0, 17.0], 6.0, 0.5), "smooth changed nothing");
     }
 
     #[test]

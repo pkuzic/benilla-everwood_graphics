@@ -6,7 +6,7 @@
 //! mesher's output. No edits, no collision, no server — those are later lanes.
 //!
 //! Everything in this module is gated behind the crate's `voxel` cargo feature (OFF by default), so
-//! the shipped player build is byte-unchanged. The torus is the P0 overhang proof: a genuinely
+//! the shipped player build is byte-unchanged. The volume is the P0 overhang proof: a genuinely
 //! non-heightmap surface (two surfaces over one column) that the WoW heightmap can never express.
 
 use bevy::asset::RenderAssetUsages;
@@ -30,6 +30,21 @@ pub fn monkey_voxel_mesh_to_bevy(vm: &benilla_voxel::VoxelMesh) -> Mesh {
     );
     mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, vm.positions.clone());
     mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, vm.normals.clone());
+    // Bake a simple top-down shade (from each normal's up-component) into an earthy vertex colour,
+    // so the sculpted form reads without the world's custom terrain lighting — a plain lit
+    // StandardMaterial renders black against benilla's bespoke light. The real triplanar terrain
+    // material replaces this in a later lane.
+    const EARTH: [f32; 3] = [0.62, 0.52, 0.38];
+    let colors: Vec<[f32; 4]> = vm
+        .normals
+        .iter()
+        .map(|n| {
+            let up = (n[1] * 0.5 + 0.5).clamp(0.0, 1.0); // Bevy +Y up: top faces brighter
+            let b = 0.35 + 0.65 * up;
+            [EARTH[0] * b, EARTH[1] * b, EARTH[2] * b, 1.0]
+        })
+        .collect();
+    mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, colors);
     mesh.insert_indices(Indices::U32(vm.indices.clone()));
     mesh
 }
@@ -43,17 +58,18 @@ pub struct MonkeyVoxelVolume;
 #[derive(Component)]
 pub struct MonkeyVoxelChunk(pub benilla_voxel::Chunk);
 
-/// P0 render: spawn one static voxel torus in front of the player, once a world is live.
+/// P0 render: spawn one static voxel volume in front of the player, once a world is live.
 pub struct MonkeyVoxelPlugin;
 
 impl Plugin for MonkeyVoxelPlugin {
     fn build(&self, app: &mut App) {
+        app.init_resource::<MonkeyVoxelBrushRadius>();
         // Spawn once, in front of the camera, so it is guaranteed on-screen on any login — gated on
         // a live world (a `WorldCamera` with a real pose) and a `Local` one-shot latch.
         app.add_systems(
             Update,
             (
-                spawn_monkey_voxel_torus,
+                spawn_monkey_voxel_volume,
                 monkey_voxel_capture_follow,
                 monkey_voxel_brush_edit,
                 monkey_voxel_capture_demo_edit,
@@ -63,14 +79,23 @@ impl Plugin for MonkeyVoxelPlugin {
     }
 }
 
-/// The torus centre in the mesher's local space: voxel coord `[17, 17, 17]` × `VOXEL_SIZE` yards.
-const TORUS_LOCAL_CENTRE: f32 =
-    17.0 * benilla_voxel::VOXEL_SIZE;
+/// The volume centre in the mesher's local space: voxel coord `[17, 17, 17]` × `VOXEL_SIZE` yards.
+const VOLUME_LOCAL_CENTRE: f32 = 17.0 * benilla_voxel::VOXEL_SIZE;
 
-/// Yards in front of the camera to place the torus centre.
+/// Yards in front of the camera to place the volume centre.
 const SPAWN_AHEAD_YARDS: f32 = 22.0;
 
-fn spawn_monkey_voxel_torus(
+/// Current brush radius in voxels (adjustable live with `-`/`=`). Default ~2 yd.
+#[derive(Resource)]
+pub struct MonkeyVoxelBrushRadius(pub f32);
+
+impl Default for MonkeyVoxelBrushRadius {
+    fn default() -> Self {
+        Self(4.0)
+    }
+}
+
+fn spawn_monkey_voxel_volume(
     mut done: Local<bool>,
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
@@ -89,25 +114,28 @@ fn spawn_monkey_voxel_torus(
         return; // camera not yet placed in the world
     }
 
-    // Build the P0 overhang-proof torus and convert it to a Bevy mesh.
-    let chunk = benilla_voxel::torus(10.0, 4.0, [17.0, 17.0, 17.0]);
+    // Build the terraform sandbox: a flat-topped ground block (slab) → Bevy mesh. One 32³ chunk at
+    // 0.5 yd = a 16 yd cube; solid in the lower half, flat top at the chunk mid-height.
+    let chunk = benilla_voxel::slab(17.0);
     let voxel_mesh = chunk.mesh();
     let tri_count = voxel_mesh.tri_count();
     let vert_count = voxel_mesh.positions.len();
     let mesh = meshes.add(monkey_voxel_mesh_to_bevy(&voxel_mesh));
 
-    // A bright, unlit, double-sided material so it is unmistakable regardless of time-of-day light.
+    // Unlit + double-sided; the earthy shading rides in the mesh's vertex colours (see
+    // monkey_voxel_mesh_to_bevy), which unlit renders as base_color * vertex_colour. White base =
+    // the baked colour shows through. Unlit dodges benilla's custom light (a lit material = black).
     let material = materials.add(StandardMaterial {
-        base_color: Color::srgb(1.0, 0.35, 0.0),
+        base_color: Color::WHITE,
         unlit: true,
         cull_mode: None,
         ..default()
     });
 
-    // Place the torus centre ~22 yd in front of the camera; the mesh is local to its chunk origin,
+    // Place the volume centre ~22 yd in front of the camera; the mesh is local to its chunk origin,
     // so offset the transform by the local centre to put the ring on that point.
     let centre = cam_pos + *cam.forward() * SPAWN_AHEAD_YARDS;
-    let origin = centre - Vec3::splat(TORUS_LOCAL_CENTRE);
+    let origin = centre - Vec3::splat(VOLUME_LOCAL_CENTRE);
 
     commands.spawn((
         Mesh3d(mesh),
@@ -115,13 +143,14 @@ fn spawn_monkey_voxel_torus(
         Transform::from_translation(origin),
         MonkeyVoxelVolume,
         MonkeyVoxelChunk(chunk),
-        Name::new("MONKEY voxel torus (P0)"),
+        Name::new("MONKEY voxel sandbox"),
     ));
 
     let wow = bevy_to_wow(centre);
     info!(
-        "MONKEY (voxel): spawned P0 torus — {vert_count} verts, {tri_count} tris. \
-         Bevy centre {:.1?}, WoW centre [{:.1}, {:.1}, {:.1}] (x,y,z). Look ~{SPAWN_AHEAD_YARDS} yd ahead.",
+        "MONKEY (voxel): spawned terraform slab — {vert_count} verts, {tri_count} tris. \
+         Bevy centre {:.1?}, WoW centre [{:.1}, {:.1}, {:.1}] (x,y,z). Look ~{SPAWN_AHEAD_YARDS} yd ahead; \
+         brush [ dig / ] build / \\ smooth, -/= size.",
         centre.to_array(),
         wow[0],
         wow[1],
@@ -131,10 +160,10 @@ fn spawn_monkey_voxel_torus(
 }
 
 /// Capture-only framing aid. In `$WOW_CAPTURE` mode the scenario camera settles to its framing a
-/// few frames AFTER the one-shot spawn, which would leave the torus off-screen (both baselines log
-/// the identical spawn centre yet frame differently). While capturing, keep the torus glued ~22 yd
+/// few frames AFTER the one-shot spawn, which would leave the volume off-screen (both baselines log
+/// the identical spawn centre yet frame differently). While capturing, keep the volume glued ~22 yd
 /// in front of the CURRENT camera so the shot always frames it. In a live session the env is unset,
-/// so this is a no-op and the spawned torus stays fixed in the world as intended.
+/// so this is a no-op and the spawned volume stays fixed in the world as intended.
 fn monkey_voxel_capture_follow(
     camera: Query<&GlobalTransform, With<WorldCamera>>,
     mut volume: Query<&mut Transform, With<MonkeyVoxelVolume>>,
@@ -146,22 +175,35 @@ fn monkey_voxel_capture_follow(
         return;
     };
     let centre = cam.translation() + *cam.forward() * SPAWN_AHEAD_YARDS;
-    tf.translation = centre - Vec3::splat(TORUS_LOCAL_CENTRE);
+    tf.translation = centre - Vec3::splat(VOLUME_LOCAL_CENTRE);
 }
 
-/// P1 local voxel brush (dev/GM): hold **`[`** to carve, **`]`** to build, aimed at the voxel volume
-/// along your view. Mutates the chunk's density field and re-meshes live. Client-only for now —
-/// server authority, GM-gating and multiplayer sync arrive in P1b (`DESIGN-VoxelTerrain.md`).
+/// P1 local voxel brush (dev/GM). Hold **`[`** carve · **`]`** build · **`\`** smooth, aimed at the
+/// volume along your view; **`-`/`=`** change brush size. Mutates the chunk's density field and
+/// re-meshes live. Client-only for now — server authority, GM-gating and multiplayer sync arrive in
+/// P1b (`DESIGN-VoxelTerrain.md`).
 fn monkey_voxel_brush_edit(
     keys: Res<ButtonInput<KeyCode>>,
+    mut radius: ResMut<MonkeyVoxelBrushRadius>,
     mut meshes: ResMut<Assets<Mesh>>,
     camera: Query<&GlobalTransform, With<WorldCamera>>,
     mut volume: Query<(&mut MonkeyVoxelChunk, &Mesh3d, &Transform), With<MonkeyVoxelVolume>>,
 ) {
+    // Brush size: `-` shrinks, `=` grows (clamped 1..14 voxels).
+    if keys.just_pressed(KeyCode::Minus) {
+        radius.0 = (radius.0 - 1.0).max(1.0);
+    }
+    if keys.just_pressed(KeyCode::Equal) {
+        radius.0 = (radius.0 + 1.0).min(14.0);
+    }
+
+    // Brush mode (held = continuous): [ carve, ] build, \ smooth.
     let mode = if keys.pressed(KeyCode::BracketLeft) {
         BrushMode::Subtract
     } else if keys.pressed(KeyCode::BracketRight) {
         BrushMode::Add
+    } else if keys.pressed(KeyCode::Backslash) {
+        BrushMode::Smooth
     } else {
         return;
     };
@@ -171,20 +213,24 @@ fn monkey_voxel_brush_edit(
 
     // Aim the brush at the volume's depth along the view ray, so looking at the volume always lands
     // on it and turning your view sweeps the brush across its face.
-    let vol_centre = tf.translation + Vec3::splat(TORUS_LOCAL_CENTRE);
+    let vol_centre = tf.translation + Vec3::splat(VOLUME_LOCAL_CENTRE);
     let dist = (vol_centre - cam.translation()).length();
     let world = cam.translation() + *cam.forward() * dist;
-    let local = (world - tf.translation) / benilla_voxel::VOXEL_SIZE;
+    let local = ((world - tf.translation) / benilla_voxel::VOXEL_SIZE).to_array();
 
-    const BRUSH_RADIUS_VOXELS: f32 = 4.0; // ~2 yd
-    if chunk.0.edit_sphere(local.to_array(), BRUSH_RADIUS_VOXELS, mode) {
+    let r = radius.0;
+    let changed = match mode {
+        BrushMode::Smooth => chunk.0.smooth_sphere(local, r, 0.5),
+        m => chunk.0.edit_sphere(local, r, m),
+    };
+    if changed {
         // insert returns a prior-asset Result we don't need; the handle stays the same.
         let _ = meshes.insert(&mesh3d.0, monkey_voxel_mesh_to_bevy(&chunk.0.mesh()));
     }
 }
 
 /// Capture-only proof that the edit → re-mesh → render chain works headlessly: once the volume
-/// exists, carve two bites out of the torus so the baseline screenshot shows a *deformed* volume.
+/// exists, carve two bites out of the volume so the baseline screenshot shows a *deformed* volume.
 /// No-op in live play (env unset) — there the brush drives edits.
 fn monkey_voxel_capture_demo_edit(
     mut done: Local<bool>,
@@ -197,9 +243,11 @@ fn monkey_voxel_capture_demo_edit(
     let Ok((mut chunk, mesh3d)) = volume.single_mut() else {
         return;
     };
-    // Two holes on the ring (local voxel coords on the tube: centre [17,17,17], major radius 10).
-    chunk.0.edit_sphere([27.0, 17.0, 17.0], 5.0, BrushMode::Subtract);
-    chunk.0.edit_sphere([17.0, 27.0, 17.0], 4.0, BrushMode::Subtract);
+    // Terraform the slab for the baseline shot: carve a pit + a tunnel, raise a mound, then smooth.
+    chunk.0.edit_sphere([13.0, 17.0, 13.0], 6.0, BrushMode::Subtract);
+    chunk.0.edit_sphere([22.0, 17.0, 20.0], 5.0, BrushMode::Subtract);
+    chunk.0.edit_sphere([24.0, 22.0, 12.0], 6.0, BrushMode::Add);
+    chunk.0.smooth_sphere([18.0, 18.0, 16.0], 8.0, 0.5);
     let _ = meshes.insert(&mesh3d.0, monkey_voxel_mesh_to_bevy(&chunk.0.mesh()));
     *done = true;
 }
@@ -210,9 +258,9 @@ mod tests {
 
     #[test]
     fn voxel_mesh_converts_with_matching_counts() {
-        let chunk = benilla_voxel::torus(10.0, 4.0, [17.0, 17.0, 17.0]);
+        let chunk = benilla_voxel::volume(10.0, 4.0, [17.0, 17.0, 17.0]);
         let vm = chunk.mesh();
-        assert!(!vm.is_empty(), "torus produced no geometry");
+        assert!(!vm.is_empty(), "volume produced no geometry");
 
         let mesh = monkey_voxel_mesh_to_bevy(&vm);
 
