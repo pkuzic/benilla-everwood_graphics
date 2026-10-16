@@ -75,6 +75,56 @@ impl Chunk {
             .collect();
         VoxelMesh { positions, normals: buffer.normals, indices: buffer.indices }
     }
+
+    /// Apply a spherical brush to the density field (the P1 edit primitive). `center` and `radius`
+    /// are in **voxel/sample coordinates** (the caller converts a world point via the chunk's
+    /// transform). CSG against the SDF, so edges stay smooth after re-meshing:
+    /// - [`BrushMode::Subtract`] (dig) carves solid away inside the sphere → `max(old, r - |p-c|)`.
+    /// - [`BrushMode::Add`] deposits solid inside the sphere → `min(old, |p-c| - r)`.
+    ///
+    /// Returns `true` if any voxel changed (so the caller can skip a re-mesh when nothing did).
+    /// Only the sphere's bounding box (+1 voxel) is touched, so cost scales with brush size, not
+    /// chunk size.
+    pub fn edit_sphere(&mut self, center: [f32; 3], radius: f32, mode: BrushMode) -> bool {
+        let dim = SAMPLES as i32;
+        let lo = |c: f32| ((c - radius - 1.0).floor() as i32).max(0);
+        let hi = |c: f32| ((c + radius + 1.0).ceil() as i32).min(dim - 1);
+        let mut changed = false;
+        for z in lo(center[2])..=hi(center[2]) {
+            for y in lo(center[1])..=hi(center[1]) {
+                for x in lo(center[0])..=hi(center[0]) {
+                    let brush = ((x as f32 - center[0]).powi(2)
+                        + (y as f32 - center[1]).powi(2)
+                        + (z as f32 - center[2]).powi(2))
+                    .sqrt()
+                        - radius; // negative inside the brush
+                    let i = ChunkShape::linearize([x as u32, y as u32, z as u32]) as usize;
+                    let old = self.density[i] as f32 / DENSITY_SCALE;
+                    let new = match mode {
+                        BrushMode::Subtract => old.max(-brush),
+                        BrushMode::Add => old.min(brush),
+                    };
+                    let q = (new * DENSITY_SCALE)
+                        .round()
+                        .clamp(i8::MIN as f32, i8::MAX as f32) as i8;
+                    if q != self.density[i] {
+                        self.density[i] = q;
+                        changed = true;
+                    }
+                }
+            }
+        }
+        changed
+    }
+}
+
+/// What a brush stroke does to the density field.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BrushMode {
+    /// Carve solid away (dig a hole / tunnel).
+    Subtract,
+    /// Deposit solid (build up terrain).
+    Add,
 }
 
 /// A plain triangle mesh — the contract between the mesher and every consumer (benilla-world render,
@@ -139,6 +189,7 @@ pub fn torus(major: f32, minor: f32, center: [f32; 3]) -> Chunk {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fast_surface_nets::ndshape::ConstShape;
     use std::collections::HashMap;
 
     #[test]
@@ -195,6 +246,37 @@ mod tests {
     #[test]
     fn air_chunk_is_empty() {
         assert!(Chunk::air().mesh().is_empty());
+    }
+
+    #[test]
+    fn subtract_brush_digs_a_hole() {
+        let mut c = sphere(12.0, [17.0, 17.0, 17.0]);
+        let ci = ChunkShape::linearize([17, 17, 17]) as usize;
+        assert!(c.density[ci] < 0, "sphere centre should start solid");
+        let before = c.mesh().tri_count();
+
+        let changed = c.edit_sphere([17.0, 17.0, 17.0], 5.0, BrushMode::Subtract);
+        assert!(changed, "dig changed nothing");
+        assert!(c.density[ci] > 0, "dug centre should now be air");
+        assert_ne!(before, c.mesh().tri_count(), "mesh unchanged after digging a hole");
+    }
+
+    #[test]
+    fn add_brush_deposits_solid() {
+        let mut c = Chunk::air();
+        assert!(c.mesh().is_empty());
+        let changed = c.edit_sphere([17.0, 17.0, 17.0], 6.0, BrushMode::Add);
+        assert!(changed, "add changed nothing");
+        assert!(!c.mesh().is_empty(), "add brush produced no geometry");
+        let ci = ChunkShape::linearize([17, 17, 17]) as usize;
+        assert!(c.density[ci] < 0, "centre of an added sphere should be solid");
+    }
+
+    #[test]
+    fn brush_outside_range_is_a_noop() {
+        let mut c = sphere(12.0, [17.0, 17.0, 17.0]);
+        // A tiny brush far in the air (corner) touches nothing solid and must report no change.
+        assert!(!c.edit_sphere([2.0, 2.0, 2.0], 1.0, BrushMode::Subtract));
     }
 
     #[test]
