@@ -1,6 +1,6 @@
 # DESIGN — Voxel Terrain (Everwood)
 
-**Status:** design settled / ready for P0 · **Branch:** `everwood-voxel_terrain` (this repo, `pkuzic/benilla-everwood_graphics`)
+**Status:** P0 + P1 (brush, multiplayer sync, shared GM-placed build site, persistence) DONE + verified; P2 server authority next · **Branch:** `everwood-voxel_terrain` (this repo, `pkuzic/benilla-everwood_graphics`)
 **Decided 2026-10-16:** Option **C** (voxel / SDF) for live networked terraforming. Editor is a benilla
 mod, **voxel-first**, NOT a Noggit rewrite.
 
@@ -204,4 +204,29 @@ WOW_CAPTURE=felwood-noon WOW_CAPTURE_OUT=<out>.png \
 Scenes: `WOW_CAPTURE=list` (felwood-noon/-night, water-noon/-night). In capture the scenario camera
 settles after the one-shot spawn, so a capture-only system keeps the torus framed (no-op in live play).
 
-*Next: P1 — in-game GM brush + server-authoritative edit-op sync over MonkeyNet.*
+## P1 — DONE + VERIFIED (2026-10-17)
+
+In-game terraforming sandbox, multiplayer sync, a shared GM-placed build site, and persistence — all
+client-side (the server-authoritative half is still the "hard 60%", below).
+
+- **P1a brush:** a multi-chunk flat-top ground slab spawns; hold **`[`** carve · **`]`** build · **`\`**
+  smooth, **`-`/`=`** brush size. Live re-mesh. Earthy unlit shading (a lit material is black under
+  benilla's custom world light).
+- **P1b multiplayer sync:** each edit broadcasts as a **guild addon message** `MV:<hex>`
+  (`ClientCommand::AddonMessage { distribution: Guild }`) — the core's `Guild::BroadcastToGuild` relays
+  `LANG_ADDON` guild chat to every online member, **no server change** (a raw custom WoW channel was NOT
+  relayed on this server). Edits are volume-LOCAL coords; remote edits that arrive before the local volume
+  exists are buffered, not dropped.
+- **P1c shared build site:** **Ctrl+P** drops a site at the GM's feet, persists it
+  (`monkey_voxel_site.bin`), and broadcasts the WORLD anchor as `VS:<hex>` (`MonkeyVoxelSpawn`). Every client
+  adopts that exact anchor and re-anchors its single volume there, so a guild's local-coord edits all land on
+  the same world spot. Survives relog. One system (`monkey_voxel_manage_volume`) owns create/place/adopt so
+  exactly one volume ever exists (a split let deferred `Commands` make two).
+- **Persistence:** every local + remote edit appends to `$BENILLA_HOME/monkey_voxel_journal.bin`, replayed
+  on spawn; the placed site anchor persists alongside.
+
+**2-client test:** `disposable/voxmp_test.ps1` (both chars in one guild — the relay is guild-scoped). Verified
+A placed `[-8963.5,-132.5,84.4]`, B adopted the identical anchor, both journals 17 B after A's edit.
+
+*Next: P2 server authority — GM-gate placement/edits + area-wide distribution (DynamicTree collision inject +
+Recast tile rebuild → walkable). Then triplanar terrain material, multi-site, P4 LOD + offline editor.*
