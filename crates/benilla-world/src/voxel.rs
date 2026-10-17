@@ -442,6 +442,7 @@ impl Plugin for MonkeyVoxelPlugin {
             (
                 monkey_voxel_manage_volume,
                 monkey_voxel_capture_follow,
+                monkey_voxel_texture_from_terrain,
                 monkey_voxel_brush_edit,
                 monkey_voxel_apply_remote,
                 monkey_voxel_autoedit,
@@ -709,6 +710,80 @@ fn monkey_voxel_capture_follow(
     };
     let centre = cam.translation() + *cam.forward() * SPAWN_AHEAD_YARDS - Vec3::Y * 3.0;
     tf.translation = centre - volume_half_extent();
+}
+
+/// Dress the voxel surface in the REAL ADT tileset of the ground under it, so a sculpted region
+/// matches the surrounding Blizzlike terrain instead of the procedural grass/rock/dirt. Each frame:
+/// find the covering tile+MCNK chunk under the volume centre; if that tile is resident, point the
+/// shared material at the tile's own `layer_array`/`alpha_array` and feed it the covering chunk's
+/// layer indices, alpha index and NW corner (the shader then triplanar-samples + alpha-blends like
+/// the real ground). Until the tile is resident the material keeps its procedural fallback, so the
+/// volume is never untextured. Re-points only when the covering (tile, chunk) changes, so the common
+/// case is one map lookup; the cloned handles pin the tile's arrays, so the look survives the tile
+/// scrolling out of the stream window. ONE volume at a time → one shared material.
+fn monkey_voxel_texture_from_terrain(
+    streamer: Res<crate::terrain_stream::TerrainStreamer>,
+    adts: Res<Assets<benilla_assets::AdtTile>>,
+    mat_handle: Res<MonkeyVoxelMaterialHandle>,
+    mut materials: ResMut<Assets<MonkeyVoxelMaterial>>,
+    volume: Query<(&Transform, &MonkeyVoxelData), With<MonkeyVoxelVolume>>,
+    mut last: Local<Option<(i32, i32, usize)>>,
+) {
+    let Ok((tf, data)) = volume.single() else {
+        return;
+    };
+    // The volume centre (Bevy origin corner + half-extent) → WoW, which names the tile and chunk.
+    let centre = tf.translation + half_extent_for(data.0.chunk_dims());
+    let wow = bevy_to_wow(centre);
+    let (tx, ty) = benilla_formats::world_to_tile(wow[0], wow[1]);
+    let tile = (tx as i32, ty as i32);
+
+    let Some(handle) = streamer.tile_handle(tile) else {
+        return; // tile not resident yet — keep the procedural fallback
+    };
+    let Some(adt) = adts.get(&handle) else {
+        return; // handle known but the asset is still loading
+    };
+    let Some(nw) = adt.chunks.first().map(|c| c.positions[0]) else {
+        return;
+    };
+
+    // Chunk index under the centre: rows step south (−WoW X), columns east (−WoW Y); idx = row*16+col.
+    let cs = benilla_formats::CHUNK_SIZE;
+    let row = (((nw[0] - wow[0]) / cs).floor() as i32).clamp(0, 15) as usize;
+    let col = (((nw[1] - wow[1]) / cs).floor() as i32).clamp(0, 15) as usize;
+    let idx = row * 16 + col;
+
+    // A hole chunk carries no real tileset (default shading = solid fallback); keep the procedural
+    // look there rather than paint it flat green.
+    let is_hole = adt.chunks.get(idx).is_none_or(|c| c.indices.len() < 3);
+    if is_hole {
+        return;
+    }
+    let Some(shading) = adt.shading.get(idx) else {
+        return;
+    };
+
+    if *last == Some((tile.0, tile.1, idx)) {
+        return; // already wearing this chunk's tileset
+    }
+    let chunk_nw = [nw[0] - row as f32 * cs, nw[1] - col as f32 * cs];
+    if let Some(mat) = materials.get_mut(&mat_handle.0) {
+        material::monkey_voxel_apply_real(
+            &mut mat.extension,
+            adt.layer_array.clone(),
+            adt.alpha_array.clone(),
+            shading.layers,
+            shading.alpha,
+            chunk_nw,
+        );
+        *last = Some((tile.0, tile.1, idx));
+        info!(
+            "MONKEY (voxel): surface now wears the real tileset of tile {tile:?} chunk {idx} \
+             (layers {:?}).",
+            shading.layers,
+        );
+    }
 }
 
 /// P1 local voxel brush (GM only). Hold **`[`** carve · **`]`** build · **`\`** smooth, aimed at the

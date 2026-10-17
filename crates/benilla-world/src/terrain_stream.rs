@@ -108,6 +108,16 @@ impl TerrainStreamer {
         let spawned = self.tiles.values().filter(|t| t.furnished).count();
         (spawned, self.tiles.len())
     }
+
+    /// MONKEY (voxel): the loaded [`AdtTile`] handle for a tile key, so the voxel build site can
+    /// read the REAL tileset of the ground it sits on and texture its sculpted surface to match.
+    /// `None` until that tile is resident (the caller keeps the procedural fallback meanwhile). The
+    /// cloned handle keeps the asset alive for as long as the voxel material holds it, so the
+    /// texture survives the tile scrolling out of the stream window.
+    #[cfg(feature = "voxel")]
+    pub fn tile_handle(&self, tile: (i32, i32)) -> Option<Handle<AdtTile>> {
+        self.tiles.get(&tile).map(|t| t.handle.clone())
+    }
 }
 
 /// One loaded tile and everything it owns.
