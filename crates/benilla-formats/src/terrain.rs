@@ -167,6 +167,35 @@ impl ChunkMesh {
     }
 }
 
+/// The fan-triangle indices for one 145-vertex (stride-17) MCNK chunk, honoring a `holes` bitmap:
+/// the same walk [`adt_to_tile_mesh`] inlines, extracted so a caller can RE-derive a chunk's
+/// indices with EXTRA holes. The voxel build site uses it to carve the real ADT ground out from
+/// under its footprint (`holes | extra_holes`), so a dug hole shows the voxel interior, not the old
+/// flat ground. For each of the 8×8 cells a set hole bit `(row>>1)·4 + (col>>1)` drops that cell's
+/// four fan triangles; the vertices stay, exactly as a loaded hole does.
+pub fn chunk_indices_holed(holes: u16) -> Vec<u32> {
+    let mut indices = Vec::with_capacity(8 * 8 * 12);
+    for row in 0..8u32 {
+        for col in 0..8u32 {
+            if holes & (1u16 << ((row >> 1) * 4 + (col >> 1))) != 0 {
+                continue;
+            }
+            let tl = row * 17 + col;
+            let tr = tl + 1;
+            let bl = tl + 17;
+            let br = bl + 1;
+            let ctr = row * 17 + 9 + col;
+            indices.extend_from_slice(&[
+                ctr, tl, bl, // west fan
+                ctr, bl, br, // south fan
+                ctr, br, tr, // east fan
+                ctr, tr, tl, // north fan
+            ]);
+        }
+    }
+    indices
+}
+
 /// The `z` of `tri` at column `(x, y)`, `None` outside its XY projection or for a vertical face.
 /// Shared by the WMO down-ray and the terrain probe, the two legs of the reference's arbitration.
 pub fn triangle_z_at(tri: &[[f32; 3]; 3], x: f32, y: f32) -> Option<f32> {
@@ -355,27 +384,10 @@ pub fn adt_to_tile_mesh(adt_bytes: &[u8]) -> Result<TileMesh> {
         }
 
         // Four fan triangles per cell, CCW from above (front face up in Bevy under the det +1
-        // transform); a set hole bit drops its 2×2 block, and 1.12 has no high-res holes.
+        // transform); a set hole bit drops its 2×2 block, and 1.12 has no high-res holes. The walk
+        // lives in `chunk_indices_holed`, shared with the voxel build site's hole re-derivation.
         let holes = mcnk.header.holes_low_res;
-        let mut indices = Vec::with_capacity(8 * 8 * 12);
-        for row in 0..8u32 {
-            for col in 0..8u32 {
-                if holes & (1u16 << ((row >> 1) * 4 + (col >> 1))) != 0 {
-                    continue;
-                }
-                let tl = row * 17 + col;
-                let tr = tl + 1;
-                let bl = tl + 17;
-                let br = bl + 1;
-                let ctr = row * 17 + 9 + col;
-                indices.extend_from_slice(&[
-                    ctr, tl, bl, // west fan
-                    ctr, bl, br, // south fan
-                    ctr, br, tr, // east fan
-                    ctr, tr, tl, // north fan
-                ]);
-            }
-        }
+        let indices = chunk_indices_holed(holes);
 
         // Name and effect id together, so the two vecs stay aligned when a layer is dropped.
         let layers: Vec<(String, u32)> = mcnk

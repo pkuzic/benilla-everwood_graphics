@@ -1,0 +1,399 @@
+//! MONKEY (voxel): hide the real ADT terrain under a voxel build site, so a region placed on the
+//! real ground REPLACES it — a hole dug into the voxel shows the voxel interior (dark walls going
+//! down), not the old flat heightmap ground poking through at its original height.
+//!
+//! The terrain renderer draws one mesh per CELL = 4×4 MCNK chunks (`terrain_stream::furnish`). This
+//! module finds the cells the voxel footprint overlaps and re-meshes them with the covered MCNK
+//! chunks carved out via [`benilla_formats::chunk_indices_holed`] (`chunk.holes | extra_holes`) — a
+//! block-precise hole, the same mechanism a loaded ADT hole uses. It is reversible: a cell is
+//! restored (re-meshed un-holed) when the region moves off it or is removed, and re-carved when a
+//! tile streams out and back in (the furnisher respawns the cell fresh/visible). Collision is left
+//! untouched — the voxel carries its own walk collider; dig-through terrain collision is a later
+//! lane (see the module's note in the report).
+//!
+//! Everything here is gated behind the crate's `voxel` cargo feature, like the rest of `voxel`.
+
+use std::collections::{HashMap, HashSet};
+
+use bevy::camera::primitives::Aabb;
+use bevy::math::Vec3A;
+use bevy::prelude::*;
+
+use super::{MonkeyVoxelData, MonkeyVoxelVolume};
+use crate::terrain_stream::TerrainStreamer;
+use benilla_assets::coords::bevy_to_wow;
+use benilla_assets::materials::TerrainMaterial;
+use benilla_assets::{chunks_to_mesh, AdtTile, ChunkShading};
+use benilla_formats::{chunk_indices_holed, ChunkMesh};
+
+/// `(tile_x, tile_y, cell_idx)`: a render cell (4×4 MCNK chunks) of one tile, the unit the
+/// furnisher spawns one `Mesh3d` + `MeshMaterial3d<TerrainMaterial>` per.
+type CellKey = (i32, i32, usize);
+
+/// What to carve out of one render cell: the extra hole bits per MCNK chunk (`chunk_idx` within the
+/// tile, 0..256) plus a cheap signature so a moved footprint re-carves only when the bits change.
+struct CellPlan {
+    chunk_holes: Vec<(usize, u16)>,
+    sig: u64,
+}
+
+/// The build site's terrain-hiding state: the footprint signature (recompute the plan only when it
+/// changes), the per-cell carve plan, and which cell entities are currently carved (so they are
+/// restored when the footprint leaves them and re-carved after a stream-out/in respawns them).
+#[derive(Resource, Default)]
+pub(super) struct MonkeyVoxelHideState {
+    /// Quantized footprint signature (centre ×2 rounded, chunk dims); `None` = no volume / cleared.
+    sig: Option<(i64, i64, [u32; 3])>,
+    /// The carve plan per affected render cell.
+    desired: HashMap<CellKey, CellPlan>,
+    /// Carved cell entities → (key, plan-sig) they were carved for.
+    applied: HashMap<Entity, (CellKey, u64)>,
+}
+
+/// `WOW_VOXEL_NO_HIDE=1`: keep the real ADT ground under the build site (the pre-hiding look), a
+/// dev A/B switch read once.
+fn monkey_voxel_hide_disabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("WOW_VOXEL_NO_HIDE").is_some())
+}
+
+/// Half the yard-size of a 2-cell hole block (= `CHUNK_SIZE / 4` ≈ 8.33 yd), the granularity the
+/// `holes` bitmap drops: bit `(row>>1)*4 + (col>>1)` for the 8×8 cell grid.
+#[inline]
+fn block_size() -> f32 {
+    benilla_formats::CHUNK_SIZE / 4.0
+}
+
+/// The world-centre of the 64×64 tile grid in WoW yards; the global MCNK grid counts out from here.
+#[inline]
+fn map_center() -> f32 {
+    32.0 * benilla_formats::TILE_SIZE
+}
+
+/// The `(tile_x, tile_y, cell_idx)` a WoW XY column falls in, by the global MCNK grid. Rows step
+/// south (−X) and are `tile_y`'s axis; columns step east (−Y) and are `tile_x`'s axis — the same
+/// split `benilla_formats::world_to_tile` uses (`tile_x` from Y, `tile_y` from X).
+fn cell_key_at(wow_x: f32, wow_y: f32) -> CellKey {
+    let cs = benilla_formats::CHUNK_SIZE;
+    let mc = map_center();
+    let gx = (((mc - wow_x) / cs).floor() as i32).clamp(0, 1023); // global chunk row (X / south)
+    let gy = (((mc - wow_y) / cs).floor() as i32).clamp(0, 1023); // global chunk col (Y / east)
+    let (tx, ty) = (gy / 16, gx / 16);
+    let (row, col) = ((gx % 16) as usize, (gy % 16) as usize);
+    (tx, ty, (row / 4) * 4 + (col / 4))
+}
+
+/// The render cell an entity's world-space `Aabb` names, from its horizontal centre.
+fn cell_key_of(center: Vec3A) -> CellKey {
+    // Bevy → WoW horizontal: wow_x (north) = −bevy_z, wow_y (west) = −bevy_x.
+    cell_key_at(-center.z, -center.x)
+}
+
+/// Build the per-cell carve plan for the footprint `[fx0,fx1]×[fy0,fy1]` (WoW X×Y). Only tiles that
+/// are resident (handle + loaded asset) are planned — a cell of a tile we can't read can't be
+/// re-meshed, so its old ground stays (reported as a tile-straddle limitation).
+fn compute_desired(
+    fx0: f32,
+    fx1: f32,
+    fy0: f32,
+    fy1: f32,
+    streamer: &TerrainStreamer,
+    adts: &Assets<AdtTile>,
+) -> HashMap<CellKey, CellPlan> {
+    let cs = benilla_formats::CHUNK_SIZE;
+    let mc = map_center();
+    let block = block_size();
+    const EPS: f32 = 1.0e-3;
+
+    // The global MCNK chunk index range the footprint's bounding box touches.
+    let gx_lo = (((mc - fx1) / cs).floor() as i32).clamp(0, 1023);
+    let gx_hi = (((mc - fx0) / cs).floor() as i32).clamp(0, 1023);
+    let gy_lo = (((mc - fy1) / cs).floor() as i32).clamp(0, 1023);
+    let gy_hi = (((mc - fy0) / cs).floor() as i32).clamp(0, 1023);
+
+    // Accumulate extra hole bits per (tile, chunk index within tile). A 2-cell hole block is holed
+    // when its CENTRE lies inside the footprint — nearest-rounding to the 8.33-yd block grid, which
+    // keeps the carved region within ~half a block of the true 32-yd footprint (minimal
+    // over-removal, the alternative "any overlap" test rounds the hole UP by a whole block per edge
+    // and shows a void ring around the patch). `EPS` biases the boundary so a block centred exactly
+    // on the footprint edge is not holed.
+    let mut per_tile: HashMap<(i32, i32), HashMap<usize, u16>> = HashMap::new();
+    for gx in gx_lo..=gx_hi {
+        let chunk_x_hi = mc - gx as f32 * cs; // chunk's north edge (max X)
+        for gy in gy_lo..=gy_hi {
+            let chunk_y_hi = mc - gy as f32 * cs; // chunk's west edge (max Y)
+            let (tx, ty) = (gy / 16, gx / 16);
+            let chunk_idx = (gx % 16) as usize * 16 + (gy % 16) as usize;
+            let mut bits: u16 = 0;
+            for brow in 0..4i32 {
+                let bx_mid = chunk_x_hi - (brow as f32 + 0.5) * block;
+                if bx_mid <= fx0 + EPS || bx_mid >= fx1 - EPS {
+                    continue; // this block's centre is outside the footprint's X span
+                }
+                for bcol in 0..4i32 {
+                    let by_mid = chunk_y_hi - (bcol as f32 + 0.5) * block;
+                    if by_mid <= fy0 + EPS || by_mid >= fy1 - EPS {
+                        continue;
+                    }
+                    bits |= 1u16 << (brow * 4 + bcol);
+                }
+            }
+            if bits != 0 {
+                *per_tile
+                    .entry((tx, ty))
+                    .or_default()
+                    .entry(chunk_idx)
+                    .or_insert(0) |= bits;
+            }
+        }
+    }
+
+    // Group affected chunks into their render cells, dropping non-resident tiles.
+    let mut desired: HashMap<CellKey, CellPlan> = HashMap::new();
+    for ((tx, ty), chunks) in per_tile {
+        let Some(handle) = streamer.tile_handle((tx, ty)) else {
+            continue;
+        };
+        if adts.get(&handle).is_none() {
+            continue;
+        }
+        for (chunk_idx, bits) in chunks {
+            let (row, col) = (chunk_idx / 16, chunk_idx % 16);
+            let cell = (row / 4) * 4 + (col / 4);
+            desired
+                .entry((tx, ty, cell))
+                .or_insert_with(|| CellPlan {
+                    chunk_holes: Vec::new(),
+                    sig: 0,
+                })
+                .chunk_holes
+                .push((chunk_idx, bits));
+        }
+    }
+    for plan in desired.values_mut() {
+        plan.chunk_holes.sort_unstable();
+        // FNV-1a over the (chunk, bits) pairs: changes when the covered blocks change.
+        let mut h = 0xcbf29ce484222325u64;
+        for (ci, bits) in &plan.chunk_holes {
+            for b in (*ci as u64).to_le_bytes().into_iter().chain(bits.to_le_bytes()) {
+                h = (h ^ b as u64).wrapping_mul(0x100000001b3);
+            }
+        }
+        plan.sig = h;
+    }
+    desired
+}
+
+/// Re-mesh one render cell of `adt`, applying `extra` (chunk-index → extra hole bits) to the
+/// chunks it names; `extra` empty restores the un-holed cell. `None` if every chunk is a hole (a
+/// 32-yd footprint never covers a whole 133-yd cell, so in practice this always builds a mesh).
+fn rebuild_cell_mesh(adt: &AdtTile, cell: usize, extra: &[(usize, u16)]) -> Option<Mesh> {
+    let (cy, cx) = (cell / 4, cell % 4);
+    // Clone only the chunks we hole; the rest are referenced from the asset.
+    let mut clones: HashMap<usize, ChunkMesh> = HashMap::new();
+    for &(ci, bits) in extra {
+        if bits == 0 {
+            continue;
+        }
+        let (row, col) = (ci / 16, ci % 16);
+        if row / 4 != cy || col / 4 != cx {
+            continue; // a chunk of another cell, ignore here
+        }
+        if let Some(src) = adt.chunks.get(ci) {
+            let mut c = src.clone();
+            c.indices = chunk_indices_holed(src.holes | bits);
+            clones.insert(ci, c);
+        }
+    }
+    let mut parts: Vec<(&ChunkMesh, &ChunkShading)> = Vec::with_capacity(16);
+    for dy in 0..4usize {
+        for dx in 0..4usize {
+            let ci = (cy * 4 + dy) * 16 + (cx * 4 + dx);
+            let Some(shading) = adt.shading.get(ci) else {
+                continue;
+            };
+            if let Some(chunk) = clones.get(&ci).or_else(|| adt.chunks.get(ci)) {
+                parts.push((chunk, shading));
+            }
+        }
+    }
+    chunks_to_mesh(&parts)
+}
+
+/// Swap the cell entity's rendered mesh in place (carve with `extra`, or restore with `&[]`).
+/// Returns whether the swap happened (the tile must still be resident to re-read its chunks).
+fn swap_cell(
+    adts: &Assets<AdtTile>,
+    streamer: &TerrainStreamer,
+    meshes: &mut Assets<Mesh>,
+    key: CellKey,
+    extra: &[(usize, u16)],
+    mesh3d: &Mesh3d,
+) -> bool {
+    let (tx, ty, cell) = key;
+    let Some(handle) = streamer.tile_handle((tx, ty)) else {
+        return false;
+    };
+    let Some(adt) = adts.get(&handle) else {
+        return false;
+    };
+    let Some(mesh) = rebuild_cell_mesh(adt, cell, extra) else {
+        return false;
+    };
+    // The vertices are unchanged (a hole only drops triangles), so the entity's cull Aabb stays
+    // valid — no need to touch it.
+    let _ = meshes.insert(&mesh3d.0, mesh);
+    true
+}
+
+/// Carve the ADT terrain under the voxel build site, and keep the carve in step with the region:
+/// recompute the plan when the footprint moves, carve newly-resident cells, restore cells the
+/// footprint has left (or whose covered blocks changed), and re-carve cells the streamer respawned.
+#[allow(clippy::type_complexity)]
+pub(super) fn monkey_voxel_hide_terrain(
+    streamer: Res<TerrainStreamer>,
+    adts: Res<Assets<AdtTile>>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut state: ResMut<MonkeyVoxelHideState>,
+    volume: Query<(&Transform, &MonkeyVoxelData), With<MonkeyVoxelVolume>>,
+    cells: Query<(Entity, &Mesh3d, &Aabb), With<MeshMaterial3d<TerrainMaterial>>>,
+) {
+    // Dev A/B switch (`WOW_VOXEL_NO_HIDE=1`): leave the real ground showing under the patch, as the
+    // pre-hiding behaviour, so a capture can compare carved vs un-carved. Restores first so a live
+    // toggle reverts cleanly.
+    let no_hide = monkey_voxel_hide_disabled();
+
+    // No volume (or hiding disabled): restore every still-living carved cell, then forget the plan.
+    let volume = if no_hide { Err(()) } else { volume.single().map_err(|_| ()) };
+    let Ok((tf, data)) = volume else {
+        if !state.applied.is_empty() {
+            let living: HashMap<Entity, Mesh3d> =
+                cells.iter().map(|(e, m, _)| (e, m.clone())).collect();
+            for (e, (key, _)) in std::mem::take(&mut state.applied) {
+                if let Some(mesh3d) = living.get(&e) {
+                    swap_cell(&adts, &streamer, &mut meshes, key, &[], mesh3d);
+                }
+            }
+        }
+        state.desired.clear();
+        state.sig = None;
+        return;
+    };
+
+    // Footprint in WoW yards: the volume centre ± the horizontal half-extent. Bevy X ↔ WoW Y, Bevy
+    // Z ↔ WoW X, so the WoW X span is half.z and the WoW Y span is half.x.
+    let half = super::half_extent_for(data.0.chunk_dims());
+    let centre = tf.translation + half;
+    let wow = bevy_to_wow(centre);
+    let (fx0, fx1) = (wow[0] - half.z, wow[0] + half.z);
+    let (fy0, fy1) = (wow[1] - half.x, wow[1] + half.x);
+
+    // Recompute the plan only when the footprint meaningfully moves (quantised to 0.5 yd).
+    let q = |v: f32| (v * 2.0).round() as i64;
+    let sig = (q(wow[0]), q(wow[1]), data.0.chunk_dims());
+    if state.sig != Some(sig) {
+        state.sig = Some(sig);
+        state.desired = compute_desired(fx0, fx1, fy0, fy1, &streamer, &adts);
+        let plan: Vec<_> = state
+            .desired
+            .iter()
+            .map(|(k, p)| (*k, p.chunk_holes.clone()))
+            .collect();
+        info!(
+            "MONKEY (voxel): hide plan — footprint WoW X[{:.1},{:.1}] Y[{:.1},{:.1}] covers {} \
+             render cell(s): {:?}",
+            fx0,
+            fx1,
+            fy0,
+            fy1,
+            state.desired.len(),
+            plan,
+        );
+    }
+
+    // Index the resident terrain cells by their render-cell key.
+    let mut by_key: HashMap<CellKey, (Entity, Mesh3d)> = HashMap::new();
+    let mut living: HashSet<Entity> = HashSet::new();
+    for (e, mesh3d, aabb) in &cells {
+        living.insert(e);
+        by_key.insert(cell_key_of(aabb.center), (e, mesh3d.clone()));
+    }
+
+    // Restore cells no longer carved the way the plan wants (moved off, bits changed), and forget
+    // carved cells the streamer despawned (their mesh asset went with them).
+    let snapshot: Vec<(Entity, CellKey, u64)> = state
+        .applied
+        .iter()
+        .map(|(e, (k, s))| (*e, *k, *s))
+        .collect();
+    for (e, key, applied_sig) in snapshot {
+        if !living.contains(&e) {
+            state.applied.remove(&e);
+            continue;
+        }
+        if state.desired.get(&key).map(|p| p.sig) != Some(applied_sig) {
+            if let Some((_, mesh3d)) = by_key.get(&key) {
+                swap_cell(&adts, &streamer, &mut meshes, key, &[], mesh3d);
+            }
+            state.applied.remove(&e);
+        }
+    }
+
+    // Carve desired cells that aren't already carved on a live entity for the current plan.
+    let desired_keys: Vec<CellKey> = state.desired.keys().copied().collect();
+    for key in desired_keys {
+        let plan_sig = state.desired[&key].sig;
+        let already = state
+            .applied
+            .iter()
+            .any(|(e, (k, s))| *k == key && *s == plan_sig && living.contains(e));
+        if already {
+            continue;
+        }
+        let Some((e, mesh3d)) = by_key.get(&key).map(|(e, m)| (*e, m.clone())) else {
+            continue; // the cell hasn't streamed in yet; caught on a later frame
+        };
+        if swap_cell(
+            &adts,
+            &streamer,
+            &mut meshes,
+            key,
+            &state.desired[&key].chunk_holes,
+            &mesh3d,
+        ) {
+            state.applied.insert(e, (key, plan_sig));
+            // `debug!`, not `info!`: this re-fires whenever a tile streams out and back in and the
+            // cell respawns, so it must not spam the player's log on every pass near a build site.
+            debug!(
+                "MONKEY (voxel): carved terrain cell {key:?} (entity {e:?}) — the real ADT ground \
+                 under the build site is now holed."
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The render-cell key round-trips Bevy-centre → WoW → (tile, cell) consistently with the
+    /// footprint planner's own `cell_key_at`, for a handful of tile/cell centres.
+    #[test]
+    fn cell_key_round_trips_through_bevy_centre() {
+        let cs = benilla_formats::CHUNK_SIZE;
+        let mc = super::map_center();
+        for &(tx, ty, row, col) in &[(32i32, 49i32, 5usize, 10usize), (0, 0, 0, 0), (63, 63, 15, 15)]
+        {
+            // The WoW centre of chunk (tile_y row, tile_x col) → its render cell.
+            let gx = ty * 16 + row as i32;
+            let gy = tx * 16 + col as i32;
+            let wow_x = mc - (gx as f32 + 0.5) * cs;
+            let wow_y = mc - (gy as f32 + 0.5) * cs;
+            let expect = ((tx, ty, (row / 4) * 4 + (col / 4)), cell_key_at(wow_x, wow_y));
+            assert_eq!(expect.0, expect.1, "cell_key_at mismatch");
+            // Bevy horizontal centre = wow_to_bevy: (−wow_y, _, −wow_x).
+            let via_aabb = cell_key_of(Vec3A::new(-wow_y, 123.0, -wow_x));
+            assert_eq!(via_aabb, expect.0, "aabb centre → cell key");
+        }
+    }
+}

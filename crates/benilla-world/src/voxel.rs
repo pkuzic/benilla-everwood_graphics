@@ -18,6 +18,9 @@ mod material;
 pub use material::MonkeyVoxelMaterial;
 use material::MonkeyVoxelMaterialHandle;
 
+mod terrain_hide;
+use terrain_hide::{monkey_voxel_hide_terrain, MonkeyVoxelHideState};
+
 use crate::view::WorldCamera;
 use benilla_assets::coords::{bevy_to_wow, wow_to_bevy};
 use benilla_voxel::BrushMode;
@@ -433,6 +436,7 @@ impl Plugin for MonkeyVoxelPlugin {
         app.init_resource::<MonkeyVoxelNet>();
         app.init_resource::<MonkeyVoxelSiteSpawned>();
         app.init_resource::<MonkeyLocalGm>();
+        app.init_resource::<MonkeyVoxelHideState>();
         // Spawn once, in front of the camera, so it is guaranteed on-screen on any login — gated on
         // a live world (a `WorldCamera` with a real pose) and a `Local` one-shot latch.
         // Chained for a deterministic order: volume management (create / place / adopt) runs BEFORE
@@ -448,6 +452,9 @@ impl Plugin for MonkeyVoxelPlugin {
                 monkey_voxel_autoedit,
                 monkey_voxel_capture_demo_edit,
                 monkey_voxel_sync_collider,
+                // Hide the real ADT ground under the footprint, after the volume's transform and
+                // density are finalised for the frame — so a dug hole shows the voxel interior.
+                monkey_voxel_hide_terrain,
             )
                 .chain()
                 .run_if(crate::schedule::world_is_live),
@@ -702,7 +709,11 @@ fn monkey_voxel_capture_follow(
     camera: Query<&GlobalTransform, With<WorldCamera>>,
     mut volume: Query<&mut Transform, With<MonkeyVoxelVolume>>,
 ) {
-    if std::env::var_os("WOW_CAPTURE").is_none() {
+    // `WOW_VOXEL_NO_FOLLOW=1`: leave the volume where it was ground-seeded (don't glue it to the
+    // camera), so a capture can verify the on-GROUND terrain-hiding (a dug hole at ground height),
+    // which the glued-ahead float would hide by lifting the patch off the real ground.
+    if std::env::var_os("WOW_CAPTURE").is_none() || std::env::var_os("WOW_VOXEL_NO_FOLLOW").is_some()
+    {
         return;
     }
     let (Ok(cam), Ok(mut tf)) = (camera.single(), volume.single_mut()) else {
