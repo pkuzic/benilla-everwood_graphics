@@ -21,6 +21,8 @@ pub(crate) fn plugin(app: &mut App) {
     bevy::asset::embedded_asset!(app, "shaders/static_gx.wgsl");
     // MONKEY (torch shadows Phase 1): the vertex-only depth-map shader for the interior-fixture pass.
     bevy::asset::embedded_asset!(app, "shaders/torch_depth.wgsl");
+    #[cfg(feature = "voxel")]
+    bevy::asset::embedded_asset!(app, "shaders/monkey_voxel.wgsl");
 }
 
 #[cfg(test)]
@@ -45,6 +47,10 @@ mod tests {
             if !name.ends_with(".wgsl") {
                 continue;
             }
+            #[cfg(not(feature = "voxel"))]
+            if name == "monkey_voxel.wgsl" {
+                continue;
+            }
             found += 1;
             let path = format!("benilla_world/shaders/{name}");
             let read = bevy::tasks::block_on(async {
@@ -62,6 +68,10 @@ mod tests {
         // 8 since 2016 added `sky_vertex.wgsl` (the sky's shared far-depth vertex stage);
         // 9 since the torch-shadow Phase 1 added `torch_depth.wgsl` (the interior depth map).
         // MONKEY (sky): 10 with `sky_fx.wgsl`, the sky's Enhanced/High library.
-        assert_eq!(found, 10, "the engine's shader set changed size");
+        assert_eq!(
+            found,
+            if cfg!(feature = "voxel") { 11 } else { 10 },
+            "the engine's shader set changed size"
+        );
     }
 }

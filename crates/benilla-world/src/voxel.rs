@@ -14,6 +14,10 @@ use bevy::asset::RenderAssetUsages;
 use bevy::mesh::{Indices, PrimitiveTopology};
 use bevy::prelude::*;
 
+mod material;
+pub use material::MonkeyVoxelMaterial;
+use material::MonkeyVoxelMaterialHandle;
+
 use crate::view::WorldCamera;
 use benilla_assets::coords::{bevy_to_wow, wow_to_bevy};
 use benilla_voxel::BrushMode;
@@ -31,52 +35,6 @@ pub fn monkey_voxel_mesh_to_bevy(vm: &benilla_voxel::VoxelMesh) -> Mesh {
     );
     mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, vm.positions.clone());
     mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, vm.normals.clone());
-    // Bake a terrain look straight into vertex colours and render it UNLIT: a lit StandardMaterial
-    // renders black against benilla's bespoke world light, so we can't rely on the scene light. We
-    // blend grass / dirt / rock by SLOPE (flat tops = grass, gentle = dirt, cliffs = rock), shade by
-    // a fixed sun plus ambient so the sculpted form reads, and add a touch of position mottle so big
-    // flats don't look like painted plastic. A true triplanar material that samples the ADT splat
-    // set is a later lane (owner decision 4); this is the stand-in that already looks like ground.
-    const GRASS: [f32; 3] = [0.29, 0.40, 0.17];
-    const DIRT: [f32; 3] = [0.44, 0.35, 0.22];
-    const ROCK: [f32; 3] = [0.40, 0.40, 0.43];
-    // A fixed "sun" in Bevy space (up and to one side), normalised.
-    let sun = {
-        let v = [0.35f32, 0.80, 0.50];
-        let l = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
-        [v[0] / l, v[1] / l, v[2] / l]
-    };
-    let lerp3 = |a: [f32; 3], b: [f32; 3], t: f32| {
-        [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t]
-    };
-    let smoothstep = |e0: f32, e1: f32, x: f32| {
-        let t = ((x - e0) / (e1 - e0)).clamp(0.0, 1.0);
-        t * t * (3.0 - 2.0 * t)
-    };
-    let colors: Vec<[f32; 4]> = vm
-        .positions
-        .iter()
-        .zip(vm.normals.iter())
-        .map(|(p, n)| {
-            let slope = n[1].clamp(0.0, 1.0); // 1 = flat (facing up), 0 = vertical cliff
-            // rock on the steep, grass on the flat, dirt in between.
-            let rock_to_dirt = lerp3(ROCK, DIRT, smoothstep(0.45, 0.70, slope));
-            let base = lerp3(rock_to_dirt, GRASS, smoothstep(0.80, 0.94, slope));
-            // Cheap value-noise mottle from world position, ±6%.
-            let h = (p[0] * 12.9898 + p[1] * 51.233 + p[2] * 78.233).sin() * 43758.547;
-            let mottle = 1.0 + ((h - h.floor()) - 0.5) * 0.12;
-            // Directional sun (half-lambert so backfaces aren't pure black) + ambient floor.
-            let ndl = n[0] * sun[0] + n[1] * sun[1] + n[2] * sun[2];
-            let light = (0.45 + 0.55 * (ndl * 0.5 + 0.5)) * mottle;
-            [
-                (base[0] * light).clamp(0.0, 1.0),
-                (base[1] * light).clamp(0.0, 1.0),
-                (base[2] * light).clamp(0.0, 1.0),
-                1.0,
-            ]
-        })
-        .collect();
-    mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, colors);
     mesh.insert_indices(Indices::U32(vm.indices.clone()));
     mesh
 }
@@ -90,8 +48,16 @@ fn monkey_voxel_collider(vm: &benilla_voxel::VoxelMesh) -> Option<Collider> {
     if vm.indices.len() < 3 {
         return None;
     }
-    let verts: Vec<Vec3> = vm.positions.iter().map(|p| Vec3::new(p[0], p[1], p[2])).collect();
-    let tris: Vec<[u32; 3]> = vm.indices.chunks_exact(3).map(|c| [c[0], c[1], c[2]]).collect();
+    let verts: Vec<Vec3> = vm
+        .positions
+        .iter()
+        .map(|p| Vec3::new(p[0], p[1], p[2]))
+        .collect();
+    let tris: Vec<[u32; 3]> = vm
+        .indices
+        .chunks_exact(3)
+        .map(|c| [c[0], c[1], c[2]])
+        .collect();
     Some(Collider::trimesh(verts, tris))
 }
 
@@ -268,7 +234,9 @@ fn monkey_voxel_journal_load() -> Vec<MonkeyVoxelEdit> {
     };
     bytes
         .chunks_exact(17)
-        .filter_map(|c| MonkeyVoxelEdit::from_hex(&c.iter().map(|x| format!("{x:02x}")).collect::<String>()))
+        .filter_map(|c| {
+            MonkeyVoxelEdit::from_hex(&c.iter().map(|x| format!("{x:02x}")).collect::<String>())
+        })
         .collect()
 }
 
@@ -313,20 +281,12 @@ fn monkey_voxel_fresh(chunks: [u32; 3], surface: f32) -> benilla_voxel::VoxelVol
         monkey_voxel_apply_one(&mut volume, e);
     }
     if !saved.is_empty() {
-        info!("MONKEY (voxel): replayed {} journalled edit(s)", saved.len());
+        info!(
+            "MONKEY (voxel): replayed {} journalled edit(s)",
+            saved.len()
+        );
     }
     volume
-}
-
-/// Earthy unlit material (shading rides in the mesh's vertex colours; a lit material is black under
-/// benilla's custom world light).
-fn monkey_voxel_material(materials: &mut Assets<StandardMaterial>) -> Handle<StandardMaterial> {
-    materials.add(StandardMaterial {
-        base_color: Color::WHITE,
-        unlit: true,
-        cull_mode: None,
-        ..default()
-    })
 }
 
 /// Spawn the single voxel-volume entity with its centre at `centre_bevy`. Used when no volume exists
@@ -335,7 +295,7 @@ fn monkey_voxel_material(materials: &mut Assets<StandardMaterial>) -> Handle<Sta
 fn monkey_voxel_build_entity(
     commands: &mut Commands,
     meshes: &mut Assets<Mesh>,
-    materials: &mut Assets<StandardMaterial>,
+    material: &Handle<MonkeyVoxelMaterial>,
     chunks: [u32; 3],
     surface: f32,
     centre_bevy: Vec3,
@@ -344,11 +304,10 @@ fn monkey_voxel_build_entity(
     let voxel_mesh = volume.mesh();
     let (tri_count, vert_count) = (voxel_mesh.tri_count(), voxel_mesh.positions.len());
     let mesh = meshes.add(monkey_voxel_mesh_to_bevy(&voxel_mesh));
-    let material = monkey_voxel_material(materials);
     let origin = centre_bevy - half_extent_for(chunks);
     commands.spawn((
         Mesh3d(mesh),
-        MeshMaterial3d(material),
+        MeshMaterial3d(material.clone()),
         Transform::from_translation(origin),
         MonkeyVoxelVolume,
         MonkeyVoxelData(volume),
@@ -411,6 +370,8 @@ pub struct MonkeyVoxelPlugin;
 
 impl Plugin for MonkeyVoxelPlugin {
     fn build(&self, app: &mut App) {
+        app.add_plugins(MaterialPlugin::<MonkeyVoxelMaterial>::default());
+        app.add_systems(Startup, material::monkey_voxel_create_material);
         app.init_resource::<MonkeyVoxelBrushRadius>();
         app.init_resource::<MonkeyVoxelNet>();
         app.init_resource::<MonkeyVoxelSiteSpawned>();
@@ -486,7 +447,7 @@ fn monkey_voxel_manage_volume(
     gm: Res<MonkeyLocalGm>,
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
+    material: Res<MonkeyVoxelMaterialHandle>,
     camera: Query<&GlobalTransform, With<WorldCamera>>,
     world: crate::world_point::WorldPoint,
     mut volume: Query<(&mut MonkeyVoxelData, &mut Transform, &Mesh3d), With<MonkeyVoxelVolume>>,
@@ -507,7 +468,11 @@ fn monkey_voxel_manage_volume(
     if let Some(site) = net.spawn_inbox.drain(..).last() {
         monkey_voxel_site_save(&site);
         monkey_voxel_journal_clear();
-        let chunks = [site.chunks[0] as u32, site.chunks[1] as u32, site.chunks[2] as u32];
+        let chunks = [
+            site.chunks[0] as u32,
+            site.chunks[1] as u32,
+            site.chunks[2] as u32,
+        ];
         new_site = Some((wow_to_bevy(site.anchor_wow), chunks, site.surface));
         let a = site.anchor_wow;
         info!(
@@ -532,7 +497,11 @@ fn monkey_voxel_manage_volume(
         let centre = site_centre_at_player(cam, &world, VOL_CHUNKS, VOL_SURFACE);
         let site = MonkeyVoxelSpawn {
             anchor_wow: bevy_to_wow(centre),
-            chunks: [VOL_CHUNKS[0] as u8, VOL_CHUNKS[1] as u8, VOL_CHUNKS[2] as u8],
+            chunks: [
+                VOL_CHUNKS[0] as u8,
+                VOL_CHUNKS[1] as u8,
+                VOL_CHUNKS[2] as u8,
+            ],
             surface: VOL_SURFACE,
         };
         monkey_voxel_site_save(&site);
@@ -551,7 +520,15 @@ fn monkey_voxel_manage_volume(
     // persisted site, else the solo-sandbox placement ahead of the settled view.
     if let Ok((mut data, mut tf, mesh3d)) = volume.single_mut() {
         if let Some((centre, chunks, surface)) = new_site {
-            monkey_voxel_relocate(&mut data, &mut tf, mesh3d, &mut meshes, chunks, surface, centre);
+            monkey_voxel_relocate(
+                &mut data,
+                &mut tf,
+                mesh3d,
+                &mut meshes,
+                chunks,
+                surface,
+                centre,
+            );
         }
         return;
     }
@@ -559,12 +536,30 @@ fn monkey_voxel_manage_volume(
         return; // volume creation already queued this/last frame; nothing to do until it exists
     }
     if let Some((centre, chunks, surface)) = new_site {
-        monkey_voxel_build_entity(&mut commands, &mut meshes, &mut materials, chunks, surface, centre);
+        monkey_voxel_build_entity(
+            &mut commands,
+            &mut meshes,
+            &material.0,
+            chunks,
+            surface,
+            centre,
+        );
         spawned.0 = true;
     } else if let Some(site) = monkey_voxel_site_load() {
-        let chunks = [site.chunks[0] as u32, site.chunks[1] as u32, site.chunks[2] as u32];
+        let chunks = [
+            site.chunks[0] as u32,
+            site.chunks[1] as u32,
+            site.chunks[2] as u32,
+        ];
         let c = wow_to_bevy(site.anchor_wow);
-        monkey_voxel_build_entity(&mut commands, &mut meshes, &mut materials, chunks, site.surface, c);
+        monkey_voxel_build_entity(
+            &mut commands,
+            &mut meshes,
+            &material.0,
+            chunks,
+            site.surface,
+            c,
+        );
         spawned.0 = true;
     } else {
         // Solo sandbox: wait for the camera to settle (world-enter keeps nudging it), then drop the
@@ -586,7 +581,14 @@ fn monkey_voxel_manage_volume(
             top_y - VOL_SURFACE * benilla_voxel::VOXEL_SIZE,
             ahead.z - half.z,
         );
-        monkey_voxel_build_entity(&mut commands, &mut meshes, &mut materials, VOL_CHUNKS, VOL_SURFACE, origin + half);
+        monkey_voxel_build_entity(
+            &mut commands,
+            &mut meshes,
+            &material.0,
+            VOL_CHUNKS,
+            VOL_SURFACE,
+            origin + half,
+        );
         spawned.0 = true;
     }
 }
@@ -688,10 +690,14 @@ fn monkey_voxel_brush_edit(
             BrushMode::Add => 1,
             BrushMode::Smooth => 2,
         };
-        let edit = MonkeyVoxelEdit { center: local, radius: r, mode: mode_code };
+        let edit = MonkeyVoxelEdit {
+            center: local,
+            radius: r,
+            mode: mode_code,
+        };
         monkey_voxel_journal_append(&edit); // persist (survives relog)
         net.outbox.push(edit); // broadcast to other players (net relay drains the outbox)
-        // insert returns a prior-asset Result we don't need; the handle stays the same.
+                               // insert returns a prior-asset Result we don't need; the handle stays the same.
         let _ = meshes.insert(&mesh3d.0, monkey_voxel_mesh_to_bevy(&data.0.mesh()));
     }
 }
@@ -756,7 +762,11 @@ fn monkey_voxel_autoedit(
     let Ok((mut data, mesh3d)) = volume.single_mut() else {
         return;
     };
-    let edit = MonkeyVoxelEdit { center: [33.0, 20.0, 33.0], radius: 8.0, mode: 1 };
+    let edit = MonkeyVoxelEdit {
+        center: [33.0, 20.0, 33.0],
+        radius: 8.0,
+        mode: 1,
+    };
     if monkey_voxel_apply_one(&mut data.0, &edit) {
         monkey_voxel_journal_append(&edit);
         net.outbox.push(edit); // broadcast to other players
@@ -799,14 +809,21 @@ mod tests {
 
     #[test]
     fn monkey_voxel_edit_hex_roundtrips() {
-        let e = MonkeyVoxelEdit { center: [13.5, 16.0, 22.25], radius: 4.0, mode: 1 };
+        let e = MonkeyVoxelEdit {
+            center: [13.5, 16.0, 22.25],
+            radius: 4.0,
+            mode: 1,
+        };
         let hex = e.to_hex();
         assert_eq!(hex.len(), 34, "17 bytes = 34 hex chars");
         let d = MonkeyVoxelEdit::from_hex(&hex).expect("decode");
         assert_eq!(d.center, e.center);
         assert_eq!(d.radius, e.radius);
         assert_eq!(d.mode, e.mode);
-        assert!(MonkeyVoxelEdit::from_hex("short").is_none(), "malformed rejected");
+        assert!(
+            MonkeyVoxelEdit::from_hex("short").is_none(),
+            "malformed rejected"
+        );
     }
 
     #[test]
