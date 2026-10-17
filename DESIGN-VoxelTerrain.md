@@ -1,6 +1,6 @@
 # DESIGN — Voxel Terrain (Everwood)
 
-**Status:** P0 + P1 (brush, multiplayer sync, shared GM-placed build site, persistence) DONE + verified; P2 server authority next · **Branch:** `everwood-voxel_terrain` (this repo, `pkuzic/benilla-everwood_graphics`)
+**Status:** client voxel system DONE + verified + live-safe (brush, guild multiplayer sync, shared GM build site, persistence, grass/dirt/rock material, walkable collision, GM-gating); server-side area-wide/arbitrary-collision/navmesh scoped as enhancements · **Branch:** `everwood-voxel_terrain` (this repo, `pkuzic/benilla-everwood_graphics`)
 **Decided 2026-10-16:** Option **C** (voxel / SDF) for live networked terraforming. Editor is a benilla
 mod, **voxel-first**, NOT a Noggit rewrite.
 
@@ -224,9 +224,49 @@ client-side (the server-authoritative half is still the "hard 60%", below).
   exactly one volume ever exists (a split let deferred `Commands` make two).
 - **Persistence:** every local + remote edit appends to `$BENILLA_HOME/monkey_voxel_journal.bin`, replayed
   on spawn; the placed site anchor persists alongside.
+- **Real terrain material:** vertex colours blend grass / dirt / rock by SLOPE (flat = grass, cliffs = rock),
+  shaded by a fixed sun + ambient + position mottle, rendered unlit. Looks like ground that fits the world
+  (capture-verified). A true ADT-splat triplanar material is still a later option (owner decision 4).
+- **Walkable collision:** the voxel entity carries an avian `Collider::trimesh` (+ `RigidBody::Static`,
+  default layer) rebuilt from the density on every edit by `monkey_voxel_sync_collider` (one
+  `Changed<MonkeyVoxelData>` system). benilla's mover sweeps the player capsule against avian colliders (not
+  the heightmap), so you stand and walk on the voxel surface — including overhangs/walls the heightmap can't
+  express. **Live-safe** (see server findings): no geometric fly/height anticheat check rejects an above-ground
+  stander.
+- **GM-gating** (owner decision 2): the KEY-driven brush + Ctrl+P placement require the local GM flag
+  (`PLAYER_FLAGS & 0x8`, `.gm on`), bridged from benilla-app into benilla-world's `MonkeyLocalGm` (the
+  `FfxDeathFade` pattern). Viewing/adopting a site and applying others' edits are NOT gated; the headless
+  `WOW_VOXEL_AUTO*` hooks bypass the gate for tests.
 
 **2-client test:** `disposable/voxmp_test.ps1` (both chars in one guild — the relay is guild-scoped). Verified
-A placed `[-8963.5,-132.5,84.4]`, B adopted the identical anchor, both journals 17 B after A's edit.
+A placed `[-8963.5,-132.5,84.4]`, B adopted the identical anchor, both journals 17 B after A's edit. Material
+capture-verified; collision smoke-verified (collider attaches + rebuilds on edit, no avian panic).
 
-*Next: P2 server authority — GM-gate placement/edits + area-wide distribution (DynamicTree collision inject +
-Recast tile rebuild → walkable). Then triplanar terrain material, multi-site, P4 LOD + offline editor.*
+## Server half — GROUNDED (research 2026-10-17)
+
+Ground-truthed against the actual tortoise-wow core. The client feature above is complete and **live-safe
+on its own**; these are enhancements, now precisely scoped:
+
+- **Anticheat is NOT a blocker for walking on voxels.** Fly detection is movement-FLAG based (normal walk
+  flags pass); there is NO geometric "player N yd above GridMap = fly/teleport" reject. Undermap only fires
+  ~100 yd *below* ground; wall-climb check is dormant. The one live exposure is `CHEAT_TYPE_OVERSPEED_Z`
+  (`Anticheat/Movement/Movement.cpp:593`) on ABRUPT vertical transitions (raising a mound under a stander, or
+  a near-vertical ascent) — smoke-test on live-config before shipping; likely fine for normal walking.
+- **Area-wide distribution (non-guild nearby players) = drag-n-drop Eluna, NO core rebuild.** Eluna can't see
+  inbound addon chat (hooks defined but core never calls them; guild relay is pure C++ `BroadcastToGuild`).
+  Instead: GM client uplinks each edit on the existing MonkeyNet **`build`** channel (→ Eluna `OnMonkeyNet`
+  event 55, MODERATOR-gated, binary-safe ≤16 KB, rate-limited) or as a `.`-command; a `lua_scripts` script
+  fans it out with `anchor:GetPlayersInRange(R)` + `p:SendAddonMessage("VOXEL", payload, 6, p)` (exactly how
+  `lua_scripts/BuildMode.lua` already distributes build state). **Client cost:** a MonkeyNet-send uplink (needs
+  benilla CMSG_MONKEY support — the sticking point) and an inbound `VOXEL` whisper-addon handler. The guild
+  relay already covers a build team, so this is an enhancement, not a blocker.
+- **Server-authoritative collision** (so non-voxel clients / server mechanics see the height): `Map::GetHeight`
+  already maxes in `_dynamicTree` (GameObject models). A placed/scaled collidable prefab GO works today via
+  Lua (BuildMode.lua pattern). TRUE arbitrary-voxel collision needs synthesizing an in-memory vmap `WorldModel`
+  from the density and `Map::InsertGameObjectModel` — a medium C++ piece, not a one-liner.
+- **NPC navmesh over voxels = genuinely large / descoped for v1.** Recast is vendored but the BUILD side is
+  `#ifdef MMAP_GENERATOR` only; there is NO runtime tile rebuild. NPCs will path under a mound until an offline
+  MMAP regen. Players stand on mounds fine without it.
+
+*Next (scoped): the Eluna area-relay + MonkeyNet client uplink (area-wide); optional `OVERSPEED_Z` exemption if
+live testing flags it; multi-site; arbitrary-voxel `_dynamicTree` collision; P4 LOD/transvoxel + offline editor.*

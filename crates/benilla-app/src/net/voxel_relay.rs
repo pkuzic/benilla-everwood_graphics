@@ -14,9 +14,12 @@ use bevy::prelude::*;
 
 use benilla_protocol::{SessionEvent, SessionEventKind};
 use benilla_ui::script::AddonDistribution;
-use benilla_world::voxel::{MonkeyVoxelEdit, MonkeyVoxelNet, MonkeyVoxelSpawn};
+use benilla_world::voxel::{MonkeyLocalGm, MonkeyVoxelEdit, MonkeyVoxelNet, MonkeyVoxelSpawn};
 
-use crate::net::{ClientCommand, NetCommands, NetHandlerApp, SelfGuid};
+use crate::net::{ClientCommand, NetCommands, NetHandlerApp, ObjectStore, SelfGuid, SelfPlayer};
+
+/// `PLAYER_FLAGS & 0x8` — GM mode on (`.gm on`); same bit chat's `is_gm` reads.
+const PLAYER_FLAGS_GM: u32 = 0x8;
 
 /// The tag marking a voxel-EDIT addon line (`MV:<34 hex>`). Also used by the chat UI to keep these
 /// lines out of the visible chat log.
@@ -24,10 +27,22 @@ pub(crate) const MONKEY_VOXEL_PREFIX: &str = "MV:";
 /// The tag marking a shared-build-SITE placement line (`VS:<38 hex>`).
 pub(crate) const MONKEY_VOXEL_SPAWN_PREFIX: &str = "VS:";
 
-/// Wire the relay: the inbound-chat interceptor plus the outbox-drain sender.
+/// Wire the relay: the inbound-chat interceptor, the outbox-drain sender, and the GM-status bridge.
 pub(crate) fn register(app: &mut App) {
     app.net_handler(SessionEventKind::Chat, monkey_voxel_recv)
-        .add_systems(Update, monkey_voxel_drain_outbox);
+        .add_systems(Update, (monkey_voxel_drain_outbox, monkey_voxel_push_gm));
+}
+
+/// Bridge the self player's GM flag into benilla-world's `MonkeyLocalGm` each frame (benilla-world
+/// can't read the network descriptor), the `FfxDeathFade` pattern. Gates the GM-only brush/placement.
+fn monkey_voxel_push_gm(
+    self_q: Query<&ObjectStore, With<SelfPlayer>>,
+    mut gm: ResMut<MonkeyLocalGm>,
+) {
+    gm.0 = self_q
+        .single()
+        .map(|s| s.0.player_flags() & PLAYER_FLAGS_GM != 0)
+        .unwrap_or(false);
 }
 
 /// Drain the brush's outboxes: each local edit goes out as a `MV:<hex>` and each shared-site

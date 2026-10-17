@@ -9,6 +9,7 @@
 //! the shipped player build is byte-unchanged. The volume is the P0 overhang proof: a genuinely
 //! non-heightmap surface (two surfaces over one column) that the WoW heightmap can never express.
 
+use avian3d::prelude::{Collider, RigidBody};
 use bevy::asset::RenderAssetUsages;
 use bevy::mesh::{Indices, PrimitiveTopology};
 use bevy::prelude::*;
@@ -30,23 +31,99 @@ pub fn monkey_voxel_mesh_to_bevy(vm: &benilla_voxel::VoxelMesh) -> Mesh {
     );
     mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, vm.positions.clone());
     mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, vm.normals.clone());
-    // Bake a simple top-down shade (from each normal's up-component) into an earthy vertex colour,
-    // so the sculpted form reads without the world's custom terrain lighting — a plain lit
-    // StandardMaterial renders black against benilla's bespoke light. The real triplanar terrain
-    // material replaces this in a later lane.
-    const EARTH: [f32; 3] = [0.62, 0.52, 0.38];
+    // Bake a terrain look straight into vertex colours and render it UNLIT: a lit StandardMaterial
+    // renders black against benilla's bespoke world light, so we can't rely on the scene light. We
+    // blend grass / dirt / rock by SLOPE (flat tops = grass, gentle = dirt, cliffs = rock), shade by
+    // a fixed sun plus ambient so the sculpted form reads, and add a touch of position mottle so big
+    // flats don't look like painted plastic. A true triplanar material that samples the ADT splat
+    // set is a later lane (owner decision 4); this is the stand-in that already looks like ground.
+    const GRASS: [f32; 3] = [0.29, 0.40, 0.17];
+    const DIRT: [f32; 3] = [0.44, 0.35, 0.22];
+    const ROCK: [f32; 3] = [0.40, 0.40, 0.43];
+    // A fixed "sun" in Bevy space (up and to one side), normalised.
+    let sun = {
+        let v = [0.35f32, 0.80, 0.50];
+        let l = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+        [v[0] / l, v[1] / l, v[2] / l]
+    };
+    let lerp3 = |a: [f32; 3], b: [f32; 3], t: f32| {
+        [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t]
+    };
+    let smoothstep = |e0: f32, e1: f32, x: f32| {
+        let t = ((x - e0) / (e1 - e0)).clamp(0.0, 1.0);
+        t * t * (3.0 - 2.0 * t)
+    };
     let colors: Vec<[f32; 4]> = vm
-        .normals
+        .positions
         .iter()
-        .map(|n| {
-            let up = (n[1] * 0.5 + 0.5).clamp(0.0, 1.0); // Bevy +Y up: top faces brighter
-            let b = 0.35 + 0.65 * up;
-            [EARTH[0] * b, EARTH[1] * b, EARTH[2] * b, 1.0]
+        .zip(vm.normals.iter())
+        .map(|(p, n)| {
+            let slope = n[1].clamp(0.0, 1.0); // 1 = flat (facing up), 0 = vertical cliff
+            // rock on the steep, grass on the flat, dirt in between.
+            let rock_to_dirt = lerp3(ROCK, DIRT, smoothstep(0.45, 0.70, slope));
+            let base = lerp3(rock_to_dirt, GRASS, smoothstep(0.80, 0.94, slope));
+            // Cheap value-noise mottle from world position, ±6%.
+            let h = (p[0] * 12.9898 + p[1] * 51.233 + p[2] * 78.233).sin() * 43758.547;
+            let mottle = 1.0 + ((h - h.floor()) - 0.5) * 0.12;
+            // Directional sun (half-lambert so backfaces aren't pure black) + ambient floor.
+            let ndl = n[0] * sun[0] + n[1] * sun[1] + n[2] * sun[2];
+            let light = (0.45 + 0.55 * (ndl * 0.5 + 0.5)) * mottle;
+            [
+                (base[0] * light).clamp(0.0, 1.0),
+                (base[1] * light).clamp(0.0, 1.0),
+                (base[2] * light).clamp(0.0, 1.0),
+                1.0,
+            ]
         })
         .collect();
     mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, colors);
     mesh.insert_indices(Indices::U32(vm.indices.clone()));
     mesh
+}
+
+/// An avian trimesh collider from the same mesher output the render mesh uses, so the player capsule
+/// (which sweeps avian colliders, NOT the heightmap) can stand and walk on the voxel surface. No
+/// `CollisionLayers` → it sits on `CollisionLayer::Default`, which the player body filter includes.
+/// `None` for an empty (fully carved) volume so no phantom floor remains. Walkable needs the SERVER
+/// to accept the heights too; the local server runs with anticheat off, live is the documented P3.
+fn monkey_voxel_collider(vm: &benilla_voxel::VoxelMesh) -> Option<Collider> {
+    if vm.indices.len() < 3 {
+        return None;
+    }
+    let verts: Vec<Vec3> = vm.positions.iter().map(|p| Vec3::new(p[0], p[1], p[2])).collect();
+    let tris: Vec<[u32; 3]> = vm.indices.chunks_exact(3).map(|c| [c[0], c[1], c[2]]).collect();
+    Some(Collider::trimesh(verts, tris))
+}
+
+/// Keep the walk-collider in step with the density: whenever any edit mutates `MonkeyVoxelData`
+/// (brush, remote edit, placement/relocate, auto hooks, or the first spawn), rebuild the entity's
+/// trimesh collider from the new surface. One change-detection system covers every edit path; it is
+/// ordered last in the chain so a same-frame edit is caught. (This re-meshes once more per edit
+/// frame just for the collider — fine for the small sandbox; throttle or go async if a big volume
+/// hitches.)
+fn monkey_voxel_sync_collider(
+    mut commands: Commands,
+    mut announced: Local<bool>,
+    changed: Query<(Entity, &MonkeyVoxelData), Changed<MonkeyVoxelData>>,
+) {
+    for (e, data) in &changed {
+        let vm = data.0.mesh();
+        match monkey_voxel_collider(&vm) {
+            Some(c) => {
+                if !*announced {
+                    info!(
+                        "MONKEY (voxel): attached a walk collider ({} tris) — you can stand on the terrain.",
+                        vm.indices.len() / 3,
+                    );
+                    *announced = true;
+                }
+                commands.entity(e).insert(c); // RigidBody::Static is already on the entity
+            }
+            None => {
+                commands.entity(e).remove::<Collider>();
+            }
+        }
+    }
 }
 
 /// Marks the P0 debug voxel volume entity.
@@ -275,6 +352,9 @@ fn monkey_voxel_build_entity(
         Transform::from_translation(origin),
         MonkeyVoxelVolume,
         MonkeyVoxelData(volume),
+        // Static body once; `monkey_voxel_sync_collider` attaches/updates the trimesh Collider from
+        // the density (it fires on this freshly-Added data next frame) and on every later edit.
+        RigidBody::Static,
         Name::new("MONKEY voxel sandbox"),
     ));
     let wow = bevy_to_wow(centre_bevy);
@@ -318,6 +398,14 @@ fn monkey_voxel_apply_one(v: &mut benilla_voxel::VoxelVolume, e: &MonkeyVoxelEdi
 #[derive(Resource, Default)]
 pub struct MonkeyVoxelSiteSpawned(pub bool);
 
+/// Whether the local player is a GM (`PLAYER_FLAGS & 0x8`, i.e. `.gm on`). benilla-world can't read
+/// the network descriptor, so benilla-app fills this each frame from the self player's flags (the
+/// `FfxDeathFade` bridge pattern). Gates the KEY-driven brush + build-site placement so only a GM
+/// edits (owner decision 2); viewing/adopting a site and applying others' edits are NOT gated, and
+/// the headless `WOW_VOXEL_AUTO*` test hooks bypass it. Defaults false until benilla-app sets it.
+#[derive(Resource, Default)]
+pub struct MonkeyLocalGm(pub bool);
+
 /// P0 render: spawn one static voxel volume in front of the player, once a world is live.
 pub struct MonkeyVoxelPlugin;
 
@@ -326,6 +414,7 @@ impl Plugin for MonkeyVoxelPlugin {
         app.init_resource::<MonkeyVoxelBrushRadius>();
         app.init_resource::<MonkeyVoxelNet>();
         app.init_resource::<MonkeyVoxelSiteSpawned>();
+        app.init_resource::<MonkeyLocalGm>();
         // Spawn once, in front of the camera, so it is guaranteed on-screen on any login — gated on
         // a live world (a `WorldCamera` with a real pose) and a `Local` one-shot latch.
         // Chained for a deterministic order: volume management (create / place / adopt) runs BEFORE
@@ -339,6 +428,7 @@ impl Plugin for MonkeyVoxelPlugin {
                 monkey_voxel_apply_remote,
                 monkey_voxel_autoedit,
                 monkey_voxel_capture_demo_edit,
+                monkey_voxel_sync_collider,
             )
                 .chain()
                 .run_if(crate::schedule::world_is_live),
@@ -393,6 +483,7 @@ fn monkey_voxel_manage_volume(
     mut last_cam: Local<Option<Vec3>>,
     mut spawned: ResMut<MonkeyVoxelSiteSpawned>,
     mut net: ResMut<MonkeyVoxelNet>,
+    gm: Res<MonkeyLocalGm>,
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
@@ -425,8 +516,10 @@ fn monkey_voxel_manage_volume(
         );
     }
 
-    // Local placement (Ctrl+P, or the headless `$WOW_VOXEL_AUTOPLACE` hook ~4 s in).
-    let key_place = (keys.pressed(KeyCode::ControlLeft) || keys.pressed(KeyCode::ControlRight))
+    // Local placement (Ctrl+P, GM only; or the headless `$WOW_VOXEL_AUTOPLACE` hook ~4 s in, which
+    // bypasses the gate for tests).
+    let key_place = gm.0
+        && (keys.pressed(KeyCode::ControlLeft) || keys.pressed(KeyCode::ControlRight))
         && keys.just_pressed(KeyCode::KeyP);
     let auto_place = !*auto_place_done && std::env::var_os("WOW_VOXEL_AUTOPLACE").is_some() && {
         *place_elapsed += time.delta_secs();
@@ -539,18 +632,22 @@ fn monkey_voxel_capture_follow(
     tf.translation = centre - volume_half_extent();
 }
 
-/// P1 local voxel brush (dev/GM). Hold **`[`** carve · **`]`** build · **`\`** smooth, aimed at the
+/// P1 local voxel brush (GM only). Hold **`[`** carve · **`]`** build · **`\`** smooth, aimed at the
 /// volume along your view; **`-`/`=`** change brush size. Mutates the chunk's density field and
-/// re-meshes live. Client-only for now — server authority, GM-gating and multiplayer sync arrive in
-/// P1b (`DESIGN-VoxelTerrain.md`).
+/// re-meshes live, broadcasting each edit to the guild. GM-gated (owner decision 2) — a non-GM sees
+/// edits but can't make them. `.gm on` to enable.
 fn monkey_voxel_brush_edit(
     keys: Res<ButtonInput<KeyCode>>,
+    gm: Res<MonkeyLocalGm>,
     mut radius: ResMut<MonkeyVoxelBrushRadius>,
     mut meshes: ResMut<Assets<Mesh>>,
     camera: Query<&GlobalTransform, With<WorldCamera>>,
     mut volume: Query<(&mut MonkeyVoxelData, &Mesh3d, &Transform), With<MonkeyVoxelVolume>>,
     mut net: ResMut<MonkeyVoxelNet>,
 ) {
+    if !gm.0 {
+        return; // GM-only; a non-GM's brush keys do nothing (they still see others' edits).
+    }
     // Brush size: `-` shrinks, `=` grows (clamped 1..14 voxels).
     if keys.just_pressed(KeyCode::Minus) {
         radius.0 = (radius.0 - 1.0).max(1.0);

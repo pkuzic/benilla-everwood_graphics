@@ -282,6 +282,45 @@ impl VoxelVolume {
         ]
     }
 
+    /// The up-axis surface height (in VOXEL units, grid space) at the column `(x_vox, z_vox)` — the
+    /// highest air→solid crossing marching the density column top-down, bilinear in x/z. `None` if
+    /// the column is entirely air/solid or outside the grid. For standing/walking on the voxel
+    /// surface: a caller maps a world point to local voxel coords
+    /// `((world - origin) / VOXEL_SIZE)`, calls this, and maps the result back
+    /// `origin.y + height * VOXEL_SIZE`. Density convention: negative = solid, positive = air.
+    pub fn surface_height_at(&self, x_vox: f32, z_vox: f32) -> Option<f32> {
+        if x_vox < 0.0 || z_vox < 0.0 {
+            return None;
+        }
+        let x0 = x_vox.floor() as usize;
+        let z0 = z_vox.floor() as usize;
+        if x0 + 1 >= self.gdim[0] || z0 + 1 >= self.gdim[2] {
+            return None;
+        }
+        let fx = x_vox - x0 as f32;
+        let fz = z_vox - z0 as f32;
+        let sample = |y: usize| -> f32 {
+            let d00 = self.density[self.gidx(x0, y, z0)] as f32;
+            let d10 = self.density[self.gidx(x0 + 1, y, z0)] as f32;
+            let d01 = self.density[self.gidx(x0, y, z0 + 1)] as f32;
+            let d11 = self.density[self.gidx(x0 + 1, y, z0 + 1)] as f32;
+            let a = d00 + (d10 - d00) * fx;
+            let b = d01 + (d11 - d01) * fx;
+            a + (b - a) * fz
+        };
+        // Scan top-down for the first air (>= 0) above solid (< 0): the top surface of that column.
+        let mut above = sample(self.gdim[1] - 1);
+        for y in (0..self.gdim[1] - 1).rev() {
+            let here = sample(y);
+            if above >= 0.0 && here < 0.0 {
+                // Linear zero-crossing between node y (here) and y+1 (above).
+                return Some(y as f32 + (-here) / (above - here));
+            }
+            above = here;
+        }
+        None
+    }
+
     /// Build by sampling an SDF over global voxel coords (negative = solid).
     pub fn from_sdf(chunks: [u32; 3], mut f: impl FnMut([u32; 3]) -> f32) -> Self {
         let gdim = Self::dims(chunks);
@@ -547,6 +586,21 @@ mod tests {
         // An edit centred on the seam between chunk 0 and chunk 1 (global x = 32) must change it.
         let mut v = VoxelVolume::slab([2, 1, 1], 16.0);
         assert!(v.edit_sphere([32.0, 16.0, 16.0], 6.0, BrushMode::Subtract));
+    }
+
+    #[test]
+    fn surface_height_tracks_the_slab_and_edits() {
+        // A flat slab at surface y=16: the height query returns ~16 across the interior.
+        let v = VoxelVolume::slab([2, 1, 2], 16.0);
+        let h = v.surface_height_at(32.0, 32.0).expect("slab has a surface mid-volume");
+        assert!((h - 16.0).abs() < 0.6, "flat slab height ~16, got {h}");
+        // Build a mound (add material above the slab) and the surface there rises.
+        let mut v2 = VoxelVolume::slab([2, 1, 2], 16.0);
+        v2.edit_sphere([32.0, 20.0, 32.0], 6.0, BrushMode::Add);
+        let hm = v2.surface_height_at(32.0, 32.0).expect("mound has a surface");
+        assert!(hm > h + 1.0, "mound should raise the surface above the flat slab ({hm} vs {h})");
+        // Outside the grid → None.
+        assert!(v.surface_height_at(-5.0, 10.0).is_none(), "outside grid is None");
     }
 
     #[test]
