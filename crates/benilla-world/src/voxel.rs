@@ -272,19 +272,74 @@ fn monkey_voxel_site_load() -> Option<MonkeyVoxelSpawn> {
     MonkeyVoxelSpawn::from_hex(&hex)
 }
 
-/// A fresh base slab with the current journal replayed onto it (empty right after a site is placed
-/// or adopted, since the journal is cleared then).
-fn monkey_voxel_fresh(chunks: [u32; 3], surface: f32) -> benilla_voxel::VoxelVolume {
-    let mut volume = benilla_voxel::VoxelVolume::slab(chunks, surface);
+/// The real ground sampled under a volume's footprint: a per-column world-height grid plus the
+/// world origin-y chosen so the terrain sits vertically centred in the volume (room above to build,
+/// below to dig). This is what makes a placed region START as the real terrain under it instead of a
+/// flat pad — the GM then sculpts it into overhangs/caves. `centre` is the volume's world centre
+/// (its y is the mean ground height).
+pub struct TerrainSeed {
+    pub origin_y: f32,
+    pub heights: Vec<f32>,
+    pub centre: Vec3,
+}
+
+/// Sample the real ground height across the volume's footprint (centred at `centre_xz`), into the
+/// per-column grid `VoxelVolume::from_heightmap` wants. `None` if the ground under the centre is not
+/// resident yet (the caller falls back to a flat pad / retries). Unresident or hole columns are
+/// filled with the mean so the seed has no gaps.
+fn monkey_voxel_sample_terrain(
+    world: &crate::world_point::WorldPoint,
+    centre_xz: Vec2,
+    chunks: [u32; 3],
+) -> Option<TerrainSeed> {
+    let centre_h = world.terrain_height_under(Vec3::new(centre_xz.x, 0.0, centre_xz.y))?;
+    let half = half_extent_for(chunks);
+    let gx = (chunks[0] * benilla_voxel::CHUNK + 2) as usize;
+    let gz = (chunks[2] * benilla_voxel::CHUNK + 2) as usize;
+    let (origin_x, origin_z) = (centre_xz.x - half.x, centre_xz.y - half.z);
+    let mut heights = vec![f32::NAN; gx * gz];
+    let (mut sum, mut n) = (0.0f32, 0u32);
+    for iz in 0..gz {
+        for ix in 0..gx {
+            let wx = origin_x + ix as f32 * benilla_voxel::VOXEL_SIZE;
+            let wz = origin_z + iz as f32 * benilla_voxel::VOXEL_SIZE;
+            if let Some(h) = world.terrain_height_under(Vec3::new(wx, 0.0, wz)) {
+                heights[ix + iz * gx] = h;
+                sum += h;
+                n += 1;
+            }
+        }
+    }
+    // Lift the seeded surface a hair above the real ground so the voxel OCCLUDES it (no z-fighting
+    // between the surface-nets mesh and the heightmap triangulation at identical heights) — until the
+    // proper hole-remesh hiding lands. A ~0.15 yd lip at the region edge is barely visible; a z-fight
+    // is not. Holes dug below still reveal the real ground (the accepted "no hiding yet" state).
+    const SEED_LIFT: f32 = 0.15;
+    let mean = if n > 0 { sum / n as f32 } else { centre_h } + SEED_LIFT;
+    for h in heights.iter_mut() {
+        *h = if h.is_nan() { mean } else { *h + SEED_LIFT };
+    }
+    let origin_y = mean - half.y;
+    Some(TerrainSeed { origin_y, heights, centre: Vec3::new(centre_xz.x, mean, centre_xz.y) })
+}
+
+/// A fresh volume seeded from the real heightmap (or a flat slab when `seed` is `None` — unresident
+/// ground / solo sandbox), with the current journal replayed so prior sculpting returns.
+fn monkey_voxel_fresh_seeded(
+    chunks: [u32; 3],
+    surface: f32,
+    seed: Option<&TerrainSeed>,
+) -> benilla_voxel::VoxelVolume {
+    let mut volume = match seed {
+        Some(s) => benilla_voxel::VoxelVolume::from_heightmap(chunks, s.origin_y, &s.heights),
+        None => benilla_voxel::VoxelVolume::slab(chunks, surface),
+    };
     let saved = monkey_voxel_journal_load();
     for e in &saved {
         monkey_voxel_apply_one(&mut volume, e);
     }
     if !saved.is_empty() {
-        info!(
-            "MONKEY (voxel): replayed {} journalled edit(s)",
-            saved.len()
-        );
+        info!("MONKEY (voxel): replayed {} journalled edit(s)", saved.len());
     }
     volume
 }
@@ -298,9 +353,10 @@ fn monkey_voxel_build_entity(
     material: &Handle<MonkeyVoxelMaterial>,
     chunks: [u32; 3],
     surface: f32,
+    seed: Option<&TerrainSeed>,
     centre_bevy: Vec3,
 ) {
-    let volume = monkey_voxel_fresh(chunks, surface);
+    let volume = monkey_voxel_fresh_seeded(chunks, surface, seed);
     let voxel_mesh = volume.mesh();
     let (tri_count, vert_count) = (voxel_mesh.tri_count(), voxel_mesh.positions.len());
     let mesh = meshes.add(monkey_voxel_mesh_to_bevy(&voxel_mesh));
@@ -335,9 +391,10 @@ fn monkey_voxel_relocate(
     meshes: &mut Assets<Mesh>,
     chunks: [u32; 3],
     surface: f32,
+    seed: Option<&TerrainSeed>,
     centre_bevy: Vec3,
 ) {
-    data.0 = monkey_voxel_fresh(chunks, surface);
+    data.0 = monkey_voxel_fresh_seeded(chunks, surface, seed);
     transform.translation = centre_bevy - half_extent_for(chunks);
     let _ = meshes.insert(&mesh3d.0, monkey_voxel_mesh_to_bevy(&data.0.mesh()));
 }
@@ -398,7 +455,7 @@ impl Plugin for MonkeyVoxelPlugin {
 }
 
 /// Terraform sandbox size: chunks per axis. `[2,1,2]` = a 32 × 16 × 32 yd ground patch (4 chunks).
-const VOL_CHUNKS: [u32; 3] = [2, 1, 2];
+const VOL_CHUNKS: [u32; 3] = [2, 2, 2];
 /// Flat-top height within the volume, in voxels (solid below, air above).
 const VOL_SURFACE: f32 = 16.0;
 
@@ -519,7 +576,14 @@ fn monkey_voxel_manage_volume(
     // relocate it on a new site. If it does not exist yet, create exactly one: at a new site, else a
     // persisted site, else the solo-sandbox placement ahead of the settled view.
     if let Ok((mut data, mut tf, mesh3d)) = volume.single_mut() {
-        if let Some((centre, chunks, surface)) = new_site {
+        if let Some((mut centre, chunks, surface)) = new_site {
+            // Seed the volume from the REAL ground under its footprint (so it starts as the terrain
+            // there); re-centre vertically on the mean ground height. Falls back to a flat pad if the
+            // ground isn't resident.
+            let seed = monkey_voxel_sample_terrain(&world, Vec2::new(centre.x, centre.z), chunks);
+            if let Some(s) = &seed {
+                centre.y = s.centre.y;
+            }
             monkey_voxel_relocate(
                 &mut data,
                 &mut tf,
@@ -527,6 +591,7 @@ fn monkey_voxel_manage_volume(
                 &mut meshes,
                 chunks,
                 surface,
+                seed.as_ref(),
                 centre,
             );
         }
@@ -535,13 +600,18 @@ fn monkey_voxel_manage_volume(
     if spawned.0 {
         return; // volume creation already queued this/last frame; nothing to do until it exists
     }
-    if let Some((centre, chunks, surface)) = new_site {
+    if let Some((mut centre, chunks, surface)) = new_site {
+        let seed = monkey_voxel_sample_terrain(&world, Vec2::new(centre.x, centre.z), chunks);
+        if let Some(s) = &seed {
+            centre.y = s.centre.y;
+        }
         monkey_voxel_build_entity(
             &mut commands,
             &mut meshes,
             &material.0,
             chunks,
             surface,
+            seed.as_ref(),
             centre,
         );
         spawned.0 = true;
@@ -551,19 +621,24 @@ fn monkey_voxel_manage_volume(
             site.chunks[1] as u32,
             site.chunks[2] as u32,
         ];
-        let c = wow_to_bevy(site.anchor_wow);
+        let mut c = wow_to_bevy(site.anchor_wow);
+        let seed = monkey_voxel_sample_terrain(&world, Vec2::new(c.x, c.z), chunks);
+        if let Some(s) = &seed {
+            c.y = s.centre.y;
+        }
         monkey_voxel_build_entity(
             &mut commands,
             &mut meshes,
             &material.0,
             chunks,
             site.surface,
+            seed.as_ref(),
             c,
         );
         spawned.0 = true;
     } else {
-        // Solo sandbox: wait for the camera to settle (world-enter keeps nudging it), then drop the
-        // patch a short way ahead along the settled view, flat top a touch above the real ground.
+        // Solo sandbox: wait for the camera to settle (world-enter keeps nudging it), then seed a
+        // region from the real ground a short way ahead along the settled view.
         let settled = last_cam.is_some_and(|p| p.distance(cam_pos) < 0.5);
         *last_cam = Some(cam_pos);
         *settle_frames = if settled { *settle_frames + 1 } else { 0 };
@@ -571,23 +646,25 @@ fn monkey_voxel_manage_volume(
             return; // ~0.5 s of a still camera
         }
         let ahead = cam_pos + *cam.forward() * SPAWN_AHEAD_YARDS;
+        let seed = monkey_voxel_sample_terrain(&world, Vec2::new(ahead.x, ahead.z), VOL_CHUNKS);
         let half = volume_half_extent();
-        let ground = world
-            .terrain_height_under(ahead)
-            .unwrap_or(cam_pos.y - EYE_HEIGHT_YARDS);
-        let top_y = ground + 1.5;
-        let origin = Vec3::new(
-            ahead.x - half.x,
-            top_y - VOL_SURFACE * benilla_voxel::VOXEL_SIZE,
-            ahead.z - half.z,
-        );
+        let centre = match &seed {
+            Some(s) => s.centre,
+            None => {
+                let ground = world
+                    .terrain_height_under(ahead)
+                    .unwrap_or(cam_pos.y - EYE_HEIGHT_YARDS);
+                Vec3::new(ahead.x, (ground + 1.5) - VOL_SURFACE * benilla_voxel::VOXEL_SIZE + half.y, ahead.z)
+            }
+        };
         monkey_voxel_build_entity(
             &mut commands,
             &mut meshes,
             &material.0,
             VOL_CHUNKS,
             VOL_SURFACE,
-            origin + half,
+            seed.as_ref(),
+            centre,
         );
         spawned.0 = true;
     }

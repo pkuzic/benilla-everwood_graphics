@@ -343,6 +343,24 @@ impl VoxelVolume {
         Self::from_sdf(chunks, move |[_, y, _]| y as f32 - surface)
     }
 
+    /// A volume whose surface follows a per-column WORLD height — seeded from the real heightmap, so
+    /// the voxel region starts as an exact copy of the ground it sits on (then a GM sculpts it into
+    /// overhangs/caves the heightmap can't express). `heights` is the horizontal grid of ground
+    /// heights, row-major `gx = chunks[0]*CHUNK+2` wide and `gz = chunks[2]*CHUNK+2` tall, in the same
+    /// world-y units as `origin_world_y + voxel_row * VOXEL_SIZE`. Solid below the height, air above
+    /// (SDF = world_y − height, the slab law generalised per column). A column whose height is NaN is
+    /// treated as all-air (unloaded ground: leave it empty rather than guess).
+    pub fn from_heightmap(chunks: [u32; 3], origin_world_y: f32, heights: &[f32]) -> Self {
+        let gx = (chunks[0] * CHUNK + 2) as usize;
+        Self::from_sdf(chunks, |[x, y, z]| {
+            let h = heights[x as usize + z as usize * gx];
+            if h.is_nan() {
+                return (SAMPLES * CHUNK) as f32; // far outside: all air
+            }
+            (origin_world_y + y as f32 * VOXEL_SIZE) - h
+        })
+    }
+
     /// Sphere brush over the whole volume (`center`/`radius` in global voxel coords). Spans chunk
     /// boundaries freely since the density is one grid. Returns whether anything changed.
     pub fn edit_sphere(&mut self, center: [f32; 3], radius: f32, mode: BrushMode) -> bool {
@@ -586,6 +604,28 @@ mod tests {
         // An edit centred on the seam between chunk 0 and chunk 1 (global x = 32) must change it.
         let mut v = VoxelVolume::slab([2, 1, 1], 16.0);
         assert!(v.edit_sphere([32.0, 16.0, 16.0], 6.0, BrushMode::Subtract));
+    }
+
+    #[test]
+    fn from_heightmap_follows_a_sloped_ground() {
+        // A ground that ramps along x: height = 8 + 0.1 * world_x. The volume's surface should track
+        // it (higher surface at larger x), proving the region seeds from the real heightmap.
+        let chunks = [2u32, 2, 2];
+        let gx = (chunks[0] * CHUNK + 2) as usize;
+        let gz = (chunks[2] * CHUNK + 2) as usize;
+        let origin_y = 0.0;
+        let mut heights = vec![0f32; gx * gz];
+        for z in 0..gz {
+            for x in 0..gx {
+                heights[x + z * gx] = 8.0 + 0.1 * (x as f32 * VOXEL_SIZE);
+            }
+        }
+        let v = VoxelVolume::from_heightmap(chunks, origin_y, &heights);
+        // Surface height is in VOXEL units: world_y = origin_y + h_vox * VOXEL_SIZE, so h_vox = height / VOXEL_SIZE.
+        let near = v.surface_height_at(10.0, 32.0).expect("surface near x-lo");
+        let far = v.surface_height_at(50.0, 32.0).expect("surface near x-hi");
+        assert!(far > near + 2.0, "ramp: surface rises with x ({near} -> {far} voxels)");
+        assert!(!v.mesh().is_empty(), "heightmap volume produced no surface");
     }
 
     #[test]
