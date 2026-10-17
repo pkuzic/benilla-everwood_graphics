@@ -48,6 +48,10 @@ pub(super) struct MonkeyVoxelHideState {
     desired: HashMap<CellKey, CellPlan>,
     /// Carved cell entities → (key, plan-sig) they were carved for.
     applied: HashMap<Entity, (CellKey, u64)>,
+    /// MONKEY (voxel): re-plan until resident — the last plan found 0 cells or a footprint corner's
+    /// tile wasn't resident, so re-plan every ~0.5 s even with an unchanged signature.
+    incomplete: bool,
+    replan_timer: f32,
 }
 
 /// `WOW_VOXEL_NO_HIDE=1`: keep the real ADT ground under the build site (the pre-hiding look), a
@@ -175,7 +179,11 @@ fn compute_desired(
         // FNV-1a over the (chunk, bits) pairs: changes when the covered blocks change.
         let mut h = 0xcbf29ce484222325u64;
         for (ci, bits) in &plan.chunk_holes {
-            for b in (*ci as u64).to_le_bytes().into_iter().chain(bits.to_le_bytes()) {
+            for b in (*ci as u64)
+                .to_le_bytes()
+                .into_iter()
+                .chain(bits.to_le_bytes())
+            {
                 h = (h ^ b as u64).wrapping_mul(0x100000001b3);
             }
         }
@@ -255,6 +263,7 @@ pub(super) fn monkey_voxel_hide_terrain(
     adts: Res<Assets<AdtTile>>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut state: ResMut<MonkeyVoxelHideState>,
+    time: Res<Time>, // MONKEY (voxel): re-plan until resident
     volume: Query<(&Transform, &MonkeyVoxelData), With<MonkeyVoxelVolume>>,
     cells: Query<(Entity, &Mesh3d, &Aabb), With<MeshMaterial3d<TerrainMaterial>>>,
 ) {
@@ -264,7 +273,11 @@ pub(super) fn monkey_voxel_hide_terrain(
     let no_hide = monkey_voxel_hide_disabled();
 
     // No volume (or hiding disabled): restore every still-living carved cell, then forget the plan.
-    let volume = if no_hide { Err(()) } else { volume.single().map_err(|_| ()) };
+    let volume = if no_hide {
+        Err(())
+    } else {
+        volume.single().map_err(|_| ())
+    };
     let Ok((tf, data)) = volume else {
         if !state.applied.is_empty() {
             let living: HashMap<Entity, Mesh3d> =
@@ -291,15 +304,39 @@ pub(super) fn monkey_voxel_hide_terrain(
     // Recompute the plan only when the footprint meaningfully moves (quantised to 0.5 yd).
     let q = |v: f32| (v * 2.0).round() as i64;
     let sig = (q(wow[0]), q(wow[1]), data.0.chunk_dims());
-    if state.sig != Some(sig) {
+    // MONKEY (voxel): re-plan until resident (the plan is XZ-only, so a re-seed's centre.y change
+    // needs no re-plan).
+    let mut retry = false;
+    if state.incomplete && state.sig == Some(sig) {
+        state.replan_timer += time.delta_secs();
+        if state.replan_timer >= 0.5 {
+            state.replan_timer = 0.0;
+            retry = true;
+        }
+    }
+    if state.sig != Some(sig) || retry {
+        let resident = |x: f32, y: f32| {
+            let (tx, ty, _) = cell_key_at(x, y);
+            streamer
+                .tile_handle((tx, ty))
+                .is_some_and(|h| adts.get(&h).is_some())
+        };
+        let all_resident = [(fx0, fy0), (fx0, fy1), (fx1, fy0), (fx1, fy1)]
+            .iter()
+            .all(|&(x, y)| resident(x, y));
+        let was_retry = retry && state.sig == Some(sig);
         state.sig = Some(sig);
         state.desired = compute_desired(fx0, fx1, fy0, fy1, &streamer, &adts);
-        let plan: Vec<_> = state
-            .desired
-            .iter()
-            .map(|(k, p)| (*k, p.chunk_holes.clone()))
-            .collect();
-        info!(
+        state.incomplete = !all_resident || state.desired.is_empty();
+        if was_retry && state.incomplete {
+            // still waiting on the stream: stay quiet (no per-0.5 s log spam)
+        } else {
+            let plan: Vec<_> = state
+                .desired
+                .iter()
+                .map(|(k, p)| (*k, p.chunk_holes.clone()))
+                .collect();
+            info!(
             "MONKEY (voxel): hide plan — footprint WoW X[{:.1},{:.1}] Y[{:.1},{:.1}] covers {} \
              render cell(s): {:?}",
             fx0,
@@ -309,6 +346,7 @@ pub(super) fn monkey_voxel_hide_terrain(
             state.desired.len(),
             plan,
         );
+        }
     }
 
     // Index the resident terrain cells by their render-cell key.
@@ -382,14 +420,20 @@ mod tests {
     fn cell_key_round_trips_through_bevy_centre() {
         let cs = benilla_formats::CHUNK_SIZE;
         let mc = super::map_center();
-        for &(tx, ty, row, col) in &[(32i32, 49i32, 5usize, 10usize), (0, 0, 0, 0), (63, 63, 15, 15)]
-        {
+        for &(tx, ty, row, col) in &[
+            (32i32, 49i32, 5usize, 10usize),
+            (0, 0, 0, 0),
+            (63, 63, 15, 15),
+        ] {
             // The WoW centre of chunk (tile_y row, tile_x col) → its render cell.
             let gx = ty * 16 + row as i32;
             let gy = tx * 16 + col as i32;
             let wow_x = mc - (gx as f32 + 0.5) * cs;
             let wow_y = mc - (gy as f32 + 0.5) * cs;
-            let expect = ((tx, ty, (row / 4) * 4 + (col / 4)), cell_key_at(wow_x, wow_y));
+            let expect = (
+                (tx, ty, (row / 4) * 4 + (col / 4)),
+                cell_key_at(wow_x, wow_y),
+            );
             assert_eq!(expect.0, expect.1, "cell_key_at mismatch");
             // Bevy horizontal centre = wow_to_bevy: (−wow_y, _, −wow_x).
             let via_aabb = cell_key_of(Vec3A::new(-wow_y, 123.0, -wow_x));

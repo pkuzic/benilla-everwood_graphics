@@ -437,6 +437,7 @@ impl Plugin for MonkeyVoxelPlugin {
         app.init_resource::<MonkeyVoxelSiteSpawned>();
         app.init_resource::<MonkeyLocalGm>();
         app.init_resource::<MonkeyVoxelHideState>();
+        app.init_resource::<MonkeyVoxelSeedPending>();
         // Spawn once, in front of the camera, so it is guaranteed on-screen on any login — gated on
         // a live world (a `WorldCamera` with a real pose) and a `Local` one-shot latch.
         // Chained for a deterministic order: volume management (create / place / adopt) runs BEFORE
@@ -445,6 +446,8 @@ impl Plugin for MonkeyVoxelPlugin {
             Update,
             (
                 monkey_voxel_manage_volume,
+                // MONKEY (voxel): re-seed a flat-slab volume once its tile is resident.
+                monkey_voxel_reseed_when_resident,
                 monkey_voxel_capture_follow,
                 monkey_voxel_texture_from_terrain,
                 monkey_voxel_brush_edit,
@@ -509,6 +512,7 @@ fn monkey_voxel_manage_volume(
     mut last_cam: Local<Option<Vec3>>,
     mut spawned: ResMut<MonkeyVoxelSiteSpawned>,
     mut net: ResMut<MonkeyVoxelNet>,
+    mut pending: ResMut<MonkeyVoxelSeedPending>,
     gm: Res<MonkeyLocalGm>,
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
@@ -602,6 +606,7 @@ fn monkey_voxel_manage_volume(
                 seed.as_ref(),
                 centre,
             );
+            pending.0 = seed.is_none().then_some((chunks, surface));
         }
         return;
     }
@@ -622,6 +627,7 @@ fn monkey_voxel_manage_volume(
             seed.as_ref(),
             centre,
         );
+        pending.0 = seed.is_none().then_some((chunks, surface));
         spawned.0 = true;
     } else if let Some(site) = monkey_voxel_site_load() {
         let chunks = [
@@ -643,6 +649,7 @@ fn monkey_voxel_manage_volume(
             seed.as_ref(),
             c,
         );
+        pending.0 = seed.is_none().then_some((chunks, site.surface));
         spawned.0 = true;
     } else {
         // Solo sandbox: wait for the camera to settle (world-enter keeps nudging it), then seed a
@@ -674,8 +681,61 @@ fn monkey_voxel_manage_volume(
             seed.as_ref(),
             centre,
         );
+        pending.0 = seed.is_none().then_some((VOL_CHUNKS, VOL_SURFACE));
         spawned.0 = true;
     }
+}
+
+/// MONKEY (voxel): `Some((chunks, surface))` while the single volume was built WITHOUT a terrain seed
+/// (its tile wasn't resident at placement / relog / adoption time) — a flat slab at the stored anchor
+/// height. Set/cleared by every build/relocate in [`monkey_voxel_manage_volume`], so a new placement
+/// or adoption resets it; [`monkey_voxel_reseed_when_resident`] clears it once it has re-seeded.
+#[derive(Resource, Default)]
+pub struct MonkeyVoxelSeedPending(pub Option<([u32; 3], f32)>);
+
+/// MONKEY (voxel): re-seed an UNSEEDED volume from the real ground once its tile streams in. Every
+/// ~0.25 s it retries [`monkey_voxel_sample_terrain`] at the volume's CURRENT anchor XZ; on success
+/// it rebuilds the volume in place via [`monkey_voxel_relocate`] (centre.y from the seed, journal
+/// replayed on top — edits are volume-local and every client derives the same seed from the same
+/// ADT, so multiplayer stays consistent) and clears the pending flag (seed once per placement).
+/// Skipped while the capture-only camera-follow glue is active (`WOW_CAPTURE` without
+/// `WOW_VOXEL_NO_FOLLOW`): there the volume is a framing aid that follows the camera, not a site.
+#[allow(clippy::too_many_arguments)]
+fn monkey_voxel_reseed_when_resident(
+    time: Res<Time>,
+    mut since: Local<f32>,
+    mut pending: ResMut<MonkeyVoxelSeedPending>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    world: crate::world_point::WorldPoint,
+    mut volume: Query<(&mut MonkeyVoxelData, &mut Transform, &Mesh3d), With<MonkeyVoxelVolume>>,
+) {
+    let Some((chunks, surface)) = pending.0 else {
+        return;
+    };
+    if std::env::var_os("WOW_CAPTURE").is_some() && std::env::var_os("WOW_VOXEL_NO_FOLLOW").is_none()
+    {
+        return;
+    }
+    *since += time.delta_secs();
+    if *since < 0.25 {
+        return;
+    }
+    *since = 0.0;
+    let Ok((mut data, mut tf, mesh3d)) = volume.single_mut() else {
+        return;
+    };
+    let centre = tf.translation + half_extent_for(chunks);
+    let Some(seed) = monkey_voxel_sample_terrain(&world, Vec2::new(centre.x, centre.z), chunks) else {
+        return;
+    };
+    let c = Vec3::new(centre.x, seed.centre.y, centre.z);
+    monkey_voxel_relocate(&mut data, &mut tf, mesh3d, &mut meshes, chunks, surface, Some(&seed), c);
+    pending.0 = None;
+    let w = bevy_to_wow(c);
+    info!(
+        "MONKEY (voxel): site re-seeded from the real terrain once its tile streamed in (centre WoW [{:.1}, {:.1}, {:.1}])",
+        w[0], w[1], w[2],
+    );
 }
 
 /// Compute the build-site centre (Bevy) for a volume of `chunks`/`surface` placed at the player's
