@@ -14,7 +14,7 @@ use bevy::mesh::{Indices, PrimitiveTopology};
 use bevy::prelude::*;
 
 use crate::view::WorldCamera;
-use benilla_assets::coords::bevy_to_wow;
+use benilla_assets::coords::{bevy_to_wow, wow_to_bevy};
 use benilla_voxel::BrushMode;
 
 /// Converts the engine-neutral [`benilla_voxel::VoxelMesh`] (triangle list; `[f32; 3]`
@@ -69,14 +69,59 @@ pub struct MonkeyVoxelEdit {
     pub mode: u8,
 }
 
-/// Cross-crate mailbox between the voxel brush (benilla-world) and the chat-channel relay
-/// (benilla-app, behind the `voxel` feature): local edits to broadcast go in `outbox`; edits
-/// received from other players land in `inbox`. benilla-app drains the outbox and sends each as a
-/// `MonkeyVoxel` channel message, and pushes decoded remote edits into the inbox.
+/// A shared build-site placement: the volume's world anchor (WoW coords of its CENTRE) plus its
+/// dimensions. A GM drops one with Ctrl+P; every client that receives it re-spawns the single shared
+/// volume at this exact anchor, so the LOCAL-coord edits that ride [`MonkeyVoxelEdit`] land on the
+/// same world spot for everyone (they only lined up before when players happened to stand together).
+#[derive(Clone, Copy, Debug)]
+pub struct MonkeyVoxelSpawn {
+    /// WoW coords [x, y, z] of the volume CENTRE — the shared world anchor.
+    pub anchor_wow: [f32; 3],
+    /// Chunk count per axis (u8 is plenty; a volume is a handful of chunks).
+    pub chunks: [u8; 3],
+    /// Flat-top height within the volume, in voxels.
+    pub surface: f32,
+}
+
+/// Cross-crate mailbox between the voxel brush (benilla-world) and the guild-addon relay
+/// (benilla-app, behind the `voxel` feature): local edits/placements to broadcast go in the
+/// `*_outbox`; those received from other players land in the `*_inbox`. benilla-app drains the
+/// outboxes and sends each as a `MV:`/`VS:` guild addon message, and pushes decoded inbound ones in.
 #[derive(Resource, Default)]
 pub struct MonkeyVoxelNet {
     pub outbox: Vec<MonkeyVoxelEdit>,
     pub inbox: Vec<MonkeyVoxelEdit>,
+    pub spawn_outbox: Vec<MonkeyVoxelSpawn>,
+    pub spawn_inbox: Vec<MonkeyVoxelSpawn>,
+}
+
+impl MonkeyVoxelSpawn {
+    /// Encode to hex (anchor 3×f32 LE, chunks 3×u8, surface f32 LE → 19 bytes / 38 hex).
+    pub fn to_hex(&self) -> String {
+        let mut b = Vec::with_capacity(19);
+        for v in self.anchor_wow {
+            b.extend_from_slice(&v.to_le_bytes());
+        }
+        b.extend_from_slice(&self.chunks);
+        b.extend_from_slice(&self.surface.to_le_bytes());
+        b.iter().map(|x| format!("{x:02x}")).collect()
+    }
+
+    /// Decode from the hex payload; `None` if malformed.
+    pub fn from_hex(s: &str) -> Option<Self> {
+        if s.len() != 38 {
+            return None;
+        }
+        let b: Vec<u8> = (0..19)
+            .map(|i| u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).ok())
+            .collect::<Option<Vec<u8>>>()?;
+        let f = |o: usize| f32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
+        Some(Self {
+            anchor_wow: [f(0), f(4), f(8)],
+            chunks: [b[12], b[13], b[14]],
+            surface: f(15),
+        })
+    }
 }
 
 impl MonkeyVoxelEdit {
@@ -150,6 +195,114 @@ fn monkey_voxel_journal_load() -> Vec<MonkeyVoxelEdit> {
         .collect()
 }
 
+/// Truncate the journal — a fresh build site starts with no edits (so stale edits from a previous
+/// site don't replay onto a newly placed/adopted one).
+fn monkey_voxel_journal_clear() {
+    let _ = std::fs::remove_file(monkey_voxel_journal_path());
+}
+
+/// The shared build site's anchor file (beside the journal). Present only once a GM has placed a
+/// site (or this client adopted one); its presence makes the volume re-spawn at that fixed world
+/// anchor on relog instead of ahead of the camera (the solo-sandbox default).
+fn monkey_voxel_site_path() -> std::path::PathBuf {
+    std::env::var_os("BENILLA_HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join("monkey_voxel_site.bin")
+}
+
+/// Persist the current shared build site (19-byte [`MonkeyVoxelSpawn`] payload).
+fn monkey_voxel_site_save(site: &MonkeyVoxelSpawn) {
+    let hex = site.to_hex();
+    let bytes: Vec<u8> = (0..hex.len() / 2)
+        .map(|i| u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).unwrap_or(0))
+        .collect();
+    let _ = std::fs::write(monkey_voxel_site_path(), &bytes);
+}
+
+/// Load the persisted shared build site, if any.
+fn monkey_voxel_site_load() -> Option<MonkeyVoxelSpawn> {
+    let bytes = std::fs::read(monkey_voxel_site_path()).ok()?;
+    let hex: String = bytes.iter().map(|x| format!("{x:02x}")).collect();
+    MonkeyVoxelSpawn::from_hex(&hex)
+}
+
+/// A fresh base slab with the current journal replayed onto it (empty right after a site is placed
+/// or adopted, since the journal is cleared then).
+fn monkey_voxel_fresh(chunks: [u32; 3], surface: f32) -> benilla_voxel::VoxelVolume {
+    let mut volume = benilla_voxel::VoxelVolume::slab(chunks, surface);
+    let saved = monkey_voxel_journal_load();
+    for e in &saved {
+        monkey_voxel_apply_one(&mut volume, e);
+    }
+    if !saved.is_empty() {
+        info!("MONKEY (voxel): replayed {} journalled edit(s)", saved.len());
+    }
+    volume
+}
+
+/// Earthy unlit material (shading rides in the mesh's vertex colours; a lit material is black under
+/// benilla's custom world light).
+fn monkey_voxel_material(materials: &mut Assets<StandardMaterial>) -> Handle<StandardMaterial> {
+    materials.add(StandardMaterial {
+        base_color: Color::WHITE,
+        unlit: true,
+        cull_mode: None,
+        ..default()
+    })
+}
+
+/// Spawn the single voxel-volume entity with its centre at `centre_bevy`. Used when no volume exists
+/// yet (first auto-spawn, or a placement/adoption that beats the auto-spawn). The caller flips
+/// [`MonkeyVoxelSiteSpawned`] so exactly one volume is ever created.
+fn monkey_voxel_build_entity(
+    commands: &mut Commands,
+    meshes: &mut Assets<Mesh>,
+    materials: &mut Assets<StandardMaterial>,
+    chunks: [u32; 3],
+    surface: f32,
+    centre_bevy: Vec3,
+) {
+    let volume = monkey_voxel_fresh(chunks, surface);
+    let voxel_mesh = volume.mesh();
+    let (tri_count, vert_count) = (voxel_mesh.tri_count(), voxel_mesh.positions.len());
+    let mesh = meshes.add(monkey_voxel_mesh_to_bevy(&voxel_mesh));
+    let material = monkey_voxel_material(materials);
+    let origin = centre_bevy - half_extent_for(chunks);
+    commands.spawn((
+        Mesh3d(mesh),
+        MeshMaterial3d(material),
+        Transform::from_translation(origin),
+        MonkeyVoxelVolume,
+        MonkeyVoxelData(volume),
+        Name::new("MONKEY voxel sandbox"),
+    ));
+    let wow = bevy_to_wow(centre_bevy);
+    info!(
+        "MONKEY (voxel): spawned terraform patch {:?} chunks — {vert_count} verts, {tri_count} tris \
+         at WoW centre [{:.1}, {:.1}, {:.1}] (x,y,z). Brush [ dig / ] build / \\ smooth, -/= size; \
+         Ctrl+P places a shared build site here for the whole guild.",
+        chunks, wow[0], wow[1], wow[2],
+    );
+}
+
+/// Relocate/reset the EXISTING volume to a fresh slab at `centre_bevy` (a placement or adoption when
+/// the volume already exists), rather than despawning and respawning — which would momentarily leave
+/// zero or (with deferred commands) two volumes and break the `single` queries.
+fn monkey_voxel_relocate(
+    data: &mut MonkeyVoxelData,
+    transform: &mut Transform,
+    mesh3d: &Mesh3d,
+    meshes: &mut Assets<Mesh>,
+    chunks: [u32; 3],
+    surface: f32,
+    centre_bevy: Vec3,
+) {
+    data.0 = monkey_voxel_fresh(chunks, surface);
+    transform.translation = centre_bevy - half_extent_for(chunks);
+    let _ = meshes.insert(&mesh3d.0, monkey_voxel_mesh_to_bevy(&data.0.mesh()));
+}
+
 /// Apply an edit to a volume by its `mode` code. Returns whether anything changed.
 fn monkey_voxel_apply_one(v: &mut benilla_voxel::VoxelVolume, e: &MonkeyVoxelEdit) -> bool {
     match e.mode {
@@ -159,6 +312,12 @@ fn monkey_voxel_apply_one(v: &mut benilla_voxel::VoxelVolume, e: &MonkeyVoxelEdi
     }
 }
 
+/// Synchronous "a volume has been created this session" latch — shared by the auto-spawn, a GM
+/// placement and an adoption so exactly ONE volume ever exists (a per-system `Local` latch let the
+/// auto-spawn and a placement each create one when settle was slow → two volumes → broken queries).
+#[derive(Resource, Default)]
+pub struct MonkeyVoxelSiteSpawned(pub bool);
+
 /// P0 render: spawn one static voxel volume in front of the player, once a world is live.
 pub struct MonkeyVoxelPlugin;
 
@@ -166,18 +325,22 @@ impl Plugin for MonkeyVoxelPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<MonkeyVoxelBrushRadius>();
         app.init_resource::<MonkeyVoxelNet>();
+        app.init_resource::<MonkeyVoxelSiteSpawned>();
         // Spawn once, in front of the camera, so it is guaranteed on-screen on any login — gated on
         // a live world (a `WorldCamera` with a real pose) and a `Local` one-shot latch.
+        // Chained for a deterministic order: volume management (create / place / adopt) runs BEFORE
+        // edits apply that frame, so a freshly placed or adopted site is in place first.
         app.add_systems(
             Update,
             (
-                spawn_monkey_voxel_volume,
+                monkey_voxel_manage_volume,
                 monkey_voxel_capture_follow,
                 monkey_voxel_brush_edit,
                 monkey_voxel_apply_remote,
                 monkey_voxel_autoedit,
                 monkey_voxel_capture_demo_edit,
             )
+                .chain()
                 .run_if(crate::schedule::world_is_live),
         );
     }
@@ -188,11 +351,16 @@ const VOL_CHUNKS: [u32; 3] = [2, 1, 2];
 /// Flat-top height within the volume, in voxels (solid below, air above).
 const VOL_SURFACE: f32 = 16.0;
 
-/// Half the volume's world size (yards) — offsets the entity origin so the volume centre lands on a
-/// target point, and is the aim reference for the brush.
-fn volume_half_extent() -> Vec3 {
-    Vec3::new(VOL_CHUNKS[0] as f32, VOL_CHUNKS[1] as f32, VOL_CHUNKS[2] as f32)
+/// Half the world size (yards) of a volume with the given chunk dims — offsets the entity origin so
+/// the volume centre lands on a target point.
+fn half_extent_for(chunks: [u32; 3]) -> Vec3 {
+    Vec3::new(chunks[0] as f32, chunks[1] as f32, chunks[2] as f32)
         * (benilla_voxel::CHUNK as f32 * benilla_voxel::VOXEL_SIZE * 0.5)
+}
+
+/// Half the sandbox volume's world size — the aim reference for the brush.
+fn volume_half_extent() -> Vec3 {
+    half_extent_for(VOL_CHUNKS)
 }
 
 /// Yards in front of the camera to place the volume centre (close, so it's right there to sculpt).
@@ -210,99 +378,146 @@ impl Default for MonkeyVoxelBrushRadius {
     }
 }
 
-fn spawn_monkey_voxel_volume(
-    mut done: Local<bool>,
+/// The ONE system that owns the single voxel volume: it creates it, relocates it on a shared-site
+/// placement (local Ctrl+P / `$WOW_VOXEL_AUTOPLACE`, or one adopted from another player), and reads
+/// the persisted site on relog. Keeping all of this in a single system avoids the cross-system
+/// deferred-command race that made two volumes (auto-spawn queues a volume the place/adopt system
+/// can't yet see via `single`, so it made a second one).
+#[allow(clippy::too_many_arguments)]
+fn monkey_voxel_manage_volume(
+    keys: Res<ButtonInput<KeyCode>>,
+    time: Res<Time>,
+    mut auto_place_done: Local<bool>,
+    mut place_elapsed: Local<f32>,
     mut settle_frames: Local<u32>,
     mut last_cam: Local<Option<Vec3>>,
+    mut spawned: ResMut<MonkeyVoxelSiteSpawned>,
+    mut net: ResMut<MonkeyVoxelNet>,
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     camera: Query<&GlobalTransform, With<WorldCamera>>,
     world: crate::world_point::WorldPoint,
+    mut volume: Query<(&mut MonkeyVoxelData, &mut Transform, &Mesh3d), With<MonkeyVoxelVolume>>,
 ) {
-    if *done {
-        return;
-    }
-    // Wait for a world camera with a non-origin pose (the player has entered the world).
+    // Wait for a world camera with a real pose (the player has entered the world).
     let Ok(cam) = camera.single() else {
         return;
     };
     let cam_pos = cam.translation();
     if cam_pos == Vec3::ZERO {
-        return; // camera not yet placed in the world
-    }
-    // World-enter keeps moving the camera for a second or two as it settles behind the player. Spawn
-    // only once it has held still, so the one-shot patch lands in front of the SETTLED view rather
-    // than the transient load-in pose (the same settle trap capture mode hit).
-    let settled = last_cam.is_some_and(|p| p.distance(cam_pos) < 0.5);
-    *last_cam = Some(cam_pos);
-    *settle_frames = if settled { *settle_frames + 1 } else { 0 };
-    if *settle_frames < 30 {
-        return; // ~0.5 s of a still camera
+        return;
     }
 
-    // Build the terraform sandbox: a multi-chunk flat-topped ground patch (slab) → combined mesh,
-    // then replay the edit journal so prior terraforming returns after a relog (persistence).
-    let mut volume = benilla_voxel::VoxelVolume::slab(VOL_CHUNKS, VOL_SURFACE);
-    let saved = monkey_voxel_journal_load();
-    for e in &saved {
-        monkey_voxel_apply_one(&mut volume, e);
-    }
-    if !saved.is_empty() {
-        info!("MONKEY (voxel): replayed {} journalled edit(s)", saved.len());
-    }
-    let voxel_mesh = volume.mesh();
-    let tri_count = voxel_mesh.tri_count();
-    let vert_count = voxel_mesh.positions.len();
-    let mesh = meshes.add(monkey_voxel_mesh_to_bevy(&voxel_mesh));
+    // A new shared build site this frame: (centre_bevy, chunks, surface). Adoption (from another
+    // player) wins over a local placement if both land in one frame.
+    let mut new_site: Option<(Vec3, [u32; 3], f32)> = None;
 
-    // Unlit + double-sided; the earthy shading rides in the mesh's vertex colours (see
-    // monkey_voxel_mesh_to_bevy). Unlit dodges benilla's custom light (a lit material = black).
-    let material = materials.add(StandardMaterial {
-        base_color: Color::WHITE,
-        unlit: true,
-        cull_mode: None,
-        ..default()
-    });
+    if let Some(site) = net.spawn_inbox.drain(..).last() {
+        monkey_voxel_site_save(&site);
+        monkey_voxel_journal_clear();
+        let chunks = [site.chunks[0] as u32, site.chunks[1] as u32, site.chunks[2] as u32];
+        new_site = Some((wow_to_bevy(site.anchor_wow), chunks, site.surface));
+        let a = site.anchor_wow;
+        info!(
+            "MONKEY (voxel): adopted a shared build site from another player at WoW [{:.1}, {:.1}, {:.1}].",
+            a[0], a[1], a[2],
+        );
+    }
 
-    // Place the patch a short way ahead along the SETTLED view (in front of the player, in the
-    // look direction), with its flat top a touch above the real ground so it's a clearly visible
-    // low platform rather than flush (which z-fights and hides under the terrain). Fall back to
-    // foot level if the ground there isn't loaded.
-    let ahead = cam_pos + *cam.forward() * SPAWN_AHEAD_YARDS;
-    let half = volume_half_extent();
+    // Local placement (Ctrl+P, or the headless `$WOW_VOXEL_AUTOPLACE` hook ~4 s in).
+    let key_place = (keys.pressed(KeyCode::ControlLeft) || keys.pressed(KeyCode::ControlRight))
+        && keys.just_pressed(KeyCode::KeyP);
+    let auto_place = !*auto_place_done && std::env::var_os("WOW_VOXEL_AUTOPLACE").is_some() && {
+        *place_elapsed += time.delta_secs();
+        *place_elapsed >= 4.0
+    };
+    if auto_place {
+        *auto_place_done = true;
+    }
+    if new_site.is_none() && (key_place || auto_place) {
+        let centre = site_centre_at_player(cam, &world, VOL_CHUNKS, VOL_SURFACE);
+        let site = MonkeyVoxelSpawn {
+            anchor_wow: bevy_to_wow(centre),
+            chunks: [VOL_CHUNKS[0] as u8, VOL_CHUNKS[1] as u8, VOL_CHUNKS[2] as u8],
+            surface: VOL_SURFACE,
+        };
+        monkey_voxel_site_save(&site);
+        monkey_voxel_journal_clear();
+        net.spawn_outbox.push(site);
+        new_site = Some((centre, VOL_CHUNKS, VOL_SURFACE));
+        let a = site.anchor_wow;
+        info!(
+            "MONKEY (voxel): placed a shared build site at WoW [{:.1}, {:.1}, {:.1}] and broadcast it.",
+            a[0], a[1], a[2],
+        );
+    }
+
+    // Apply. If the volume already exists (from an earlier frame — commands are flushed by now),
+    // relocate it on a new site. If it does not exist yet, create exactly one: at a new site, else a
+    // persisted site, else the solo-sandbox placement ahead of the settled view.
+    if let Ok((mut data, mut tf, mesh3d)) = volume.single_mut() {
+        if let Some((centre, chunks, surface)) = new_site {
+            monkey_voxel_relocate(&mut data, &mut tf, mesh3d, &mut meshes, chunks, surface, centre);
+        }
+        return;
+    }
+    if spawned.0 {
+        return; // volume creation already queued this/last frame; nothing to do until it exists
+    }
+    if let Some((centre, chunks, surface)) = new_site {
+        monkey_voxel_build_entity(&mut commands, &mut meshes, &mut materials, chunks, surface, centre);
+        spawned.0 = true;
+    } else if let Some(site) = monkey_voxel_site_load() {
+        let chunks = [site.chunks[0] as u32, site.chunks[1] as u32, site.chunks[2] as u32];
+        let c = wow_to_bevy(site.anchor_wow);
+        monkey_voxel_build_entity(&mut commands, &mut meshes, &mut materials, chunks, site.surface, c);
+        spawned.0 = true;
+    } else {
+        // Solo sandbox: wait for the camera to settle (world-enter keeps nudging it), then drop the
+        // patch a short way ahead along the settled view, flat top a touch above the real ground.
+        let settled = last_cam.is_some_and(|p| p.distance(cam_pos) < 0.5);
+        *last_cam = Some(cam_pos);
+        *settle_frames = if settled { *settle_frames + 1 } else { 0 };
+        if *settle_frames < 30 {
+            return; // ~0.5 s of a still camera
+        }
+        let ahead = cam_pos + *cam.forward() * SPAWN_AHEAD_YARDS;
+        let half = volume_half_extent();
+        let ground = world
+            .terrain_height_under(ahead)
+            .unwrap_or(cam_pos.y - EYE_HEIGHT_YARDS);
+        let top_y = ground + 1.5;
+        let origin = Vec3::new(
+            ahead.x - half.x,
+            top_y - VOL_SURFACE * benilla_voxel::VOXEL_SIZE,
+            ahead.z - half.z,
+        );
+        monkey_voxel_build_entity(&mut commands, &mut meshes, &mut materials, VOL_CHUNKS, VOL_SURFACE, origin + half);
+        spawned.0 = true;
+    }
+}
+
+/// Compute the build-site centre (Bevy) for a volume of `chunks`/`surface` placed at the player's
+/// feet: horizontally under the camera, its flat top ~1.5 yd above the ground there (foot level if
+/// the terrain isn't loaded).
+fn site_centre_at_player(
+    cam: &GlobalTransform,
+    world: &crate::world_point::WorldPoint,
+    chunks: [u32; 3],
+    surface: f32,
+) -> Vec3 {
+    let cam_pos = cam.translation();
+    let half = half_extent_for(chunks);
     let ground = world
-        .terrain_height_under(ahead)
+        .terrain_height_under(cam_pos)
         .unwrap_or(cam_pos.y - EYE_HEIGHT_YARDS);
     let top_y = ground + 1.5;
-    let origin = Vec3::new(
-        ahead.x - half.x,
-        top_y - VOL_SURFACE * benilla_voxel::VOXEL_SIZE,
-        ahead.z - half.z,
-    );
-    let centre = origin + half;
-
-    commands.spawn((
-        Mesh3d(mesh),
-        MeshMaterial3d(material),
-        Transform::from_translation(origin),
-        MonkeyVoxelVolume,
-        MonkeyVoxelData(volume),
-        Name::new("MONKEY voxel sandbox"),
-    ));
-
-    let wow = bevy_to_wow(centre);
-    info!(
-        "MONKEY (voxel): spawned terraform patch {:?} chunks — {vert_count} verts, {tri_count} tris. \
-         Bevy centre {:.1?}, WoW centre [{:.1}, {:.1}, {:.1}] (x,y,z). Look ~{SPAWN_AHEAD_YARDS} yd \
-         ahead (and down); brush [ dig / ] build / \\ smooth, -/= size.",
-        VOL_CHUNKS,
-        centre.to_array(),
-        wow[0],
-        wow[1],
-        wow[2],
-    );
-    *done = true;
+    Vec3::new(
+        cam_pos.x,
+        top_y - surface * benilla_voxel::VOXEL_SIZE + half.y,
+        cam_pos.z,
+    )
 }
 
 /// Capture-only framing aid. In `$WOW_CAPTURE` mode the scenario camera settles to its framing a
