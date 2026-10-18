@@ -136,6 +136,27 @@ pub fn terrain_height_under_cached<'a>(
     bevy_pos: Vec3,
     cache: &mut Option<((i32, i32), &'a AdtTile)>,
 ) -> Option<f32> {
+    let (wow, key, adt) = resolve_tile(streamer, adt_tiles, bevy_pos, cache)?;
+    // MONKEY (voxel): a build site's carve is a hole for the standing / snapping height (the voxel
+    // collider is the ground there); area id, ground effect and MCSH shade keep the un-holed data.
+    #[cfg(feature = "voxel")]
+    {
+        terrain_height_with_holes(&adt.chunks, wow, streamer.voxel_holes.get(&key))
+    }
+    #[cfg(not(feature = "voxel"))]
+    {
+        let _ = key;
+        benilla_formats::terrain_height_at(&adt.chunks, wow)
+    }
+}
+
+/// The WoW position, tile key and resident tile under `bevy_pos`, through the one-tile cache.
+fn resolve_tile<'a>(
+    streamer: &TerrainStreamer,
+    adt_tiles: &'a Assets<AdtTile>,
+    bevy_pos: Vec3,
+    cache: &mut Option<((i32, i32), &'a AdtTile)>,
+) -> Option<([f32; 3], (i32, i32), &'a AdtTile)> {
     let wow = bevy_to_wow(bevy_pos);
     let (tx, ty) = world_to_tile(wow[0], wow[1]);
     let key = (tx as i32, ty as i32);
@@ -148,15 +169,11 @@ pub fn terrain_height_under_cached<'a>(
             adt
         }
     };
-    #[cfg(feature = "voxel")]
-    {
-        return terrain_height_with_holes(&adt.chunks, wow, streamer.voxel_holes.get(&key));
-    }
-    #[cfg(not(feature = "voxel"))]
-    benilla_formats::terrain_height_at(&adt.chunks, wow)
+    Some((wow, key, adt))
 }
 
-/// MONKEY (voxel): raw cached height path for the seed sampler.
+/// MONKEY (voxel): the raw (un-carved) cached height, for the voxel seed / placement samplers —
+/// they must read the ORIGINAL ground even under an already-carved footprint.
 #[cfg(feature = "voxel")]
 pub fn terrain_height_under_raw_cached<'a>(
     streamer: &TerrainStreamer,
@@ -164,18 +181,7 @@ pub fn terrain_height_under_raw_cached<'a>(
     bevy_pos: Vec3,
     cache: &mut Option<((i32, i32), &'a AdtTile)>,
 ) -> Option<f32> {
-    let wow = bevy_to_wow(bevy_pos);
-    let (tx, ty) = world_to_tile(wow[0], wow[1]);
-    let key = (tx as i32, ty as i32);
-    let adt = match cache {
-        Some((k, adt)) if *k == key => *adt,
-        _ => {
-            let ts = streamer.tiles.get(&key)?;
-            let adt = adt_tiles.get(&ts.handle)?;
-            *cache = Some((key, adt));
-            adt
-        }
-    };
+    let (wow, _, adt) = resolve_tile(streamer, adt_tiles, bevy_pos, cache)?;
     benilla_formats::terrain_height_at(&adt.chunks, wow)
 }
 
@@ -187,29 +193,25 @@ fn terrain_height_with_holes(
     extra: Option<&HashMap<usize, u16>>,
 ) -> Option<f32> {
     let height = benilla_formats::terrain_height_at(chunks, wow)?;
-    let Some(extra) = extra else {
+    let Some(extra) = extra.filter(|m| !m.is_empty()) else {
         return Some(height);
     };
-    for (idx, chunk) in chunks.iter().enumerate() {
-        let Some(nw) = chunk.positions.first() else {
-            continue;
+    // Only the carved chunks are visited, with the same bounds test and cell → bit rule as
+    // `ChunkMesh::height_at`.
+    let carved = extra.iter().any(|(&idx, &bits)| {
+        let Some(nw) = chunks.get(idx).and_then(|c| c.positions.first()) else {
+            return false;
         };
         let south = (nw[0] - wow[0]) / benilla_formats::TILE_SIZE * 16.0;
         let east = (nw[1] - wow[1]) / benilla_formats::TILE_SIZE * 16.0;
         if !(0.0..=1.0).contains(&south) || !(0.0..=1.0).contains(&east) {
-            continue;
+            return false;
         }
         let row = ((south * 8.0) as usize).min(7);
         let col = ((east * 8.0) as usize).min(7);
-        if extra
-            .get(&idx)
-            .is_some_and(|bits| bits & (1 << ((row >> 1) * 4 + (col >> 1))) != 0)
-        {
-            return None;
-        }
-        return Some(height);
-    }
-    Some(height)
+        bits & (1 << ((row >> 1) * 4 + (col >> 1))) != 0
+    });
+    (!carved).then_some(height)
 }
 
 /// Tracks the `AreaTable` id under the player's feet as the reference's `GetAreaID` (`0x670250`)

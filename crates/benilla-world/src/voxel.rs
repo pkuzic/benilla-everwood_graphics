@@ -675,7 +675,7 @@ fn monkey_voxel_manage_volume(
             Some(s) => s.centre,
             None => {
                 let ground = world
-                    .terrain_height_under(ahead)
+                    .terrain_height_under_raw(ahead) // MONKEY (voxel): raw, never the carve
                     .unwrap_or(cam_pos.y - EYE_HEIGHT_YARDS);
                 Vec3::new(
                     ahead.x,
@@ -762,7 +762,7 @@ fn site_centre_at_player(
     let cam_pos = cam.translation();
     let half = half_extent_for(chunks);
     let ground = world
-        .terrain_height_under(cam_pos)
+        .terrain_height_under_raw(cam_pos) // MONKEY (voxel): raw, never the carve
         .unwrap_or(cam_pos.y - EYE_HEIGHT_YARDS);
     let top_y = ground + 1.5;
     Vec3::new(
