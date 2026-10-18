@@ -444,6 +444,7 @@ impl Plugin for MonkeyVoxelPlugin {
         app.init_resource::<MonkeyVoxelSiteSpawned>();
         app.init_resource::<MonkeyLocalGm>();
         app.init_resource::<MonkeyVoxelHideState>();
+        app.init_resource::<MonkeyVoxelSeedPending>();
         // Spawn once, in front of the camera, so it is guaranteed on-screen on any login — gated on
         // a live world (a `WorldCamera` with a real pose) and a `Local` one-shot latch.
         // Chained for a deterministic order: volume management (create / place / adopt) runs BEFORE
@@ -452,6 +453,8 @@ impl Plugin for MonkeyVoxelPlugin {
             Update,
             (
                 monkey_voxel_manage_volume,
+                // MONKEY (voxel): re-seed a flat-slab volume once its tile is resident.
+                monkey_voxel_reseed_when_resident,
                 monkey_voxel_capture_follow,
                 monkey_voxel_texture_from_terrain,
                 monkey_voxel_brush_edit,
@@ -517,6 +520,7 @@ fn monkey_voxel_manage_volume(
     mut last_cam: Local<Option<Vec3>>,
     mut spawned: ResMut<MonkeyVoxelSiteSpawned>,
     mut net: ResMut<MonkeyVoxelNet>,
+    mut pending: ResMut<MonkeyVoxelSeedPending>,
     gm: Res<MonkeyLocalGm>,
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
@@ -610,6 +614,7 @@ fn monkey_voxel_manage_volume(
                 seed.as_ref(),
                 centre,
             );
+            pending.0 = seed.is_none().then_some((chunks, surface));
         }
         return;
     }
@@ -630,6 +635,7 @@ fn monkey_voxel_manage_volume(
             seed.as_ref(),
             centre,
         );
+        pending.0 = seed.is_none().then_some((chunks, surface));
         spawned.0 = true;
     } else if let Some(site) = monkey_voxel_site_load() {
         let chunks = [
@@ -651,6 +657,7 @@ fn monkey_voxel_manage_volume(
             seed.as_ref(),
             c,
         );
+        pending.0 = seed.is_none().then_some((chunks, site.surface));
         spawned.0 = true;
     } else {
         // Solo sandbox: wait for the camera to settle (world-enter keeps nudging it), then seed a
@@ -686,8 +693,61 @@ fn monkey_voxel_manage_volume(
             seed.as_ref(),
             centre,
         );
+        pending.0 = seed.is_none().then_some((VOL_CHUNKS, VOL_SURFACE));
         spawned.0 = true;
     }
+}
+
+/// MONKEY (voxel): `Some((chunks, surface))` while the single volume was built WITHOUT a terrain seed
+/// (its tile wasn't resident at placement / relog / adoption time) — a flat slab at the stored anchor
+/// height. Set/cleared by every build/relocate in [`monkey_voxel_manage_volume`], so a new placement
+/// or adoption resets it; [`monkey_voxel_reseed_when_resident`] clears it once it has re-seeded.
+#[derive(Resource, Default)]
+pub struct MonkeyVoxelSeedPending(pub Option<([u32; 3], f32)>);
+
+/// MONKEY (voxel): re-seed an UNSEEDED volume from the real ground once its tile streams in. Every
+/// ~0.25 s it retries [`monkey_voxel_sample_terrain`] at the volume's CURRENT anchor XZ; on success
+/// it rebuilds the volume in place via [`monkey_voxel_relocate`] (centre.y from the seed, journal
+/// replayed on top — edits are volume-local and every client derives the same seed from the same
+/// ADT, so multiplayer stays consistent) and clears the pending flag (seed once per placement).
+/// Skipped while the capture-only camera-follow glue is active (`WOW_CAPTURE` without
+/// `WOW_VOXEL_NO_FOLLOW`): there the volume is a framing aid that follows the camera, not a site.
+#[allow(clippy::too_many_arguments)]
+fn monkey_voxel_reseed_when_resident(
+    time: Res<Time>,
+    mut since: Local<f32>,
+    mut pending: ResMut<MonkeyVoxelSeedPending>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    world: crate::world_point::WorldPoint,
+    mut volume: Query<(&mut MonkeyVoxelData, &mut Transform, &Mesh3d), With<MonkeyVoxelVolume>>,
+) {
+    let Some((chunks, surface)) = pending.0 else {
+        return;
+    };
+    if std::env::var_os("WOW_CAPTURE").is_some() && std::env::var_os("WOW_VOXEL_NO_FOLLOW").is_none()
+    {
+        return;
+    }
+    *since += time.delta_secs();
+    if *since < 0.25 {
+        return;
+    }
+    *since = 0.0;
+    let Ok((mut data, mut tf, mesh3d)) = volume.single_mut() else {
+        return;
+    };
+    let centre = tf.translation + half_extent_for(chunks);
+    let Some(seed) = monkey_voxel_sample_terrain(&world, Vec2::new(centre.x, centre.z), chunks) else {
+        return;
+    };
+    let c = Vec3::new(centre.x, seed.centre.y, centre.z);
+    monkey_voxel_relocate(&mut data, &mut tf, mesh3d, &mut meshes, chunks, surface, Some(&seed), c);
+    pending.0 = None;
+    let w = bevy_to_wow(c);
+    info!(
+        "MONKEY (voxel): site re-seeded from the real terrain once its tile streamed in (centre WoW [{:.1}, {:.1}, {:.1}])",
+        w[0], w[1], w[2],
+    );
 }
 
 /// Compute the build-site centre (Bevy) for a volume of `chunks`/`surface` placed at the player's
@@ -739,11 +799,12 @@ fn monkey_voxel_capture_follow(
 /// Dress the voxel surface in the REAL ADT tileset of the ground under it, so a sculpted region
 /// matches the surrounding Blizzlike terrain instead of the procedural grass/rock/dirt. Each frame:
 /// find the covering tile+MCNK chunk under the volume centre; if that tile is resident, point the
-/// shared material at the tile's own `layer_array`/`alpha_array` and feed it the covering chunk's
-/// layer indices, alpha index and NW corner (the shader then triplanar-samples + alpha-blends like
-/// the real ground). Until the tile is resident the material keeps its procedural fallback, so the
-/// volume is never untextured. Re-points only when the covering (tile, chunk) changes, so the common
-/// case is one map lookup; the cloned handles pin the tile's arrays, so the look survives the tile
+/// shared material at the tile's own `layer_array`/`alpha_array`/`shadow_array` and feed it the 3×3
+/// chunk neighbourhood (layer, alpha and MCSH indices + the grid's NW corner) — the shader picks the
+/// chunk per fragment and maps/blends/lights exactly like `terrain.wgsl`. MONKEY (voxel): also binds
+/// the shared global light buffer once it exists. Until the tile is resident the material keeps its
+/// procedural fallback, so the volume is never untextured. Re-points only when the covering (tile,
+/// chunk) changes; the cloned handles pin the tile's arrays, so the look survives the tile
 /// scrolling out of the stream window. ONE volume at a time → one shared material.
 fn monkey_voxel_texture_from_terrain(
     streamer: Res<crate::terrain_stream::TerrainStreamer>,
@@ -752,7 +813,20 @@ fn monkey_voxel_texture_from_terrain(
     mut materials: ResMut<Assets<MonkeyVoxelMaterial>>,
     volume: Query<(&Transform, &MonkeyVoxelData), With<MonkeyVoxelVolume>>,
     mut last: Local<Option<(i32, i32, usize)>>,
+    // MONKEY (voxel): the terrain's shared global light, bound once it exists so the voxel is lit
+    // and fogged by the same rows as the ground around it.
+    shared_light: Option<Res<crate::lighting::SharedLightBuffer>>,
 ) {
+    if let Some(light) = &shared_light {
+        let bound = materials
+            .get(&mat_handle.0)
+            .is_some_and(|m| material::monkey_voxel_has_light(&m.extension));
+        if !bound {
+            if let Some(mat) = materials.get_mut(&mat_handle.0) {
+                material::monkey_voxel_bind_light(&mut mat.extension, light.0.clone());
+            }
+        }
+    }
     let Ok((tf, data)) = volume.single() else {
         return;
     };
@@ -768,44 +842,72 @@ fn monkey_voxel_texture_from_terrain(
     let Some(adt) = adts.get(&handle) else {
         return; // handle known but the asset is still loading
     };
-    let Some(nw) = adt.chunks.first().map(|c| c.positions[0]) else {
-        return;
-    };
 
-    // Chunk index under the centre: rows step south (−WoW X), columns east (−WoW Y); idx = row*16+col.
+    // MONKEY (voxel): find chunks by their OWN NW corner (`positions[0]`), not by `row*16+col` — the
+    // loader skips an MCNK without MCVT, so the vec index is not the grid index. A chunk is usable
+    // when it draws (a fully holed chunk carries the default, solid-fallback shading).
     let cs = benilla_formats::CHUNK_SIZE;
-    let row = (((nw[0] - wow[0]) / cs).floor() as i32).clamp(0, 15) as usize;
-    let col = (((nw[1] - wow[1]) / cs).floor() as i32).clamp(0, 15) as usize;
-    let idx = row * 16 + col;
-
-    // A hole chunk carries no real tileset (default shading = solid fallback); keep the procedural
-    // look there rather than paint it flat green.
-    let is_hole = adt.chunks.get(idx).is_none_or(|c| c.indices.len() < 3);
-    if is_hole {
-        return;
-    }
-    let Some(shading) = adt.shading.get(idx) else {
-        return;
+    let find = |x: f32, y: f32| -> Option<usize> {
+        adt.chunks.iter().position(|c| {
+            let nw = c.positions[0];
+            c.indices.len() >= 3
+                && (0.0..cs).contains(&(nw[0] - x))
+                && (0.0..cs).contains(&(nw[1] - y))
+        })
     };
-
+    let Some(idx) = find(wow[0], wow[1]) else {
+        return; // centre over a hole/missing chunk — keep what we have
+    };
     if *last == Some((tile.0, tile.1, idx)) {
-        return; // already wearing this chunk's tileset
+        return; // already wearing this neighbourhood's tileset
     }
-    let chunk_nw = [nw[0] - row as f32 * cs, nw[1] - col as f32 * cs];
+    let centre_nw = adt.chunks[idx].positions[0];
+    // The 3×3 neighbourhood, row = south (−WoW X), col = east (−WoW Y). A neighbour outside this
+    // tile (its arrays are another tile's) or a hole is CLAMPED toward the centre chunk: first the
+    // same row/col on the centre axis, then the centre itself. (Known limit: on a site straddling a
+    // tile border the far side wears the nearest in-tile chunk.)
+    let shade = |i: usize| {
+        let s = adt.shading.get(i).copied().unwrap_or_default();
+        material::MonkeyVoxelChunkShade {
+            layers: s.layers,
+            alpha: s.alpha,
+            shadow: s.shadow,
+        }
+    };
+    // A point mid-way inside neighbour (dr, dc).
+    let probe = |dr: i32, dc: i32| {
+        find(
+            centre_nw[0] - cs * (dr as f32 + 0.5),
+            centre_nw[1] - cs * (dc as f32 + 0.5),
+        )
+    };
+    let mut grid = [shade(idx); material::MONKEY_VOXEL_GRID * material::MONKEY_VOXEL_GRID];
+    for r in 0..3i32 {
+        for c in 0..3i32 {
+            let (dr, dc) = (r - 1, c - 1);
+            let pick = probe(dr, dc)
+                .or_else(|| probe(0, dc))
+                .or_else(|| probe(dr, 0))
+                .unwrap_or(idx);
+            grid[(r * 3 + c) as usize] = shade(pick);
+        }
+    }
+    // The grid's NW corner is one chunk north-west of the centre chunk's.
+    let grid_nw = [centre_nw[0] + cs, centre_nw[1] + cs];
     if let Some(mat) = materials.get_mut(&mat_handle.0) {
         material::monkey_voxel_apply_real(
             &mut mat.extension,
             adt.layer_array.clone(),
             adt.alpha_array.clone(),
-            shading.layers,
-            shading.alpha,
-            chunk_nw,
+            adt.shadow_array.clone(),
+            &grid,
+            grid_nw,
         );
         *last = Some((tile.0, tile.1, idx));
         info!(
-            "MONKEY (voxel): surface now wears the real tileset of tile {tile:?} chunk {idx} \
-             (layers {:?}).",
-            shading.layers,
+            "MONKEY (voxel): surface now wears the real tileset of tile {tile:?} around chunk {idx} \
+             (3×3 neighbourhood, centre layers {:?}).",
+            grid[4].layers,
         );
     }
 }
@@ -952,31 +1054,56 @@ fn monkey_voxel_autoedit(
     *done = true;
 }
 
-/// Capture-only proof that the edit → re-mesh → render chain works headlessly: once the volume
-/// exists, carve two bites out of the volume so the baseline screenshot shows a *deformed* volume.
-/// No-op in live play (env unset) — there the brush drives edits.
+/// Capture-only proof that the edit → re-mesh → render chain works headlessly, and something to
+/// frame for the wall/cliff look: once the volume has settled, carve relative to the REAL seeded
+/// surface (`surface_height_at`) — a ~6-yd-deep pit near the centre, a smaller crater off-centre, and
+/// a raised mound with an overhanging lip. MONKEY (voxel): re-applied whenever the volume is moved
+/// (a placement/adoption re-seeds the density and wipes earlier edits). No-op in live play (env
+/// unset) — there the brush drives edits.
 fn monkey_voxel_capture_demo_edit(
-    mut done: Local<bool>,
+    mut done_at: Local<Option<Vec3>>,
+    mut still: Local<(Option<Vec3>, u32)>,
     mut meshes: ResMut<Assets<Mesh>>,
-    mut volume: Query<(&mut MonkeyVoxelData, &Mesh3d), With<MonkeyVoxelVolume>>,
+    mut volume: Query<(&mut MonkeyVoxelData, &Mesh3d, &Transform), With<MonkeyVoxelVolume>>,
 ) {
-    if *done || std::env::var_os("WOW_CAPTURE").is_none() {
+    if std::env::var_os("WOW_CAPTURE").is_none() {
         return;
     }
-    let Ok((mut data, mesh3d)) = volume.single_mut() else {
+    let Ok((mut data, mesh3d, tf)) = volume.single_mut() else {
         return;
     };
-    // Terraform the patch for the baseline shot (global voxel coords; top surface at y=VOL_SURFACE):
-    // two craters, a trench across the chunk seam, a raised mound, then a smooth pass.
+    let at = tf.translation;
+    if done_at.is_some_and(|d| d.distance(at) < 1.0) {
+        return; // already dug at this placement
+    }
+    // Wait for ~1 s of a still volume, so a pending autoplace (~4 s) re-seed lands first.
+    if still.0.is_some_and(|p| p.distance(at) < 0.01) {
+        still.1 += 1;
+    } else {
+        *still = (Some(at), 0);
+    }
+    if still.1 < 60 {
+        return;
+    }
     let v = &mut data.0;
-    v.edit_sphere([20.0, 16.0, 22.0], 7.0, BrushMode::Subtract);
-    v.edit_sphere([46.0, 16.0, 42.0], 6.0, BrushMode::Subtract);
-    v.edit_sphere([32.0, 14.0, 12.0], 5.0, BrushMode::Subtract);
-    v.edit_sphere([32.0, 14.0, 30.0], 5.0, BrushMode::Subtract);
-    v.edit_sphere([34.0, 22.0, 46.0], 8.0, BrushMode::Add);
-    v.smooth_sphere([30.0, 18.0, 30.0], 12.0, 0.5);
+    // Surface height (voxels) at a column, or a mid-volume guess if the column has no surface.
+    let ground = |v: &benilla_voxel::VoxelVolume, x: f32, z: f32| {
+        v.surface_height_at(x, z).unwrap_or(32.0)
+    };
+    // The pit: two stacked bites at the centre, ~12 voxels (6 yd) deep with steep walls.
+    let h = ground(v, 32.0, 32.0);
+    v.edit_sphere([32.0, h - 2.0, 32.0], 10.0, BrushMode::Subtract);
+    v.edit_sphere([32.0, h - 6.0, 32.0], 7.0, BrushMode::Subtract);
+    // A smaller crater off-centre.
+    let h = ground(v, 50.0, 16.0);
+    v.edit_sphere([50.0, h, 16.0], 5.0, BrushMode::Subtract);
+    // A mound, then a lip pushed out over the ground beside it (an overhang).
+    let h = ground(v, 14.0, 48.0);
+    v.edit_sphere([14.0, h, 48.0], 7.0, BrushMode::Add);
+    v.edit_sphere([21.0, h + 6.0, 48.0], 4.0, BrushMode::Add);
     let _ = meshes.insert(&mesh3d.0, monkey_voxel_mesh_to_bevy(&v.mesh()));
-    *done = true;
+    *done_at = Some(at);
+    info!("MONKEY (voxel): capture demo dug a pit, a crater and an overhanging mound.");
 }
 
 #[cfg(test)]

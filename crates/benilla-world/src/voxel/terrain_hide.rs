@@ -60,6 +60,10 @@ pub(super) struct MonkeyVoxelHideState {
     applied: HashMap<Entity, (CellKey, u64)>,
     /// MONKEY (voxel): collider root -> (hole signature), also detects streamed roots.
     applied_tiles: HashMap<(i32, i32), (Entity, u64)>,
+    /// MONKEY (voxel): re-plan until resident — the last plan found 0 cells or a footprint corner's
+    /// tile wasn't resident, so re-plan every ~0.5 s even with an unchanged signature.
+    incomplete: bool,
+    replan_timer: f32,
 }
 
 /// `WOW_VOXEL_NO_HIDE=1`: keep the real ADT ground under the build site (the pre-hiding look), a
@@ -383,6 +387,7 @@ pub(super) fn monkey_voxel_hide_terrain(
     adts: Res<Assets<AdtTile>>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut state: ResMut<MonkeyVoxelHideState>,
+    time: Res<Time>, // MONKEY (voxel): re-plan until resident
     volume: Query<(&Transform, &MonkeyVoxelData), With<MonkeyVoxelVolume>>,
     cells: Query<(Entity, &Mesh3d, &Aabb), With<MeshMaterial3d<TerrainMaterial>>>,
 ) {
@@ -459,16 +464,40 @@ pub(super) fn monkey_voxel_hide_terrain(
     // Recompute the plan only when the footprint meaningfully moves (quantised to 0.5 yd).
     let q = |v: f32| (v * 2.0).round() as i64;
     let sig = (q(wow[0]), q(wow[1]), data.0.chunk_dims());
-    if state.sig != Some(sig) {
+    // MONKEY (voxel): re-plan until resident (the plan is XZ-only, so a re-seed's centre.y change
+    // needs no re-plan).
+    let mut retry = false;
+    if state.incomplete && state.sig == Some(sig) {
+        state.replan_timer += time.delta_secs();
+        if state.replan_timer >= 0.5 {
+            state.replan_timer = 0.0;
+            retry = true;
+        }
+    }
+    if state.sig != Some(sig) || retry {
+        let resident = |x: f32, y: f32| {
+            let (tx, ty, _) = cell_key_at(x, y);
+            streamer
+                .tile_handle((tx, ty))
+                .is_some_and(|h| adts.get(&h).is_some())
+        };
+        let all_resident = [(fx0, fy0), (fx0, fy1), (fx1, fy0), (fx1, fy1)]
+            .iter()
+            .all(|&(x, y)| resident(x, y));
+        let was_retry = retry && state.sig == Some(sig);
         state.sig = Some(sig);
         state.desired = compute_desired(fx0, fx1, fy0, fy1);
         state.desired_tiles = tile_plans(&state.desired);
-        let plan: Vec<_> = state
-            .desired
-            .iter()
-            .map(|(k, p)| (*k, p.chunk_holes.clone()))
-            .collect();
-        info!(
+        state.incomplete = !all_resident || state.desired.is_empty();
+        if was_retry && state.incomplete {
+            // still waiting on the stream: stay quiet (no per-0.5 s log spam)
+        } else {
+            let plan: Vec<_> = state
+                .desired
+                .iter()
+                .map(|(k, p)| (*k, p.chunk_holes.clone()))
+                .collect();
+            info!(
             "MONKEY (voxel): hide plan — footprint WoW X[{:.1},{:.1}] Y[{:.1},{:.1}] covers {} \
              render cell(s): {:?}",
             fx0,
@@ -478,6 +507,7 @@ pub(super) fn monkey_voxel_hide_terrain(
             state.desired.len(),
             plan,
         );
+        }
     }
 
     streamer.set_voxel_holes(
