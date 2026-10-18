@@ -15,12 +15,13 @@
 
 use std::collections::{HashMap, HashSet};
 
+use avian3d::prelude::{SpatialQuery, SpatialQueryFilter};
 use bevy::camera::primitives::Aabb;
 use bevy::math::Vec3A;
 use bevy::prelude::*;
 
 use super::{MonkeyVoxelData, MonkeyVoxelVolume};
-use crate::terrain_stream::TerrainStreamer;
+use crate::terrain_stream::{build_collider_task, PendingCollider, TerrainStreamer};
 use benilla_assets::coords::bevy_to_wow;
 use benilla_assets::materials::TerrainMaterial;
 use benilla_assets::{chunks_to_mesh, AdtTile, ChunkShading};
@@ -37,6 +38,13 @@ struct CellPlan {
     sig: u64,
 }
 
+/// MONKEY (voxel): the full per-tile carve used by its single terrain collider.
+#[derive(Clone, Default)]
+struct TilePlan {
+    chunk_holes: Vec<(usize, u16)>,
+    sig: u64,
+}
+
 /// The build site's terrain-hiding state: the footprint signature (recompute the plan only when it
 /// changes), the per-cell carve plan, and which cell entities are currently carved (so they are
 /// restored when the footprint leaves them and re-carved after a stream-out/in respawns them).
@@ -46,8 +54,12 @@ pub(super) struct MonkeyVoxelHideState {
     sig: Option<(i64, i64, [u32; 3])>,
     /// The carve plan per affected render cell.
     desired: HashMap<CellKey, CellPlan>,
+    /// MONKEY (voxel): collider plan per tile, including the combined chunk hole bits.
+    desired_tiles: HashMap<(i32, i32), TilePlan>,
     /// Carved cell entities → (key, plan-sig) they were carved for.
     applied: HashMap<Entity, (CellKey, u64)>,
+    /// MONKEY (voxel): collider root -> (hole signature), also detects streamed roots.
+    applied_tiles: HashMap<(i32, i32), (Entity, u64)>,
 }
 
 /// `WOW_VOXEL_NO_HIDE=1`: keep the real ADT ground under the build site (the pre-hiding look), a
@@ -62,6 +74,12 @@ fn monkey_voxel_hide_disabled() -> bool {
 #[inline]
 fn block_size() -> f32 {
     benilla_formats::CHUNK_SIZE / 4.0
+}
+
+/// MONKEY (voxel): require a complete hole block inside the footprint, within floating error.
+#[inline]
+fn fully_inside(lo: f32, hi: f32, footprint_lo: f32, footprint_hi: f32, eps: f32) -> bool {
+    lo >= footprint_lo - eps && hi <= footprint_hi + eps
 }
 
 /// The world-centre of the 64×64 tile grid in WoW yards; the global MCNK grid counts out from here.
@@ -97,8 +115,6 @@ fn compute_desired(
     fx1: f32,
     fy0: f32,
     fy1: f32,
-    streamer: &TerrainStreamer,
-    adts: &Assets<AdtTile>,
 ) -> HashMap<CellKey, CellPlan> {
     let cs = benilla_formats::CHUNK_SIZE;
     let mc = map_center();
@@ -126,13 +142,15 @@ fn compute_desired(
             let chunk_idx = (gx % 16) as usize * 16 + (gy % 16) as usize;
             let mut bits: u16 = 0;
             for brow in 0..4i32 {
-                let bx_mid = chunk_x_hi - (brow as f32 + 0.5) * block;
-                if bx_mid <= fx0 + EPS || bx_mid >= fx1 - EPS {
-                    continue; // this block's centre is outside the footprint's X span
+                let bx1 = chunk_x_hi - brow as f32 * block;
+                let bx0 = bx1 - block;
+                if !fully_inside(bx0, bx1, fx0, fx1, EPS) {
+                    continue; // the full block is not inside the footprint's X span
                 }
                 for bcol in 0..4i32 {
-                    let by_mid = chunk_y_hi - (bcol as f32 + 0.5) * block;
-                    if by_mid <= fy0 + EPS || by_mid >= fy1 - EPS {
+                    let by1 = chunk_y_hi - bcol as f32 * block;
+                    let by0 = by1 - block;
+                    if !fully_inside(by0, by1, fy0, fy1, EPS) {
                         continue;
                     }
                     bits |= 1u16 << (brow * 4 + bcol);
@@ -148,15 +166,10 @@ fn compute_desired(
         }
     }
 
-    // Group affected chunks into their render cells, dropping non-resident tiles.
+    // Group every affected chunk into a render cell. Unresident tiles retain a plan and are carved
+    // as soon as their root and cell entities stream in.
     let mut desired: HashMap<CellKey, CellPlan> = HashMap::new();
     for ((tx, ty), chunks) in per_tile {
-        let Some(handle) = streamer.tile_handle((tx, ty)) else {
-            continue;
-        };
-        if adts.get(&handle).is_none() {
-            continue;
-        }
         for (chunk_idx, bits) in chunks {
             let (row, col) = (chunk_idx / 16, chunk_idx % 16);
             let cell = (row / 4) * 4 + (col / 4);
@@ -175,13 +188,127 @@ fn compute_desired(
         // FNV-1a over the (chunk, bits) pairs: changes when the covered blocks change.
         let mut h = 0xcbf29ce484222325u64;
         for (ci, bits) in &plan.chunk_holes {
-            for b in (*ci as u64).to_le_bytes().into_iter().chain(bits.to_le_bytes()) {
+            for b in (*ci as u64)
+                .to_le_bytes()
+                .into_iter()
+                .chain(bits.to_le_bytes())
+            {
                 h = (h ^ b as u64).wrapping_mul(0x100000001b3);
             }
         }
         plan.sig = h;
     }
     desired
+}
+
+/// MONKEY (voxel): optional numeric ray check for the centre and two yards inside the footprint edge.
+fn monkey_voxel_probe_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("WOW_VOXEL_PROBE_RAY").is_ok_and(|value| value == "1"))
+}
+
+/// MONKEY (voxel): log collision ownership above the carved centre and near its edge, at most ten times.
+pub(super) fn monkey_voxel_probe_rays(
+    time: Res<Time>,
+    spatial: SpatialQuery,
+    streamer: Res<TerrainStreamer>,
+    adts: Res<Assets<AdtTile>>,
+    volumes: Query<(Entity, &Transform, &MonkeyVoxelData), With<MonkeyVoxelVolume>>,
+    mut probe: Local<(f32, u8)>,
+) {
+    if !monkey_voxel_probe_enabled() || probe.1 >= 10 {
+        return;
+    }
+    probe.0 += time.delta_secs();
+    if probe.0 < 2.0 {
+        return;
+    }
+    probe.0 = 0.0;
+    let Ok((voxel, tf, data)) = volumes.single() else {
+        return;
+    };
+    let half = super::half_extent_for(data.0.chunk_dims());
+    let centre = tf.translation + half;
+    let points = [
+        ("centre", centre),
+        ("edge", centre + Vec3::X * (half.x - 2.0)),
+    ];
+    for (name, point) in points {
+        let origin = point + Vec3::Y * 60.0;
+        let hit = spatial.cast_ray(
+            origin,
+            Dir3::NEG_Y,
+            160.0,
+            true,
+            &SpatialQueryFilter::default(),
+        );
+        let height = crate::terrain_stream::terrain_height_under(&streamer, &adts, point);
+        match hit {
+            Some(hit) => {
+                let hit_pos = origin - Vec3::Y * hit.distance;
+                let hit_wow = bevy_to_wow(hit_pos);
+                let (tx, ty) = benilla_formats::world_to_tile(hit_wow[0], hit_wow[1]);
+                let kind = if hit.entity == voxel {
+                    "voxel"
+                } else if streamer.tile_entity((tx as i32, ty as i32)) == Some(hit.entity) {
+                    "terrain-tile"
+                } else {
+                    "other"
+                };
+                info!("MONKEY (voxel): probe ray {} hit {} entity {:?} at y={:.3}; terrain_height_under={:?}", name, kind, hit.entity, origin.y - hit.distance, height);
+            }
+            None => info!(
+                "MONKEY (voxel): probe ray {} hit none; terrain_height_under={:?}",
+                name, height
+            ),
+        }
+    }
+    probe.1 += 1;
+}
+
+/// MONKEY (voxel): fold cell plans into the tile-level terrain collider plans.
+fn tile_plans(cells: &HashMap<CellKey, CellPlan>) -> HashMap<(i32, i32), TilePlan> {
+    let mut out: HashMap<(i32, i32), TilePlan> = HashMap::new();
+    for (&(tx, ty, _), plan) in cells {
+        out.entry((tx, ty))
+            .or_default()
+            .chunk_holes
+            .extend(plan.chunk_holes.iter().copied());
+    }
+    for plan in out.values_mut() {
+        plan.chunk_holes.sort_unstable();
+        let mut h = 0xcbf29ce484222325u64;
+        for (ci, bits) in &plan.chunk_holes {
+            for b in (*ci as u64)
+                .to_le_bytes()
+                .into_iter()
+                .chain(bits.to_le_bytes())
+            {
+                h = (h ^ b as u64).wrapping_mul(0x100000001b3);
+            }
+        }
+        plan.sig = h;
+    }
+    out
+}
+
+/// MONKEY (voxel): build one tile collider with extra hole bits applied to the affected chunks.
+fn tile_collider_data(adt: &AdtTile, holes: &[(usize, u16)]) -> Option<(Vec<Vec3>, Vec<[u32; 3]>)> {
+    collider_data_with_holes(&adt.chunks, holes)
+}
+
+/// MONKEY (voxel): make collider indices match the render carve, preserving each source hole bit.
+fn collider_data_with_holes(
+    source: &[ChunkMesh],
+    holes: &[(usize, u16)],
+) -> Option<(Vec<Vec3>, Vec<[u32; 3]>)> {
+    let mut chunks = source.to_vec();
+    for &(idx, extra) in holes {
+        if let Some(chunk) = chunks.get_mut(idx) {
+            chunk.indices = chunk_indices_holed(chunk.holes | extra);
+        }
+    }
+    crate::terrain_stream::voxel_terrain_collider_data(&chunks)
 }
 
 /// Re-mesh one render cell of `adt`, applying `extra` (chunk-index → extra hole bits) to the
@@ -251,7 +378,8 @@ fn swap_cell(
 /// footprint has left (or whose covered blocks changed), and re-carve cells the streamer respawned.
 #[allow(clippy::type_complexity)]
 pub(super) fn monkey_voxel_hide_terrain(
-    streamer: Res<TerrainStreamer>,
+    mut commands: Commands,
+    mut streamer: ResMut<TerrainStreamer>,
     adts: Res<Assets<AdtTile>>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut state: ResMut<MonkeyVoxelHideState>,
@@ -264,8 +392,13 @@ pub(super) fn monkey_voxel_hide_terrain(
     let no_hide = monkey_voxel_hide_disabled();
 
     // No volume (or hiding disabled): restore every still-living carved cell, then forget the plan.
-    let volume = if no_hide { Err(()) } else { volume.single().map_err(|_| ()) };
+    let volume = if no_hide {
+        Err(())
+    } else {
+        volume.single().map_err(|_| ())
+    };
     let Ok((tf, data)) = volume else {
+        streamer.set_voxel_holes(HashMap::new());
         if !state.applied.is_empty() {
             let living: HashMap<Entity, Mesh3d> =
                 cells.iter().map(|(e, m, _)| (e, m.clone())).collect();
@@ -275,7 +408,42 @@ pub(super) fn monkey_voxel_hide_terrain(
                 }
             }
         }
+        let applied: Vec<_> = state
+            .applied_tiles
+            .iter()
+            .map(|(tile, (root, _))| (*tile, *root))
+            .collect();
+        for (tile, root) in applied {
+            if streamer.tile_entity(tile) != Some(root) {
+                state.applied_tiles.remove(&tile);
+                continue;
+            }
+            if state
+                .applied_tiles
+                .get(&tile)
+                .is_some_and(|(_, sig)| *sig == 0)
+            {
+                continue;
+            }
+            if let Some(handle) = streamer.tile_handle(tile) {
+                if let Some(adt) = adts.get(&handle) {
+                    if let Some((verts, tris)) =
+                        crate::terrain_stream::voxel_terrain_collider_data(&adt.chunks)
+                    {
+                        let ntris = tris.len();
+                        commands.entity(root).insert(PendingCollider::new(
+                            build_collider_task(verts, tris),
+                            None,
+                            true,
+                        ));
+                        info!("MONKEY (voxel): tile ({},{}) collider rebuilt with 0 extra hole block(s) ({} tris)", tile.0, tile.1, ntris);
+                        state.applied_tiles.insert(tile, (root, 0));
+                    }
+                }
+            }
+        }
         state.desired.clear();
+        state.desired_tiles.clear();
         state.sig = None;
         return;
     };
@@ -293,7 +461,8 @@ pub(super) fn monkey_voxel_hide_terrain(
     let sig = (q(wow[0]), q(wow[1]), data.0.chunk_dims());
     if state.sig != Some(sig) {
         state.sig = Some(sig);
-        state.desired = compute_desired(fx0, fx1, fy0, fy1, &streamer, &adts);
+        state.desired = compute_desired(fx0, fx1, fy0, fy1);
+        state.desired_tiles = tile_plans(&state.desired);
         let plan: Vec<_> = state
             .desired
             .iter()
@@ -310,6 +479,14 @@ pub(super) fn monkey_voxel_hide_terrain(
             plan,
         );
     }
+
+    streamer.set_voxel_holes(
+        state
+            .desired_tiles
+            .iter()
+            .map(|(tile, plan)| (*tile, plan.chunk_holes.iter().copied().collect()))
+            .collect(),
+    );
 
     // Index the resident terrain cells by their render-cell key.
     let mut by_key: HashMap<CellKey, (Entity, Mesh3d)> = HashMap::new();
@@ -370,11 +547,115 @@ pub(super) fn monkey_voxel_hide_terrain(
             );
         }
     }
+
+    // MONKEY (voxel): replace each affected tile's one static terrain collider with the same MCNK
+    // hole bitmap as the render cells; restoring uses the original ADT indices. The old collider
+    // remains attached until the async replacement is ready, so no frame loses both surfaces.
+    let mut tiles: HashSet<(i32, i32)> = state.applied_tiles.keys().copied().collect();
+    tiles.extend(state.desired_tiles.keys().copied());
+    for tile in tiles {
+        let Some(root) = streamer.tile_entity(tile) else {
+            state.applied_tiles.remove(&tile); // streamed out; a fresh root will be carved later
+            continue;
+        };
+        let plan = state.desired_tiles.get(&tile);
+        let want_sig = plan.map_or(0, |p| p.sig);
+        if state.applied_tiles.get(&tile) == Some(&(root, want_sig)) {
+            continue;
+        }
+        let Some(handle) = streamer.tile_handle(tile) else {
+            continue;
+        };
+        let Some(adt) = adts.get(&handle) else {
+            continue;
+        };
+        let data = if let Some(plan) = plan {
+            tile_collider_data(adt, &plan.chunk_holes)
+        } else {
+            crate::terrain_stream::voxel_terrain_collider_data(&adt.chunks)
+        };
+        let Some((verts, tris)) = data else { continue };
+        let ntris = tris.len();
+        let blocks = plan.map_or(0, |p| {
+            p.chunk_holes
+                .iter()
+                .map(|(_, bits)| bits.count_ones())
+                .sum()
+        });
+        commands.entity(root).insert(PendingCollider::new(
+            build_collider_task(verts, tris),
+            None,
+            true,
+        ));
+        info!(
+            "MONKEY (voxel): tile ({},{}) collider rebuilt with {} extra hole block(s) ({} tris)",
+            tile.0, tile.1, blocks, ntris
+        );
+        state.applied_tiles.insert(tile, (root, want_sig));
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn flat_chunk() -> ChunkMesh {
+        let step = benilla_formats::CHUNK_SIZE / 8.0;
+        let mut positions = Vec::with_capacity(145);
+        for row in 0..9 {
+            for col in 0..9 {
+                positions.push([100.0 - row as f32 * step, 100.0 - col as f32 * step, 0.0]);
+            }
+            if row < 8 {
+                for col in 0..8 {
+                    positions.push([
+                        100.0 - (row as f32 + 0.5) * step,
+                        100.0 - (col as f32 + 0.5) * step,
+                        0.0,
+                    ]);
+                }
+            }
+        }
+        ChunkMesh {
+            positions,
+            normals: Vec::new(),
+            uvs: Vec::new(),
+            indices: chunk_indices_holed(0),
+            holes: 0,
+            base_texture: None,
+            layer_textures: Vec::new(),
+            layer_effect_ids: Vec::new(),
+            alpha_map: None,
+            shadow: None,
+            pred_tex: [0; 64],
+            no_effect_doodad: [false; 64],
+            index_x: 0,
+            index_y: 0,
+            area_id: 0,
+            impassable: false,
+            liquids: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_hole_block_must_be_fully_inside_the_footprint() {
+        assert!(
+            !fully_inside(0.0, 8.0, 1.0, 10.0, 1.0e-3),
+            "edge-straddling block must remain solid"
+        );
+        assert!(
+            fully_inside(2.0, 8.0, 1.0, 10.0, 1.0e-3),
+            "interior block is carved"
+        );
+    }
+
+    #[test]
+    fn collider_hole_drops_sixteen_fan_triangles_per_block() {
+        let chunk = flat_chunk();
+        let (_, base) = collider_data_with_holes(std::slice::from_ref(&chunk), &[]).unwrap();
+        let (_, holed) = collider_data_with_holes(&[chunk], &[(0, 1)]).unwrap();
+        assert_eq!(base.len() - holed.len(), 16);
+    }
 
     /// The render-cell key round-trips Bevy-centre → WoW → (tile, cell) consistently with the
     /// footprint planner's own `cell_key_at`, for a handful of tile/cell centres.
@@ -382,14 +663,20 @@ mod tests {
     fn cell_key_round_trips_through_bevy_centre() {
         let cs = benilla_formats::CHUNK_SIZE;
         let mc = super::map_center();
-        for &(tx, ty, row, col) in &[(32i32, 49i32, 5usize, 10usize), (0, 0, 0, 0), (63, 63, 15, 15)]
-        {
+        for &(tx, ty, row, col) in &[
+            (32i32, 49i32, 5usize, 10usize),
+            (0, 0, 0, 0),
+            (63, 63, 15, 15),
+        ] {
             // The WoW centre of chunk (tile_y row, tile_x col) → its render cell.
             let gx = ty * 16 + row as i32;
             let gy = tx * 16 + col as i32;
             let wow_x = mc - (gx as f32 + 0.5) * cs;
             let wow_y = mc - (gy as f32 + 0.5) * cs;
-            let expect = ((tx, ty, (row / 4) * 4 + (col / 4)), cell_key_at(wow_x, wow_y));
+            let expect = (
+                (tx, ty, (row / 4) * 4 + (col / 4)),
+                cell_key_at(wow_x, wow_y),
+            );
             assert_eq!(expect.0, expect.1, "cell_key_at mismatch");
             // Bevy horizontal centre = wow_to_bevy: (−wow_y, _, −wow_x).
             let via_aabb = cell_key_of(Vec3A::new(-wow_y, 123.0, -wow_x));

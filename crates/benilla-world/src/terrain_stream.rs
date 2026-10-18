@@ -50,6 +50,8 @@ pub use window::StreamWindow;
 // The WMO prop-light items, for the interior classifier and the app's WMO props.
 pub use spawn::prop_light::{fold_interior_probe, hex_word, interior_light_up, PropLobeLight};
 // The placed-model assembler and off-thread collider build, shared with WMO gameobject props.
+#[cfg(feature = "voxel")]
+pub(crate) use collider::terrain_collider_data as voxel_terrain_collider_data;
 pub use collider::{build_collider_task, placement_collider_data, PendingCollider};
 pub use spawn::{
     carried_light_claims, m2_anim_bound, m2_fade, point_light, spawn_model_entities,
@@ -61,6 +63,8 @@ pub use queries::{
     area_id_under, doodad_ground_shade, ground_effect_under, terrain_height_under,
     terrain_height_under_cached, AreaAuthoritySet, CaptureCameraArea, CurrentArea, ShadeResolve,
 };
+#[cfg(feature = "voxel")]
+pub use queries::{terrain_height_under_raw, terrain_height_under_raw_cached};
 
 /// Wall-clock per frame for spawning streamed tiles and placements before the rest waits a frame;
 /// uncapped, a cold start spawns the whole ring at once and blocks the main thread for seconds.
@@ -93,6 +97,9 @@ pub struct TerrainStreamer {
     settled: bool,
     /// The off-grid focus tile last warned about, so the warning fires once per tile.
     off_grid_reported: Option<(i32, i32)>,
+    /// MONKEY (voxel): extra MCNK hole bits used by height queries, separate from ADT data.
+    #[cfg(feature = "voxel")]
+    voxel_holes: HashMap<(i32, i32), HashMap<usize, u16>>,
 }
 
 /// The map-global WMO's placement id: a WMO-only map has no ADT uniqueIds to collide with, and
@@ -117,6 +124,18 @@ impl TerrainStreamer {
     #[cfg(feature = "voxel")]
     pub fn tile_handle(&self, tile: (i32, i32)) -> Option<Handle<AdtTile>> {
         self.tiles.get(&tile).map(|t| t.handle.clone())
+    }
+
+    /// MONKEY (voxel): resident terrain root for rebuilding its terrain collider around voxel holes.
+    #[cfg(feature = "voxel")]
+    pub fn tile_entity(&self, tile: (i32, i32)) -> Option<Entity> {
+        self.tiles.get(&tile).and_then(|t| t.entity)
+    }
+
+    /// MONKEY (voxel): publish the current extra hole bits for terrain height queries.
+    #[cfg(feature = "voxel")]
+    pub(crate) fn set_voxel_holes(&mut self, holes: HashMap<(i32, i32), HashMap<usize, u16>>) {
+        self.voxel_holes = holes;
     }
 }
 

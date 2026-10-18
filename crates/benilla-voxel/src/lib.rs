@@ -45,7 +45,9 @@ pub struct Chunk {
 impl Chunk {
     /// An all-air chunk (no geometry).
     pub fn air() -> Self {
-        Self { density: vec![i8::MAX; ChunkShape::USIZE].into_boxed_slice() }
+        Self {
+            density: vec![i8::MAX; ChunkShape::USIZE].into_boxed_slice(),
+        }
     }
 
     /// Build a chunk by sampling an SDF `f(voxel_coord) -> signed distance in voxel units`
@@ -57,7 +59,9 @@ impl Chunk {
             let v = (f(p) * DENSITY_SCALE).round();
             *cell = v.clamp(i8::MIN as f32, i8::MAX as f32) as i8;
         }
-        Self { density: density.into_boxed_slice() }
+        Self {
+            density: density.into_boxed_slice(),
+        }
     }
 
     /// Mesh this chunk with surface-nets. Positions are scaled to world yards (local to the chunk
@@ -65,7 +69,11 @@ impl Chunk {
     /// all-air or all-solid chunk.
     pub fn mesh(&self) -> VoxelMesh {
         debug_assert_eq!(self.density.len(), ChunkShape::USIZE);
-        let sdf: Vec<f32> = self.density.iter().map(|&d| d as f32 / DENSITY_SCALE).collect();
+        let sdf: Vec<f32> = self
+            .density
+            .iter()
+            .map(|&d| d as f32 / DENSITY_SCALE)
+            .collect();
         let mut buffer = SurfaceNetsBuffer::default();
         surface_nets(&sdf, &ChunkShape {}, [0; 3], [SAMPLES - 1; 3], &mut buffer);
         let positions = buffer
@@ -73,7 +81,11 @@ impl Chunk {
             .iter()
             .map(|p| [p[0] * VOXEL_SIZE, p[1] * VOXEL_SIZE, p[2] * VOXEL_SIZE])
             .collect();
-        VoxelMesh { positions, normals: buffer.normals, indices: buffer.indices }
+        VoxelMesh {
+            positions,
+            normals: buffer.normals,
+            indices: buffer.indices,
+        }
     }
 
     /// Apply a spherical brush to the density field (the P1 edit primitive). `center` and `radius`
@@ -124,9 +136,8 @@ impl Chunk {
     /// border so neighbour reads stay in-bounds. Returns whether anything changed.
     pub fn smooth_sphere(&mut self, center: [f32; 3], radius: f32, strength: f32) -> bool {
         let dim = SAMPLES as i32;
-        let at = |x: i32, y: i32, z: i32| {
-            ChunkShape::linearize([x as u32, y as u32, z as u32]) as usize
-        };
+        let at =
+            |x: i32, y: i32, z: i32| ChunkShape::linearize([x as u32, y as u32, z as u32]) as usize;
         let lo = |c: f32| ((c - radius).floor() as i32).max(1);
         let hi = |c: f32| ((c + radius).ceil() as i32).min(dim - 2);
         let r2 = radius * radius;
@@ -335,7 +346,11 @@ impl VoxelVolume {
                 }
             }
         }
-        Self { chunks, gdim, density }
+        Self {
+            chunks,
+            gdim,
+            density,
+        }
     }
 
     /// A flat ground block across the whole volume: solid below `surface` on the Y (up) axis.
@@ -365,7 +380,8 @@ impl VoxelVolume {
     /// boundaries freely since the density is one grid. Returns whether anything changed.
     pub fn edit_sphere(&mut self, center: [f32; 3], radius: f32, mode: BrushMode) -> bool {
         let lo = |c: f32| (c - radius - 1.0).floor().max(0.0) as usize;
-        let hi = |c: f32, d: usize| ((c + radius + 1.0).ceil() as i64).clamp(0, d as i64 - 1) as usize;
+        let hi =
+            |c: f32, d: usize| ((c + radius + 1.0).ceil() as i64).clamp(0, d as i64 - 1) as usize;
         let mut changed = false;
         for z in lo(center[2])..=hi(center[2], self.gdim[2]) {
             for y in lo(center[1])..=hi(center[1], self.gdim[1]) {
@@ -443,8 +459,11 @@ impl VoxelVolume {
         for cz in 0..self.chunks[2] {
             for cy in 0..self.chunks[1] {
                 for cx in 0..self.chunks[0] {
-                    let (ox, oy, oz) =
-                        ((cx * CHUNK) as usize, (cy * CHUNK) as usize, (cz * CHUNK) as usize);
+                    let (ox, oy, oz) = (
+                        (cx * CHUNK) as usize,
+                        (cy * CHUNK) as usize,
+                        (cz * CHUNK) as usize,
+                    );
                     for li in 0..ChunkShape::USIZE {
                         let [lx, ly, lz] = ChunkShape::delinearize(li as u32);
                         sdf[li] = self.density
@@ -493,7 +512,10 @@ mod tests {
         for p in &m.positions {
             let d = ((p[0] - c_w[0]).powi(2) + (p[1] - c_w[1]).powi(2) + (p[2] - c_w[2]).powi(2))
                 .sqrt();
-            assert!((d - r).abs() < VOXEL_SIZE * 1.5, "vertex off-surface: d={d} r={r}");
+            assert!(
+                (d - r).abs() < VOXEL_SIZE * 1.5,
+                "vertex off-surface: d={d} r={r}"
+            );
         }
     }
 
@@ -509,7 +531,10 @@ mod tests {
         // heightmap; this is the whole point of voxels.
         let mut columns: HashMap<(i32, i32), Vec<f32>> = HashMap::new();
         for p in &m.positions {
-            let key = ((p[0] / VOXEL_SIZE).round() as i32, (p[1] / VOXEL_SIZE).round() as i32);
+            let key = (
+                (p[0] / VOXEL_SIZE).round() as i32,
+                (p[1] / VOXEL_SIZE).round() as i32,
+            );
             columns.entry(key).or_default().push(p[2]);
         }
         let overhang = columns.values().any(|zs| {
@@ -518,7 +543,10 @@ mod tests {
             // a gap larger than one voxel between consecutive z's ⇒ two separate surfaces
             zs.windows(2).any(|w| (w[1] - w[0]) > VOXEL_SIZE * 2.0)
         });
-        assert!(overhang, "torus mesh has no two-surface column — overhang not represented");
+        assert!(
+            overhang,
+            "torus mesh has no two-surface column — overhang not represented"
+        );
     }
 
     #[test]
@@ -546,7 +574,11 @@ mod tests {
         let changed = c.edit_sphere([17.0, 17.0, 17.0], 5.0, BrushMode::Subtract);
         assert!(changed, "dig changed nothing");
         assert!(c.density[ci] > 0, "dug centre should now be air");
-        assert_ne!(before, c.mesh().tri_count(), "mesh unchanged after digging a hole");
+        assert_ne!(
+            before,
+            c.mesh().tri_count(),
+            "mesh unchanged after digging a hole"
+        );
     }
 
     #[test]
@@ -557,7 +589,10 @@ mod tests {
         assert!(changed, "add changed nothing");
         assert!(!c.mesh().is_empty(), "add brush produced no geometry");
         let ci = ChunkShape::linearize([17, 17, 17]) as usize;
-        assert!(c.density[ci] < 0, "centre of an added sphere should be solid");
+        assert!(
+            c.density[ci] < 0,
+            "centre of an added sphere should be solid"
+        );
     }
 
     #[test]
@@ -570,8 +605,14 @@ mod tests {
     #[test]
     fn slab_is_solid_below_air_above() {
         let c = slab(20.0);
-        assert!(c.density[ChunkShape::linearize([17, 10, 17]) as usize] < 0, "below surface = solid");
-        assert!(c.density[ChunkShape::linearize([17, 30, 17]) as usize] > 0, "above surface = air");
+        assert!(
+            c.density[ChunkShape::linearize([17, 10, 17]) as usize] < 0,
+            "below surface = solid"
+        );
+        assert!(
+            c.density[ChunkShape::linearize([17, 30, 17]) as usize] > 0,
+            "above surface = air"
+        );
         assert!(!c.mesh().is_empty(), "slab produced no surface");
     }
 
@@ -579,7 +620,10 @@ mod tests {
     fn smooth_changes_a_sharp_edit() {
         let mut c = slab(20.0);
         c.edit_sphere([17.0, 20.0, 17.0], 4.0, BrushMode::Subtract); // dig a sharp pit
-        assert!(c.smooth_sphere([17.0, 20.0, 17.0], 6.0, 0.5), "smooth changed nothing");
+        assert!(
+            c.smooth_sphere([17.0, 20.0, 17.0], 6.0, 0.5),
+            "smooth changed nothing"
+        );
     }
 
     #[test]
@@ -596,7 +640,10 @@ mod tests {
     fn volume_scales_with_chunk_count() {
         let one = VoxelVolume::slab([1, 1, 1], 16.0).mesh().positions.len();
         let four = VoxelVolume::slab([2, 1, 2], 16.0).mesh().positions.len();
-        assert!(four > one * 2, "a 2x2 footprint should have well more surface verts than 1x1");
+        assert!(
+            four > one * 2,
+            "a 2x2 footprint should have well more surface verts than 1x1"
+        );
     }
 
     #[test]
@@ -624,7 +671,10 @@ mod tests {
         // Surface height is in VOXEL units: world_y = origin_y + h_vox * VOXEL_SIZE, so h_vox = height / VOXEL_SIZE.
         let near = v.surface_height_at(10.0, 32.0).expect("surface near x-lo");
         let far = v.surface_height_at(50.0, 32.0).expect("surface near x-hi");
-        assert!(far > near + 2.0, "ramp: surface rises with x ({near} -> {far} voxels)");
+        assert!(
+            far > near + 2.0,
+            "ramp: surface rises with x ({near} -> {far} voxels)"
+        );
         assert!(!v.mesh().is_empty(), "heightmap volume produced no surface");
     }
 
@@ -632,15 +682,25 @@ mod tests {
     fn surface_height_tracks_the_slab_and_edits() {
         // A flat slab at surface y=16: the height query returns ~16 across the interior.
         let v = VoxelVolume::slab([2, 1, 2], 16.0);
-        let h = v.surface_height_at(32.0, 32.0).expect("slab has a surface mid-volume");
+        let h = v
+            .surface_height_at(32.0, 32.0)
+            .expect("slab has a surface mid-volume");
         assert!((h - 16.0).abs() < 0.6, "flat slab height ~16, got {h}");
         // Build a mound (add material above the slab) and the surface there rises.
         let mut v2 = VoxelVolume::slab([2, 1, 2], 16.0);
         v2.edit_sphere([32.0, 20.0, 32.0], 6.0, BrushMode::Add);
-        let hm = v2.surface_height_at(32.0, 32.0).expect("mound has a surface");
-        assert!(hm > h + 1.0, "mound should raise the surface above the flat slab ({hm} vs {h})");
+        let hm = v2
+            .surface_height_at(32.0, 32.0)
+            .expect("mound has a surface");
+        assert!(
+            hm > h + 1.0,
+            "mound should raise the surface above the flat slab ({hm} vs {h})"
+        );
         // Outside the grid → None.
-        assert!(v.surface_height_at(-5.0, 10.0).is_none(), "outside grid is None");
+        assert!(
+            v.surface_height_at(-5.0, 10.0).is_none(),
+            "outside grid is None"
+        );
     }
 
     #[test]

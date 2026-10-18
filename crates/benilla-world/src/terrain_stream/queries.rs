@@ -1,6 +1,9 @@
 //! What the streamed world answers about a position: MCSH ground shade, ground effect, terrain
 //! height, and the area authority (the `AreaTable.dbc` leaf under the player's feet).
 
+#[cfg(feature = "voxel")]
+use std::collections::HashMap;
+
 use benilla_assets::coords::bevy_to_wow;
 use benilla_assets::AdtTile;
 use benilla_formats::{mcsh_shadowed_at, world_to_tile};
@@ -116,6 +119,16 @@ pub fn terrain_height_under(
     terrain_height_under_cached(streamer, adt_tiles, bevy_pos, &mut None)
 }
 
+/// MONKEY (voxel): raw ADT height, intentionally ignoring voxel carve bits for seed sampling.
+#[cfg(feature = "voxel")]
+pub fn terrain_height_under_raw(
+    streamer: &TerrainStreamer,
+    adt_tiles: &Assets<AdtTile>,
+    bevy_pos: Vec3,
+) -> Option<f32> {
+    terrain_height_under_raw_cached(streamer, adt_tiles, bevy_pos, &mut None)
+}
+
 /// [`terrain_height_under`] for many columns at once: the tile resolves once per tile change.
 pub fn terrain_height_under_cached<'a>(
     streamer: &TerrainStreamer,
@@ -135,7 +148,68 @@ pub fn terrain_height_under_cached<'a>(
             adt
         }
     };
+    #[cfg(feature = "voxel")]
+    {
+        return terrain_height_with_holes(&adt.chunks, wow, streamer.voxel_holes.get(&key));
+    }
+    #[cfg(not(feature = "voxel"))]
     benilla_formats::terrain_height_at(&adt.chunks, wow)
+}
+
+/// MONKEY (voxel): raw cached height path for the seed sampler.
+#[cfg(feature = "voxel")]
+pub fn terrain_height_under_raw_cached<'a>(
+    streamer: &TerrainStreamer,
+    adt_tiles: &'a Assets<AdtTile>,
+    bevy_pos: Vec3,
+    cache: &mut Option<((i32, i32), &'a AdtTile)>,
+) -> Option<f32> {
+    let wow = bevy_to_wow(bevy_pos);
+    let (tx, ty) = world_to_tile(wow[0], wow[1]);
+    let key = (tx as i32, ty as i32);
+    let adt = match cache {
+        Some((k, adt)) if *k == key => *adt,
+        _ => {
+            let ts = streamer.tiles.get(&key)?;
+            let adt = adt_tiles.get(&ts.handle)?;
+            *cache = Some((key, adt));
+            adt
+        }
+    };
+    benilla_formats::terrain_height_at(&adt.chunks, wow)
+}
+
+#[cfg(feature = "voxel")]
+/// MONKEY (voxel): apply the extra per-MCNK low-resolution hole bitmap to a height sample.
+fn terrain_height_with_holes(
+    chunks: &[benilla_formats::ChunkMesh],
+    wow: [f32; 3],
+    extra: Option<&HashMap<usize, u16>>,
+) -> Option<f32> {
+    let height = benilla_formats::terrain_height_at(chunks, wow)?;
+    let Some(extra) = extra else {
+        return Some(height);
+    };
+    for (idx, chunk) in chunks.iter().enumerate() {
+        let Some(nw) = chunk.positions.first() else {
+            continue;
+        };
+        let south = (nw[0] - wow[0]) / benilla_formats::TILE_SIZE * 16.0;
+        let east = (nw[1] - wow[1]) / benilla_formats::TILE_SIZE * 16.0;
+        if !(0.0..=1.0).contains(&south) || !(0.0..=1.0).contains(&east) {
+            continue;
+        }
+        let row = ((south * 8.0) as usize).min(7);
+        let col = ((east * 8.0) as usize).min(7);
+        if extra
+            .get(&idx)
+            .is_some_and(|bits| bits & (1 << ((row >> 1) * 4 + (col >> 1))) != 0)
+        {
+            return None;
+        }
+        return Some(height);
+    }
+    Some(height)
 }
 
 /// Tracks the `AreaTable` id under the player's feet as the reference's `GetAreaID` (`0x670250`)
@@ -200,6 +274,72 @@ pub(super) fn update_current_area(
 mod tests {
     use super::*;
     use bevy::ecs::system::RunSystemOnce;
+
+    #[cfg(feature = "voxel")]
+    fn flat_chunk() -> benilla_formats::ChunkMesh {
+        let step = benilla_formats::CHUNK_SIZE / 8.0;
+        let mut positions = Vec::with_capacity(145);
+        for row in 0..9 {
+            for col in 0..9 {
+                positions.push([100.0 - row as f32 * step, 100.0 - col as f32 * step, 0.0]);
+            }
+            if row < 8 {
+                for col in 0..8 {
+                    positions.push([
+                        100.0 - (row as f32 + 0.5) * step,
+                        100.0 - (col as f32 + 0.5) * step,
+                        0.0,
+                    ]);
+                }
+            }
+        }
+        benilla_formats::ChunkMesh {
+            positions,
+            normals: Vec::new(),
+            uvs: Vec::new(),
+            indices: benilla_formats::chunk_indices_holed(0),
+            holes: 0,
+            base_texture: None,
+            layer_textures: Vec::new(),
+            layer_effect_ids: Vec::new(),
+            alpha_map: None,
+            shadow: None,
+            pred_tex: [0; 64],
+            no_effect_doodad: [false; 64],
+            index_x: 0,
+            index_y: 0,
+            area_id: 0,
+            impassable: false,
+            liquids: Vec::new(),
+        }
+    }
+
+    #[cfg(feature = "voxel")]
+    #[test]
+    fn voxel_height_override_holes_carved_columns_but_raw_height_remains() {
+        let chunk = flat_chunk();
+        let chunks = [chunk];
+        let extra = HashMap::from([(0usize, 1u16)]);
+        let inside = [
+            100.0 - benilla_formats::CHUNK_SIZE * 0.1,
+            100.0 - benilla_formats::CHUNK_SIZE * 0.1,
+            0.0,
+        ];
+        let outside = [
+            100.0 - benilla_formats::CHUNK_SIZE * 0.4,
+            100.0 - benilla_formats::CHUNK_SIZE * 0.4,
+            0.0,
+        ];
+        assert_eq!(
+            terrain_height_with_holes(&chunks, inside, Some(&extra)),
+            None
+        );
+        assert!(terrain_height_with_holes(&chunks, outside, Some(&extra)).is_some());
+        assert!(
+            benilla_formats::terrain_height_at(&chunks, inside).is_some(),
+            "raw path retains original ADT height"
+        );
+    }
 
     /// Every resource [`update_current_area`] reads, and no terrain.
     fn bare_world() -> World {

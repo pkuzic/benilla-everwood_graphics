@@ -185,7 +185,7 @@ pub fn placement_collider_data(
 
 /// A terrain tile's collider: one trimesh welded from its decoded MCNK chunks in draw space, the
 /// loader's hole-masked indices rebased onto the running vertex count.
-pub(super) fn terrain_collider_data(
+pub(crate) fn terrain_collider_data(
     chunks: &[benilla_formats::ChunkMesh],
 ) -> Option<(Vec<Vec3>, Vec<[u32; 3]>)> {
     let mut verts: Vec<Vec3> = Vec::new();

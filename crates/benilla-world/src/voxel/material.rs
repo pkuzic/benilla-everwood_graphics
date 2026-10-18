@@ -15,8 +15,8 @@ use bevy::image::{ImageAddressMode, ImageFilterMode, ImageSampler, ImageSamplerD
 use bevy::pbr::{ExtendedMaterial, MaterialExtension};
 use bevy::prelude::*;
 use bevy::render::render_resource::{
-    AsBindGroup, Extent3d, TextureDataOrder, TextureDimension, TextureFormat, TextureViewDescriptor,
-    TextureViewDimension,
+    AsBindGroup, Extent3d, TextureDataOrder, TextureDimension, TextureFormat,
+    TextureViewDescriptor, TextureViewDimension,
 };
 use bevy::shader::ShaderRef;
 
@@ -62,9 +62,11 @@ impl MaterialExtension for MonkeyVoxelExt {
 pub struct MonkeyVoxelMaterialHandle(
     pub Handle<MonkeyVoxelMaterial>,
     /// Procedural fallback `layer_array` (grass/rock/dirt), held so a revert never re-synthesises.
-    #[allow(dead_code)] pub(super) Handle<Image>,
+    #[allow(dead_code)]
+    pub(super) Handle<Image>,
     /// Procedural fallback `alpha_array` (unused by the fallback path, bound so the group is valid).
-    #[allow(dead_code)] pub(super) Handle<Image>,
+    #[allow(dead_code)]
+    pub(super) Handle<Image>,
 );
 
 /// Repeats per world yard that matches the real ground: the terrain samples its BLPs `uv*8` over a

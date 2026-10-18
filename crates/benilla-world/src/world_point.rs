@@ -169,6 +169,12 @@ impl WorldPoint<'_, '_> {
         self.surface.terrain_height_under(pos)
     }
 
+    /// MONKEY (voxel): raw ADT height for voxel seeding, unaffected by a site's carved query mask.
+    #[cfg(feature = "voxel")]
+    pub(crate) fn terrain_height_under_raw(&self, pos: Vec3) -> Option<f32> {
+        self.surface.terrain_height_under_raw(pos)
+    }
+
     /// Whether this point is inside a building: the faces-only down-ray, raced against the terrain.
     pub fn indoors_at(&self, feet_world: Vec3) -> bool {
         self.surface.indoors_at(feet_world)

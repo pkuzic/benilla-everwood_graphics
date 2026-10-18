@@ -295,7 +295,7 @@ fn monkey_voxel_sample_terrain(
     centre_xz: Vec2,
     chunks: [u32; 3],
 ) -> Option<TerrainSeed> {
-    let centre_h = world.terrain_height_under(Vec3::new(centre_xz.x, 0.0, centre_xz.y))?;
+    let centre_h = world.terrain_height_under_raw(Vec3::new(centre_xz.x, 0.0, centre_xz.y))?;
     let half = half_extent_for(chunks);
     let gx = (chunks[0] * benilla_voxel::CHUNK + 2) as usize;
     let gz = (chunks[2] * benilla_voxel::CHUNK + 2) as usize;
@@ -306,7 +306,7 @@ fn monkey_voxel_sample_terrain(
         for ix in 0..gx {
             let wx = origin_x + ix as f32 * benilla_voxel::VOXEL_SIZE;
             let wz = origin_z + iz as f32 * benilla_voxel::VOXEL_SIZE;
-            if let Some(h) = world.terrain_height_under(Vec3::new(wx, 0.0, wz)) {
+            if let Some(h) = world.terrain_height_under_raw(Vec3::new(wx, 0.0, wz)) {
                 heights[ix + iz * gx] = h;
                 sum += h;
                 n += 1;
@@ -323,7 +323,11 @@ fn monkey_voxel_sample_terrain(
         *h = if h.is_nan() { mean } else { *h + SEED_LIFT };
     }
     let origin_y = mean - half.y;
-    Some(TerrainSeed { origin_y, heights, centre: Vec3::new(centre_xz.x, mean, centre_xz.y) })
+    Some(TerrainSeed {
+        origin_y,
+        heights,
+        centre: Vec3::new(centre_xz.x, mean, centre_xz.y),
+    })
 }
 
 /// A fresh volume seeded from the real heightmap (or a flat slab when `seed` is `None` — unresident
@@ -342,7 +346,10 @@ fn monkey_voxel_fresh_seeded(
         monkey_voxel_apply_one(&mut volume, e);
     }
     if !saved.is_empty() {
-        info!("MONKEY (voxel): replayed {} journalled edit(s)", saved.len());
+        info!(
+            "MONKEY (voxel): replayed {} journalled edit(s)",
+            saved.len()
+        );
     }
     volume
 }
@@ -455,6 +462,7 @@ impl Plugin for MonkeyVoxelPlugin {
                 // Hide the real ADT ground under the footprint, after the volume's transform and
                 // density are finalised for the frame — so a dug hole shows the voxel interior.
                 monkey_voxel_hide_terrain,
+                terrain_hide::monkey_voxel_probe_rays,
             )
                 .chain()
                 .run_if(crate::schedule::world_is_live),
@@ -662,7 +670,11 @@ fn monkey_voxel_manage_volume(
                 let ground = world
                     .terrain_height_under(ahead)
                     .unwrap_or(cam_pos.y - EYE_HEIGHT_YARDS);
-                Vec3::new(ahead.x, (ground + 1.5) - VOL_SURFACE * benilla_voxel::VOXEL_SIZE + half.y, ahead.z)
+                Vec3::new(
+                    ahead.x,
+                    (ground + 1.5) - VOL_SURFACE * benilla_voxel::VOXEL_SIZE + half.y,
+                    ahead.z,
+                )
             }
         };
         monkey_voxel_build_entity(
@@ -712,7 +724,8 @@ fn monkey_voxel_capture_follow(
     // `WOW_VOXEL_NO_FOLLOW=1`: leave the volume where it was ground-seeded (don't glue it to the
     // camera), so a capture can verify the on-GROUND terrain-hiding (a dug hole at ground height),
     // which the glued-ahead float would hide by lifting the patch off the real ground.
-    if std::env::var_os("WOW_CAPTURE").is_none() || std::env::var_os("WOW_VOXEL_NO_FOLLOW").is_some()
+    if std::env::var_os("WOW_CAPTURE").is_none()
+        || std::env::var_os("WOW_VOXEL_NO_FOLLOW").is_some()
     {
         return;
     }

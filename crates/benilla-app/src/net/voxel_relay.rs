@@ -105,7 +105,10 @@ fn monkey_voxel_recv(
                 info!("MONKEY (voxel): received a shared build-site placement");
                 net.spawn_inbox.push(spawn);
             }
-            None => warn!("MONKEY (voxel): dropping a malformed site payload {:?}", m.text),
+            None => warn!(
+                "MONKEY (voxel): dropping a malformed site payload {:?}",
+                m.text
+            ),
         }
         return;
     }
@@ -115,7 +118,10 @@ fn monkey_voxel_recv(
                 info!("MONKEY (voxel): received a remote terrain edit");
                 net.inbox.push(edit);
             }
-            None => warn!("MONKEY (voxel): dropping a malformed relay payload {:?}", m.text),
+            None => warn!(
+                "MONKEY (voxel): dropping a malformed relay payload {:?}",
+                m.text
+            ),
         }
     }
 }
