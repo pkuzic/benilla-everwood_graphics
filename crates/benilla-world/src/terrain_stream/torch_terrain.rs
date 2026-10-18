@@ -60,6 +60,14 @@ pub fn append_terrain_torch_triangles(
             if box_sphere_d2(lo, hi, c) > r2 {
                 continue;
             }
+            // MONKEY (voxel): under a build site the ground is clipped out of the footprint (the
+            // voxel is the caster there), exactly as the drawn cells and the collider are.
+            #[cfg(feature = "voxel")]
+            let clipped = streamer
+                .voxel_carve()
+                .and_then(|r| super::voxel_clip::clip_chunk_outside_rect(chunk, &r));
+            #[cfg(feature = "voxel")]
+            let chunk = clipped.as_ref().unwrap_or(chunk);
             let base = positions.len() as u32;
             let mut used = false;
             for tri in chunk.indices.as_chunks::<3>().0 {
@@ -99,6 +107,11 @@ pub fn terrain_torch_generation(streamer: &TerrainStreamer, adt_tiles: &Assets<A
         adt_tiles.contains(&ts.handle).hash(&mut h);
         sum = sum.wrapping_add(h.finish());
     }
+    // MONKEY (voxel): a moved / removed build-site carve re-gathers the clipped ground.
+    #[cfg(feature = "voxel")]
+    {
+        sum = sum.wrapping_add(streamer.voxel_carve().map_or(0, |r| r.sig()));
+    }
     sum
 }
 
@@ -130,6 +143,12 @@ pub fn terrain_torch_generation_near(
         ts.handle.id().hash(&mut h);
         adt_tiles.contains(&ts.handle).hash(&mut h);
         sum = sum.wrapping_add(h.finish());
+    }
+    // MONKEY (voxel): folded in unconditionally — a carve moving AWAY must re-gather a slot it
+    // used to clip as well (moves are rare, GM placements).
+    #[cfg(feature = "voxel")]
+    {
+        sum = sum.wrapping_add(streamer.voxel_carve().map_or(0, |r| r.sig()));
     }
     sum
 }

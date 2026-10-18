@@ -1,9 +1,6 @@
 //! What the streamed world answers about a position: MCSH ground shade, ground effect, terrain
 //! height, and the area authority (the `AreaTable.dbc` leaf under the player's feet).
 
-#[cfg(feature = "voxel")]
-use std::collections::HashMap;
-
 use benilla_assets::coords::bevy_to_wow;
 use benilla_assets::AdtTile;
 use benilla_formats::{mcsh_shadowed_at, world_to_tile};
@@ -136,16 +133,15 @@ pub fn terrain_height_under_cached<'a>(
     bevy_pos: Vec3,
     cache: &mut Option<((i32, i32), &'a AdtTile)>,
 ) -> Option<f32> {
-    let (wow, key, adt) = resolve_tile(streamer, adt_tiles, bevy_pos, cache)?;
+    let (wow, _key, adt) = resolve_tile(streamer, adt_tiles, bevy_pos, cache)?;
     // MONKEY (voxel): a build site's carve is a hole for the standing / snapping height (the voxel
     // collider is the ground there); area id, ground effect and MCSH shade keep the un-holed data.
     #[cfg(feature = "voxel")]
     {
-        terrain_height_with_holes(&adt.chunks, wow, streamer.voxel_holes.get(&key))
+        terrain_height_with_carve(&adt.chunks, wow, streamer.voxel_carve.as_ref())
     }
     #[cfg(not(feature = "voxel"))]
     {
-        let _ = key;
         benilla_formats::terrain_height_at(&adt.chunks, wow)
     }
 }
@@ -186,32 +182,18 @@ pub fn terrain_height_under_raw_cached<'a>(
 }
 
 #[cfg(feature = "voxel")]
-/// MONKEY (voxel): apply the extra per-MCNK low-resolution hole bitmap to a height sample.
-fn terrain_height_with_holes(
+/// MONKEY (voxel): a height sample with the build site's carve applied — `None` strictly inside the
+/// carve rectangle (the same exact rectangle the render cells and the tile collider are clipped to),
+/// the raw ADT height everywhere else.
+fn terrain_height_with_carve(
     chunks: &[benilla_formats::ChunkMesh],
     wow: [f32; 3],
-    extra: Option<&HashMap<usize, u16>>,
+    carve: Option<&super::voxel_clip::VoxelCarveRect>,
 ) -> Option<f32> {
-    let height = benilla_formats::terrain_height_at(chunks, wow)?;
-    let Some(extra) = extra.filter(|m| !m.is_empty()) else {
-        return Some(height);
-    };
-    // Only the carved chunks are visited, with the same bounds test and cell → bit rule as
-    // `ChunkMesh::height_at`.
-    let carved = extra.iter().any(|(&idx, &bits)| {
-        let Some(nw) = chunks.get(idx).and_then(|c| c.positions.first()) else {
-            return false;
-        };
-        let south = (nw[0] - wow[0]) / benilla_formats::TILE_SIZE * 16.0;
-        let east = (nw[1] - wow[1]) / benilla_formats::TILE_SIZE * 16.0;
-        if !(0.0..=1.0).contains(&south) || !(0.0..=1.0).contains(&east) {
-            return false;
-        }
-        let row = ((south * 8.0) as usize).min(7);
-        let col = ((east * 8.0) as usize).min(7);
-        bits & (1 << ((row >> 1) * 4 + (col >> 1))) != 0
-    });
-    (!carved).then_some(height)
+    if carve.is_some_and(|r| r.contains_strict(wow[0], wow[1])) {
+        return None;
+    }
+    benilla_formats::terrain_height_at(chunks, wow)
 }
 
 /// Tracks the `AreaTable` id under the player's feet as the reference's `GetAreaID` (`0x670250`)
@@ -321,22 +303,21 @@ mod tests {
     fn voxel_height_override_holes_carved_columns_but_raw_height_remains() {
         let chunk = flat_chunk();
         let chunks = [chunk];
-        let extra = HashMap::from([(0usize, 1u16)]);
-        let inside = [
-            100.0 - benilla_formats::CHUNK_SIZE * 0.1,
-            100.0 - benilla_formats::CHUNK_SIZE * 0.1,
-            0.0,
-        ];
-        let outside = [
-            100.0 - benilla_formats::CHUNK_SIZE * 0.4,
-            100.0 - benilla_formats::CHUNK_SIZE * 0.4,
-            0.0,
-        ];
+        // A carve rect off the hole-block grid: 3..13 yd south / west of the chunk's NW corner.
+        let rect = super::super::voxel_clip::VoxelCarveRect {
+            x0: 100.0 - 13.0,
+            x1: 100.0 - 3.0,
+            y0: 100.0 - 13.0,
+            y1: 100.0 - 3.0,
+        };
+        let inside = [100.0 - 3.2, 100.0 - 12.8, 0.0];
+        let outside = [100.0 - 2.8, 100.0 - 8.0, 0.0];
         assert_eq!(
-            terrain_height_with_holes(&chunks, inside, Some(&extra)),
+            terrain_height_with_carve(&chunks, inside, Some(&rect)),
             None
         );
-        assert!(terrain_height_with_holes(&chunks, outside, Some(&extra)).is_some());
+        assert!(terrain_height_with_carve(&chunks, outside, Some(&rect)).is_some());
+        assert!(terrain_height_with_carve(&chunks, inside, None).is_some());
         assert!(
             benilla_formats::terrain_height_at(&chunks, inside).is_some(),
             "raw path retains original ADT height"

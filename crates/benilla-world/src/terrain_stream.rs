@@ -36,6 +36,9 @@ mod weld;
 pub(crate) mod window;
 // MONKEY (daylight: terrain torch casters): resident MCNK chunks as torch cube-map casters.
 mod torch_terrain;
+// MONKEY (voxel): exact footprint clipping of the real ground under a voxel build site.
+#[cfg(feature = "voxel")]
+pub(crate) mod voxel_clip;
 pub use torch_terrain::{
     append_terrain_torch_triangles, terrain_torch_generation, terrain_torch_generation_near,
 };
@@ -50,8 +53,6 @@ pub use window::StreamWindow;
 // The WMO prop-light items, for the interior classifier and the app's WMO props.
 pub use spawn::prop_light::{fold_interior_probe, hex_word, interior_light_up, PropLobeLight};
 // The placed-model assembler and off-thread collider build, shared with WMO gameobject props.
-#[cfg(feature = "voxel")]
-pub(crate) use collider::terrain_collider_data as voxel_terrain_collider_data;
 pub use collider::{build_collider_task, placement_collider_data, PendingCollider};
 pub use spawn::{
     carried_light_claims, m2_anim_bound, m2_fade, point_light, spawn_model_entities,
@@ -97,9 +98,10 @@ pub struct TerrainStreamer {
     settled: bool,
     /// The off-grid focus tile last warned about, so the warning fires once per tile.
     off_grid_reported: Option<(i32, i32)>,
-    /// MONKEY (voxel): extra MCNK hole bits used by height queries, separate from ADT data.
+    /// MONKEY (voxel): the build site's carve rectangle (WoW yards): the height queries answer
+    /// `None` strictly inside it and the torch casters clip the ground out of it.
     #[cfg(feature = "voxel")]
-    voxel_holes: HashMap<(i32, i32), HashMap<usize, u16>>,
+    voxel_carve: Option<voxel_clip::VoxelCarveRect>,
 }
 
 /// The map-global WMO's placement id: a WMO-only map has no ADT uniqueIds to collide with, and
@@ -132,10 +134,16 @@ impl TerrainStreamer {
         self.tiles.get(&tile).and_then(|t| t.entity)
     }
 
-    /// MONKEY (voxel): publish the current extra hole bits for terrain height queries.
+    /// MONKEY (voxel): publish the build site's carve rectangle (`None` = no carve).
     #[cfg(feature = "voxel")]
-    pub(crate) fn set_voxel_holes(&mut self, holes: HashMap<(i32, i32), HashMap<usize, u16>>) {
-        self.voxel_holes = holes;
+    pub(crate) fn set_voxel_carve(&mut self, carve: Option<voxel_clip::VoxelCarveRect>) {
+        self.voxel_carve = carve;
+    }
+
+    /// MONKEY (voxel): the published carve rectangle.
+    #[cfg(feature = "voxel")]
+    pub(crate) fn voxel_carve(&self) -> Option<voxel_clip::VoxelCarveRect> {
+        self.voxel_carve
     }
 }
 

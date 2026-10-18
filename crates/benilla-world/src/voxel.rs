@@ -505,6 +505,17 @@ impl Default for MonkeyVoxelBrushRadius {
     }
 }
 
+/// MONKEY (voxel): `WOW_VOXEL_TEST_MOVE_AT=<seconds>` — the dev restore test's move time (read
+/// once); `None` (unset / unparsable) = no test move.
+fn monkey_voxel_test_move_at() -> Option<f32> {
+    static AT: std::sync::OnceLock<Option<f32>> = std::sync::OnceLock::new();
+    *AT.get_or_init(|| {
+        std::env::var("WOW_VOXEL_TEST_MOVE_AT")
+            .ok()
+            .and_then(|s| s.trim().parse::<f32>().ok())
+    })
+}
+
 /// The ONE system that owns the single voxel volume: it creates it, relocates it on a shared-site
 /// placement (local Ctrl+P / `$WOW_VOXEL_AUTOPLACE`, or one adopted from another player), and reads
 /// the persisted site on relog. Keeping all of this in a single system avoids the cross-system
@@ -517,7 +528,13 @@ fn monkey_voxel_manage_volume(
     mut auto_place_done: Local<bool>,
     mut place_elapsed: Local<f32>,
     mut settle_frames: Local<u32>,
-    mut last_cam: Local<Option<Vec3>>,
+    // MONKEY (voxel): + the `WOW_VOXEL_TEST_MOVE_AT` clock and latch (one tuple param: the system
+    // is at Bevy's 16-parameter limit).
+    (mut last_cam, mut test_move_elapsed, mut test_move_done): (
+        Local<Option<Vec3>>,
+        Local<f32>,
+        Local<bool>,
+    ),
     mut spawned: ResMut<MonkeyVoxelSiteSpawned>,
     mut net: ResMut<MonkeyVoxelNet>,
     mut pending: ResMut<MonkeyVoxelSeedPending>,
@@ -590,6 +607,29 @@ fn monkey_voxel_manage_volume(
             "MONKEY (voxel): placed a shared build site at WoW [{:.1}, {:.1}, {:.1}] and broadcast it.",
             a[0], a[1], a[2],
         );
+    }
+
+    // MONKEY (voxel): dev restore test — `WOW_VOXEL_TEST_MOVE_AT=<s>` moves the existing site +60 yd
+    // along WoW X through the normal relocate path below (no save / broadcast), once.
+    if new_site.is_none() && !*test_move_done {
+        if let Some(at) = monkey_voxel_test_move_at() {
+            *test_move_elapsed += time.delta_secs();
+            if *test_move_elapsed >= at {
+                if let Ok((data, tf, _)) = volume.single() {
+                    let chunks = data.0.chunk_dims();
+                    let mut w = bevy_to_wow(tf.translation + half_extent_for(chunks));
+                    let from = w;
+                    w[0] += 60.0;
+                    new_site = Some((wow_to_bevy(w), chunks, VOL_SURFACE));
+                    *test_move_done = true;
+                    info!(
+                        "MONKEY (voxel): TEST_MOVE — relocating the site from WoW ({:.1}, {:.1}) to \
+                         ({:.1}, {:.1}).",
+                        from[0], from[1], w[0], w[1],
+                    );
+                }
+            }
+        }
     }
 
     // Apply. If the volume already exists (from an earlier frame — commands are flushed by now),
@@ -1097,13 +1137,20 @@ fn monkey_voxel_capture_demo_edit(
     // A smaller crater off-centre.
     let h = ground(v, 50.0, 16.0);
     v.edit_sphere([50.0, h, 16.0], 5.0, BrushMode::Subtract);
+    // MONKEY (voxel): a rim crater spanning 1..5 yd inside the +X face — the zone the old 8-yd MCNK
+    // hole blocks left covered — under the probe's `edge` ray (2 yd inside), so a shot / probe
+    // proves a dig at the footprint edge shows (no straight cut by the real ground).
+    let h = ground(v, 58.0, 32.0);
+    v.edit_sphere([58.0, h - 1.0, 32.0], 4.0, BrushMode::Subtract);
     // A mound, then a lip pushed out over the ground beside it (an overhang).
     let h = ground(v, 14.0, 48.0);
     v.edit_sphere([14.0, h, 48.0], 7.0, BrushMode::Add);
     v.edit_sphere([21.0, h + 6.0, 48.0], 4.0, BrushMode::Add);
     let _ = meshes.insert(&mesh3d.0, monkey_voxel_mesh_to_bevy(&v.mesh()));
     *done_at = Some(at);
-    info!("MONKEY (voxel): capture demo dug a pit, a crater and an overhanging mound.");
+    info!(
+        "MONKEY (voxel): capture demo dug a pit, a crater, a rim crater and an overhanging mound."
+    );
 }
 
 #[cfg(test)]
