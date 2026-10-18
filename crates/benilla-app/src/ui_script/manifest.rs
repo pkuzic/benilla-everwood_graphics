@@ -173,6 +173,11 @@ pub(crate) fn load_default_ui(script: &UiScript) -> Vec<String> {
 /// carried in the client binary, which benilla does not ship, and a modified interface file is
 /// loaded rather than refused.
 pub(super) fn load_core(script: &UiScript) -> Vec<String> {
+    // **MONKEY (stock FrameXML)** — the holes a NON-Blizzard `Interface\FrameXML\…` leaves, filled
+    // before the walk rather than after it ([`super::chain_compat`]). Here because this is the one
+    // door every chain entry comes through, so the seed cannot land late. It is a no-op on a
+    // genuinely stock install, and a seed the reference's own file overwrites if it ships one.
+    super::chain_compat::install(script);
     let Some(core) = reference_ui::core() else {
         let e = format!(
             "{}: not found — the stock interface is not built",

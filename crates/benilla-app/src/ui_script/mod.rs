@@ -36,6 +36,11 @@ mod manifest;
 /// The stock FrameXML this client runs off the player's own patch chain; its header is the rule.
 mod reference_ui;
 
+/// **MONKEY (stock FrameXML)** — what a chain whose `Interface\FrameXML\…` is NOT Blizzard's needs
+/// from us before it will run. The premise [`reference_ui`] leaves unstated, and the list of holes
+/// a private-server FrameXML leaves, are that module's header.
+mod chain_compat;
+
 /// What the host remembers per VM, so a seed or change-memo never outlives the VM it was for.
 mod session;
 

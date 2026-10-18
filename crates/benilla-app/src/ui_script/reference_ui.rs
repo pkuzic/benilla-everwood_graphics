@@ -129,6 +129,16 @@ fn read_loose(index: &benilla_formats::LooseIndex, req: &str) -> Option<Option<V
     Some(file.read())
 }
 
+/// **MONKEY (stock FrameXML)** — which archive of the chain a path actually resolves to.
+///
+/// [`read`] answers *what* the reference's file says; this answers *whose file it is*, which is a
+/// different question and the one [`super::chain_compat`] turns on: an `Interface\FrameXML\…` won
+/// by a private-server patch is not Blizzard's text, however well it parses. It lives here rather
+/// than in the caller because the cached [`chain`] handle is this module's.
+pub(super) fn winning_archive(req: &str) -> Option<&'static std::path::Path> {
+    chain()?.find_file_archive(req)
+}
+
 /// The player's patch chain, opened once per process and shared by every VM. Process-local, not
 /// the one [`benilla_assets`] holds: tests, the addon harness and a bare `UiScript` load the
 /// interface with no Bevy world to ask.

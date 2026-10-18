@@ -48,15 +48,21 @@
             ShowUIPanel(BenillaOptionsFrame)
         end)
 
+        -- MONKEY: Turtle's GameMenuFrame.xml (Everwood's chain) has no Sound rung, so UI Options
+        -- folds under Options directly; a missing rung is skipped instead of aborting this script.
         for _, fold in ipairs({
             { GameMenuButtonSoundOptions, GameMenuButtonOptions },
-            { GameMenuButtonUIOptions, GameMenuButtonSoundOptions },
+            { GameMenuButtonUIOptions, GameMenuButtonSoundOptions or GameMenuButtonOptions },
         }) do
             local button, above = fold[1], fold[2]
-            button:Hide()
-            button:ClearAllPoints()
-            button:SetPoint("TOP", above, "BOTTOM", 0, button:GetHeight())
+            if button and above then
+                button:Hide()
+                button:ClearAllPoints()
+                button:SetPoint("TOP", above, "BOTTOM", 0, button:GetHeight())
+            end
         end
+        -- MONKEY: Turtle's Shop rung opens Turtle_ShopUI, which Everwood's patch-F toc disables.
+        if GameMenuButtonShop then GameMenuButtonShop:Hide() end
         -- Key Bindings keeps its stock anchor, 1 under UI Options: the era rungs hang from its
         -- top, so an addon that inserts a button above it and re-anchors it under that button
         -- (ShaguTweaks) moves them down as it moves the stock rungs.
