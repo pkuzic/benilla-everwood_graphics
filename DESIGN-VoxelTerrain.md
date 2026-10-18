@@ -270,3 +270,26 @@ on its own**; these are enhancements, now precisely scoped:
 
 *Next (scoped): the Eluna area-relay + MonkeyNet client uplink (area-wide); optional `OVERSPEED_Z` exemption if
 live testing flags it; multi-site; arbitrary-voxel `_dynamicTree` collision; P4 LOD/transvoxel + offline editor.*
+
+## Real-terrain mode — DONE + VERIFIED (2026-10-18, branch `everwood-voxel_realterrain`)
+
+Owner redirect (2026-10-17): "normal terrain editable, new and old terrain still look Blizzlike" →
+a build site is **voxel-augmented real ground**, client-side first (GM previews). Each piece is
+verified in offline captures and/or in-world on the local server:
+
+| Commit | Piece |
+|---|---|
+| 7dc07b0a | **Seed** — `monkey_voxel_sample_terrain` samples the ADT under the footprint → `VoxelVolume::from_heightmap`; surface `SEED_LIFT` 0.15 yd above the ADT (no z-fight). |
+| 660aa4bf / 95ddfeba | **Look** — `voxel/material.rs` + `shaders/monkey_voxel.wgsl` = a copy of `terrain.wgsl`: the tile's own `layer_array`/`alpha_array`/`shadow_array`, exact planar chunk UV + blend chain + MCSH on tops, per-fragment chunk pick from a 3×3 neighbourhood, the shared `wow_light` buffer (ambient/diffuse/sun shadow/point lights/fog/wet). Walls: sharp triplanar (|n|^6) of the least-saturated layer + low-frequency tone. The voxel edge is invisible at noon and dusk. |
+| 7f1e65d8 → a8c5215d | **Hiding** — `voxel/terrain_hide.rs` re-meshes the overlapped render cells with the ground **clipped exactly** to the footprint inset 0.5 yd (`terrain_stream/voxel_clip.rs`: Sutherland–Hodgman against the 4 outside regions, attributes interpolated, shared edges split bit-identically). Replaced the first 8.33-yd MCNK-hole-block carve, which left a rim or a sky void. |
+| e1a3034b / a8c5215d | **Dig-through collision** — the tile's terrain trimesh is rebuilt from the same clipped chunks (`PendingCollider` swap on the tile root via `finish_colliders`, so the old one stays until the new one attaches and `ColliderEpoch` bumps); restored when the site leaves, re-applied after stream-out/in (race-guarded). `terrain_height_under` returns None inside the carve; the seed sampler and placement use the raw path. Probe `WOW_VOXEL_PROBE_RAY=1`: a dug pit's floor is hit 6.3 yd below the old ground. |
+| bfd070b5 | **Re-seed** — a persisted/adopted site that spawns before its tile is resident re-seeds once the tile streams in; the hide plan re-plans until resident. |
+| f83580ee / 69eacb5a | Dev/compat: `WOW_WINPOS` (test clients born on another monitor); Turtle-chain FrameXML shims (no Lua error popups on Everwood's client). |
+
+Dev hooks: `WOW_VOXEL_AUTOPLACE`, `WOW_VOXEL_AUTOEDIT`, `WOW_VOXEL_NO_HIDE`, `WOW_VOXEL_NO_FOLLOW`,
+`WOW_VOXEL_PROBE_RAY`, `WOW_VOXEL_TEST_MOVE_AT`. Known limits: a site straddling an ADT tile border wears
+the nearest in-tile chunk's textures on the far side; the outer 0.5 yd of the footprint keeps the real
+ground (the overlap that prevents a sky slit); NPC navmesh and server-side collision are not touched
+(client-side first). Everwood login needs the local-only AUTH_BUILD 7272 change in benilla-protocol
+(never committed here), and the Everwood addon gate needs a GM-rank test account (this branch has no
+native gate report).
