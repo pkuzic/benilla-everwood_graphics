@@ -17,6 +17,7 @@
 //! sign and the near-surface gradient matter to the mesher).
 
 // MONKEY (voxel): the v2 world voxel layer (sparse world-aligned chunks, seed, journal v2).
+pub mod wire;
 pub mod world;
 
 use fast_surface_nets::ndshape::{ConstShape, ConstShape3u32};

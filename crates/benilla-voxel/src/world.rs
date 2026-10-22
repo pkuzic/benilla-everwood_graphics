@@ -767,10 +767,12 @@ impl MapJournal {
                 match conf.binary_search_by_key(&seq, |x| x.seq.unwrap_or(0)) {
                     Ok(_) => JournalInsert::Duplicate,
                     Err(pos) => {
+                        // MONKEY (voxel): the region's sync point is NOT moved here: only a
+                        // completed SYNC (`D`) or a live edit in an already-synced region moves it
+                        // (the net layer decides), else a live edit heard from 300 yd would skip
+                        // the older edits of a region never synced.
                         self.edits.insert(pos, e);
                         self.confirmed += 1;
-                        let reg = self.regions.entry(e.region()).or_default();
-                        reg.last_seq = reg.last_seq.max(seq);
                         if pos + 1 == self.edits.len() {
                             JournalInsert::Appended
                         } else {
@@ -807,6 +809,16 @@ impl MapJournal {
             _ => JournalInsert::OutOfOrder,
         };
         Some((e, r))
+    }
+
+    /// MONKEY (voxel): drop our pending prediction `nonce` (the server refused it with `R`, or it
+    /// was never received). Returns it (the caller rebuilds its chunks).
+    pub fn remove_pending(&mut self, nonce: u16) -> Option<VoxelEditOp> {
+        let i = self.edits[self.confirmed..]
+            .iter()
+            .position(|e| e.local && e.nonce == nonce)?
+            + self.confirmed;
+        Some(self.edits.remove(i))
     }
 
     /// REGION-RESET: drop every edit (confirmed or not) whose centre lies in `(rx, ry)`, adopt the
@@ -1202,6 +1214,31 @@ mod tests {
         assert_eq!(
             VoxelJournal::decode(&bytes[..bytes.len() - 3]),
             Err(JournalError::Truncated)
+        );
+    }
+
+    #[test]
+    fn region_sync_point_is_net_managed_and_persists() {
+        let mut j = VoxelJournal::default();
+        let m = j.maps.entry(0).or_default();
+        let mut s = edit([10.0, 10.0, 0.0], 1.0, 0);
+        s.seq = Some(40);
+        m.insert(s);
+        assert!(m.regions.is_empty(), "a live / synced E does not move the sync point");
+        m.regions.insert((0, 0), RegionSync { epoch: 2, last_seq: 40 });
+        m.regions.insert((-141, -2), RegionSync { epoch: 7, last_seq: 123_456 });
+        let mut p = edit([20.0, 10.0, 0.0], 1.0, 1);
+        p.local = true;
+        p.nonce = 5;
+        m.insert(p);
+        assert_eq!(m.remove_pending(6), None);
+        assert_eq!(m.remove_pending(5).map(|e| e.nonce), Some(5));
+        assert!(m.pending_local().is_empty());
+        let back = VoxelJournal::decode(&j.encode()).expect("decode");
+        assert_eq!(back, j);
+        assert_eq!(
+            back.maps[&0].regions[&(-141, -2)],
+            RegionSync { epoch: 7, last_seq: 123_456 }
         );
     }
 
