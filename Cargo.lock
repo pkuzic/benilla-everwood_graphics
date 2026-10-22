@@ -3028,6 +3028,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "eme-core"
+version = "0.2.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "ena"
 version = "0.14.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
