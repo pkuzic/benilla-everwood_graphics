@@ -1,38 +1,131 @@
-//! MONKEY (Voxel): multiplayer terrain-edit relay over **guild addon messages** — the v2 fallback
-//! transport (CONTRACT §4: "no HELLO-ACK → fall back to the guild relay, prefix `MV2:` + the EDIT
-//! body, no seq, best effort").
+//! MONKEY (Voxel): the multiplayer terrain-edit network link (CONTRACT §3–4,
+//! `disposable/voxel-v2/CONTRACT.md`).
 //!
-//! Every edit the local brush makes is pushed to [`benilla_world::voxel::MonkeyVoxelNet`]'s
-//! `outbox` by the world side; this module sends each as a **guild** addon message
-//! `MV2:<46 hex>` (the 23-byte v2 EDIT body: `op 0x01, nonce u16, map u16, x f32, y f32, z f32,
-//! radius f32, mode u8, strength u8`, little-endian) and decodes the guild members' lines into the
-//! `inbox`, which the world applies through the canonical path (no seq → appended in arrival
-//! order). The server relays guild addon traffic verbatim, so this needs no server change.
+//! **SERVER mode** (the authority script `MonkeyVoxelServer.lua` answers): on entering the world
+//! and on every map change the client sends HELLO `.mvox 1002`; an `H` within 10 s selects it.
+//! - uplink: the brush's [`MonkeyVoxelNet`] `outbox` → `.mvox 01…` (23-byte EDIT, hex lowercase);
+//!   the server consumes `.mvox` silently and nothing local echoes a sent chat command, so these
+//!   never show in the chat frame.
+//! - downlink: `MONKEYVOXEL<TAB><hex>` addon whispers (sender == receiver; several fixed-size
+//!   records per message), decoded by [`benilla_world::voxel::wire`]. Addon traffic never renders
+//!   in the chat frame (`ui_chat::net`'s `is_addon` branch). `E` → a confirm of OUR prediction
+//!   (nonce AND body equal) or a remote edit (deduped by seq in the journal); `D` → the region's
+//!   sync point (`more` → ask again); `X` → reset the region + re-SYNC from 0; `R` → drop the
+//!   prediction (logged with the reason). All go into `MonkeyVoxelNet::events` in ARRIVAL order.
+//! - SYNC: the regions (64 yd) whose centre is within 200 yd of the player and not synced this
+//!   session, ≤ 12 entries per command, ≤ 1 command per 250 ms, after_seq = the persisted sync
+//!   point (journal), so a relog only fetches newer edits. A region whose centre drifts beyond
+//!   230 yd is forgotten (re-SYNCed on return: outside the server's 300-yd fan-out it can miss
+//!   live edits). A live `E` in a synced region moves its sync point (contiguous while in range).
 //!
-//! The server-authority lane (`.mvox` + `MONKEYVOXEL` whispers) will sit beside this and drive the
-//! same mailbox (`inbox` with seq, `confirms`, `resets`, `region_done`).
+//! **RELAY mode** (no `H` in 10 s — a server without the script): the v1-style guild relay, each
+//! local edit as a guild addon line `MV2:<46 hex>`, decoded from the guild members into the
+//! `inbox` (no seq, best effort).
 //!
 //! The whole module is gated behind the crate's `voxel` cargo feature (OFF by default).
 
+use std::collections::{HashMap, HashSet, VecDeque};
+
 use bevy::prelude::*;
 
+use benilla_assets::coords::bevy_to_wow;
 use benilla_protocol::{SessionEvent, SessionEventKind};
 use benilla_ui::script::AddonDistribution;
-use benilla_world::voxel::{MonkeyLocalGm, MonkeyVoxelEdit, MonkeyVoxelNet};
+use benilla_world::voxel::wire::{self, ServerRecord, SyncEntry};
+use benilla_world::voxel::{
+    region_of, MonkeyLocalGm, MonkeyVoxelEdit, MonkeyVoxelNet, MonkeyVoxelNetEvent,
+    MonkeyVoxelWorld, RegionSync, REGION_YARDS,
+};
 
-use crate::net::{ClientCommand, NetCommands, NetHandlerApp, ObjectStore, SelfGuid, SelfPlayer};
+use crate::net::{
+    ChatKind, ClientCommand, NetCommands, NetHandlerApp, ObjectStore, SelfGuid, SelfPlayer,
+};
 
 /// `PLAYER_FLAGS & 0x8` — GM mode on (`.gm on`); same bit chat's `is_gm` reads.
 const PLAYER_FLAGS_GM: u32 = 0x8;
 
-/// The tag marking a v2 voxel-EDIT addon line (`MV2:<46 hex>`). Addon traffic, so the chat UI
-/// keeps it out of the visible log.
+/// The tag marking a v2 voxel-EDIT guild-relay line (`MV2:<46 hex>`). Addon traffic, so the chat
+/// UI keeps it out of the visible log.
 pub(crate) const MONKEY_VOXEL_PREFIX: &str = "MV2:";
 
-/// Wire the relay: the inbound-chat interceptor, the outbox-drain sender, and the GM-status bridge.
+/// No `H` within this many seconds of HELLO → guild relay (CONTRACT §4).
+const HELLO_TIMEOUT_S: f32 = 10.0;
+/// HELLO is re-sent once at this age (the server ignores a HELLO < 1 s after the last).
+const HELLO_RETRY_S: f32 = 4.0;
+/// SYNC regions whose centre is within this of the player (CONTRACT §3).
+const SYNC_RADIUS: f32 = 200.0;
+/// A synced region whose centre is beyond this is forgotten (re-SYNCed on return).
+const UNSYNC_RADIUS: f32 = 230.0;
+/// At most one SYNC command per this many seconds (server gap 200 ms).
+const SYNC_GAP_S: f32 = 0.25;
+/// A SYNC entry with no `D` after this long is asked again (the server drops a SYNC sent inside
+/// its 200-ms gap silently).
+const SYNC_RETRY_S: f32 = 5.0;
+/// Local edits held while the mode is undecided (≤ 10 s at ≤ 8/s).
+const HOLD_CAP: usize = 256;
+
+/// `CHAT_MSG_WHISPER` / `_INFORM`: the server's self-whisper lane.
+const CHAT_WHISPER: u8 = 0x06;
+const CHAT_WHISPER_INFORM: u8 = 0x07;
+
+/// The transport the voxel layer currently uses.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum MonkeyVoxelMode {
+    /// Out of the world.
+    #[default]
+    Idle,
+    /// HELLO sent, waiting for `H` (local edits are held).
+    Probing,
+    /// The authority script answered.
+    Server,
+    /// No `H`: the guild `MV2:` relay.
+    Relay,
+}
+
+/// The link state of this session (reset on every world entry / map change).
+#[derive(Resource, Default)]
+pub(crate) struct MonkeyVoxelLink {
+    pub(crate) mode: MonkeyVoxelMode,
+    /// `(self guid, map)` the session state belongs to.
+    key: Option<(u64, u32)>,
+    hello_at: f32,
+    hello_tries: u8,
+    /// Decoded server records waiting for the tick (arrival order).
+    rx: Vec<ServerRecord>,
+    /// The session's view of the sync points (the journal's, updated by D / X / live E).
+    known: HashMap<(i16, i16), RegionSync>,
+    /// Regions whose SYNC completed (`D more=0`) this session.
+    synced: HashSet<(i16, i16)>,
+    /// Regions asked, waiting for their `D` → time sent.
+    inflight: HashMap<(i16, i16), f32>,
+    /// Regions to ask first (`D more=1`, `X`, timeouts).
+    again: VecDeque<(i16, i16)>,
+    last_sync_cmd: f32,
+    /// Predictions uplinked this session (older pending ones were never received → dropped once
+    /// their region's SYNC completes without confirming them).
+    sent_nonces: HashSet<u16>,
+    /// Totals for the log.
+    sync_cmds: u32,
+    /// `E` records that answered a SYNC (not live) since the last "SYNC complete" line.
+    sync_edits: u32,
+    /// A SYNC round is open (logged once when it drains).
+    sync_open: bool,
+}
+
+/// Wire the link: the inbound-chat interceptor, the GM-status bridge, the mode / SYNC tick and
+/// the outbox drain.
 pub(crate) fn register(app: &mut App) {
-    app.net_handler(SessionEventKind::Chat, monkey_voxel_recv)
-        .add_systems(Update, (monkey_voxel_drain_outbox, monkey_voxel_push_gm));
+    app.init_resource::<MonkeyVoxelLink>()
+        .net_handler(SessionEventKind::Chat, monkey_voxel_recv)
+        .add_systems(
+            Update,
+            (
+                monkey_voxel_push_gm,
+                monkey_voxel_link_tick,
+                monkey_voxel_drain_outbox,
+            )
+                .chain(),
+        );
 }
 
 /// Bridge the self player's GM flag into benilla-world's `MonkeyLocalGm` each frame (benilla-world
@@ -47,9 +140,356 @@ fn monkey_voxel_push_gm(
         .unwrap_or(false);
 }
 
-/// Drain the brush's outbox: each local edit goes out as a `MV2:<hex>` **guild** addon message.
+fn say(commands: &NetCommands, text: String) {
+    let _ = commands.0.send(ClientCommand::Chat {
+        kind: ChatKind::Say,
+        target: None,
+        text,
+        language: None,
+    });
+}
+
+/// The regions whose centre lies within `radius` of `(x, y)`, nearest first.
+fn regions_near(x: f32, y: f32, radius: f32) -> Vec<((i16, i16), f32)> {
+    let (r0x, r0y) = region_of(x - radius, y - radius);
+    let (r1x, r1y) = region_of(x + radius, y + radius);
+    let mut out = Vec::new();
+    for rx in r0x..=r1x {
+        for ry in r0y..=r1y {
+            let cx = (rx as f32 + 0.5) * REGION_YARDS;
+            let cy = (ry as f32 + 0.5) * REGION_YARDS;
+            let d = ((cx - x).powi(2) + (cy - y).powi(2)).sqrt();
+            if d <= radius {
+                out.push(((rx, ry), d));
+            }
+        }
+    }
+    out.sort_by(|a, b| a.1.total_cmp(&b.1));
+    out
+}
+
+/// Turn one batch of decoded records into ordered world events + link bookkeeping. Pure (no
+/// Bevy systems), so the confirm rule and the SYNC bookkeeping are unit-tested.
+fn monkey_voxel_route(
+    link: &mut MonkeyVoxelLink,
+    map: u16,
+    pending: &[MonkeyVoxelEdit],
+    records: Vec<ServerRecord>,
+    events: &mut Vec<MonkeyVoxelNetEvent>,
+) {
+    let mut confirmed_now: HashSet<u16> = HashSet::new();
+    for r in records {
+        match r {
+            ServerRecord::Hello { .. } => {}
+            ServerRecord::Edit(e) => {
+                let own = pending
+                    .iter()
+                    .find(|p| !confirmed_now.contains(&p.nonce) && wire::is_echo_of(&e, p));
+                let seq = e.seq.unwrap_or(0);
+                match own {
+                    Some(p) => {
+                        confirmed_now.insert(p.nonce);
+                        events.push(MonkeyVoxelNetEvent::Confirm {
+                            map: e.map,
+                            nonce: p.nonce,
+                            seq,
+                        });
+                    }
+                    None => events.push(MonkeyVoxelNetEvent::Edit(e)),
+                }
+                // A live edit in a region already synced this session keeps it contiguous.
+                let reg = e.region();
+                if e.map == map && link.synced.contains(&reg) {
+                    if let Some(k) = link.known.get_mut(&reg) {
+                        if seq > k.last_seq {
+                            k.last_seq = seq;
+                            events.push(MonkeyVoxelNetEvent::SyncPoint {
+                                map,
+                                rx: reg.0,
+                                ry: reg.1,
+                                epoch: k.epoch,
+                                last_seq: seq,
+                            });
+                        }
+                    }
+                } else if link.inflight.contains_key(&reg) {
+                    link.sync_edits += 1;
+                }
+            }
+            ServerRecord::Done {
+                map: m,
+                rx,
+                ry,
+                epoch,
+                last_seq,
+                more,
+            } => {
+                if m != map {
+                    continue;
+                }
+                let reg = (rx, ry);
+                link.inflight.remove(&reg);
+                link.known.insert(reg, RegionSync { epoch, last_seq });
+                events.push(MonkeyVoxelNetEvent::SyncPoint {
+                    map,
+                    rx,
+                    ry,
+                    epoch,
+                    last_seq,
+                });
+                if more {
+                    if !link.again.contains(&reg) {
+                        link.again.push_back(reg);
+                    }
+                } else {
+                    link.synced.insert(reg);
+                    // A prediction of an EARLIER session the completed SYNC did not confirm never
+                    // reached the server: drop it (re-sending could double-apply).
+                    for p in pending.iter().filter(|p| {
+                        p.map == map
+                            && p.region() == reg
+                            && !link.sent_nonces.contains(&p.nonce)
+                            && !confirmed_now.contains(&p.nonce)
+                    }) {
+                        info!(
+                            "MONKEY (voxel): stale local prediction nonce {} in region ({rx}, \
+                             {ry}) was never confirmed by the server — dropping it",
+                            p.nonce
+                        );
+                        events.push(MonkeyVoxelNetEvent::DropLocal {
+                            map,
+                            nonce: p.nonce,
+                        });
+                    }
+                }
+            }
+            ServerRecord::Reset {
+                map: m,
+                rx,
+                ry,
+                epoch,
+            } => {
+                events.push(MonkeyVoxelNetEvent::Reset {
+                    map: m,
+                    rx,
+                    ry,
+                    epoch,
+                });
+                if m != map {
+                    continue;
+                }
+                let reg = (rx, ry);
+                info!(
+                    "MONKEY (voxel): X REGION-RESET ({rx}, {ry}) epoch {epoch} — re-SYNC from 0"
+                );
+                link.known.insert(reg, RegionSync { epoch, last_seq: 0 });
+                link.synced.remove(&reg);
+                // A reply to an in-flight SYNC carries its E + D right behind this X: keep waiting.
+                if !link.inflight.contains_key(&reg) && !link.again.contains(&reg) {
+                    link.again.push_back(reg);
+                }
+            }
+            ServerRecord::Reject { nonce, reason } => {
+                warn!(
+                    "MONKEY (voxel): server REJECTED our edit nonce {nonce} (R reason {reason}: \
+                     {}) — dropping the local prediction",
+                    wire::reject_reason(reason)
+                );
+                events.push(MonkeyVoxelNetEvent::DropLocal { map, nonce });
+            }
+        }
+    }
+}
+
+/// The SYNC entries to send now: re-asks first, then unsynced regions near the player, nearest
+/// first, ≤ 12.
+fn monkey_voxel_sync_batch(
+    link: &mut MonkeyVoxelLink,
+    near: &[((i16, i16), f32)],
+    sync_point: impl Fn((i16, i16)) -> RegionSync,
+) -> Vec<SyncEntry> {
+    let mut regs: Vec<(i16, i16)> = Vec::new();
+    while regs.len() < wire::SYNC_MAX_ENTRIES {
+        let Some(r) = link.again.pop_front() else {
+            break;
+        };
+        if !regs.contains(&r) {
+            regs.push(r);
+        }
+    }
+    for (r, _) in near {
+        if regs.len() >= wire::SYNC_MAX_ENTRIES {
+            break;
+        }
+        if !link.synced.contains(r) && !link.inflight.contains_key(r) && !regs.contains(r) {
+            regs.push(*r);
+        }
+    }
+    regs.into_iter()
+        .map(|r| {
+            let s = link.known.get(&r).copied().unwrap_or_else(|| sync_point(r));
+            link.known.insert(r, s);
+            SyncEntry {
+                rx: r.0,
+                ry: r.1,
+                epoch: s.epoch,
+                after_seq: s.last_seq,
+            }
+        })
+        .collect()
+}
+
+/// The mode machine + SYNC scheduler + record router (runs every frame).
+#[allow(clippy::too_many_arguments)]
+fn monkey_voxel_link_tick(
+    time: Res<Time>,
+    self_guid: Res<SelfGuid>,
+    world: Res<MonkeyVoxelWorld>,
+    body: Query<&Transform, With<SelfPlayer>>,
+    commands: Res<NetCommands>,
+    mut link: ResMut<MonkeyVoxelLink>,
+    mut net: ResMut<MonkeyVoxelNet>,
+) {
+    let now = time.elapsed_secs();
+    let (Some(guid), Some(map)) = (self_guid.0, world.map()) else {
+        if link.mode != MonkeyVoxelMode::Idle {
+            *link = MonkeyVoxelLink::default();
+        }
+        return;
+    };
+    let link = &mut *link;
+    // World entry / relog / map change: a fresh session state + HELLO.
+    if link.key != Some((guid, map)) {
+        let rx = std::mem::take(&mut link.rx);
+        *link = MonkeyVoxelLink {
+            key: Some((guid, map)),
+            mode: MonkeyVoxelMode::Probing,
+            hello_at: now,
+            hello_tries: 1,
+            // An H that raced the map change still counts.
+            rx: rx
+                .into_iter()
+                .filter(|r| matches!(r, ServerRecord::Hello { .. }))
+                .collect(),
+            ..Default::default()
+        };
+        say(&commands, wire::hello_command());
+        info!("MONKEY (voxel): HELLO .mvox 1002 sent (map {map}) — waiting for the server's H");
+    }
+    let map16 = map as u16;
+
+    // Records → events (H switches the mode).
+    let records = std::mem::take(&mut link.rx);
+    if !records.is_empty() {
+        if let Some(ServerRecord::Hello { version }) = records
+            .iter()
+            .find(|r| matches!(r, ServerRecord::Hello { .. }))
+        {
+            if link.mode != MonkeyVoxelMode::Server {
+                info!(
+                    "MONKEY (voxel): SERVER mode — HELLO-ACK v{version} after {:.1} s (map {map}); \
+                     edits go through .mvox, SYNC within {SYNC_RADIUS} yd",
+                    now - link.hello_at
+                );
+                link.mode = MonkeyVoxelMode::Server;
+            }
+        }
+        let pending = world.pending_local(map16);
+        monkey_voxel_route(link, map16, &pending, records, &mut net.events);
+    }
+
+    match link.mode {
+        MonkeyVoxelMode::Probing => {
+            let age = now - link.hello_at;
+            if age >= HELLO_TIMEOUT_S {
+                link.mode = MonkeyVoxelMode::Relay;
+                info!(
+                    "MONKEY (voxel): no HELLO-ACK in {HELLO_TIMEOUT_S} s — RELAY mode (guild \
+                     MV2: lines, no server authority)"
+                );
+            } else if age >= HELLO_RETRY_S && link.hello_tries < 2 {
+                link.hello_tries += 1;
+                say(&commands, wire::hello_command());
+            }
+        }
+        MonkeyVoxelMode::Server => {
+            let Ok(tf) = body.single() else {
+                return;
+            };
+            let p = bevy_to_wow(tf.translation);
+            // Forget regions that drifted out of the fan-out; retry lost SYNCs.
+            let far: Vec<(i16, i16)> = link
+                .synced
+                .iter()
+                .copied()
+                .filter(|r| {
+                    let cx = (r.0 as f32 + 0.5) * REGION_YARDS;
+                    let cy = (r.1 as f32 + 0.5) * REGION_YARDS;
+                    ((cx - p[0]).powi(2) + (cy - p[1]).powi(2)).sqrt() > UNSYNC_RADIUS
+                })
+                .collect();
+            for r in far {
+                link.synced.remove(&r);
+            }
+            let lost: Vec<(i16, i16)> = link
+                .inflight
+                .iter()
+                .filter(|(_, t)| now - **t > SYNC_RETRY_S)
+                .map(|(r, _)| *r)
+                .collect();
+            for r in lost {
+                link.inflight.remove(&r);
+                link.again.push_back(r);
+            }
+            if now - link.last_sync_cmd < SYNC_GAP_S {
+                return;
+            }
+            let near = regions_near(p[0], p[1], SYNC_RADIUS);
+            let entries =
+                monkey_voxel_sync_batch(link, &near, |r| world.region_sync(map16, r.0, r.1));
+            if entries.is_empty() {
+                // Nothing left to ask and every answer in: one line per SYNC round.
+                if link.sync_open && link.inflight.is_empty() {
+                    link.sync_open = false;
+                    info!(
+                        "MONKEY (voxel): SYNC complete — {} region(s) synced, {} edit(s) fetched \
+                         (0 = the journal was already current)",
+                        link.synced.len(),
+                        std::mem::take(&mut link.sync_edits)
+                    );
+                }
+                return;
+            }
+            link.last_sync_cmd = now;
+            link.sync_cmds += 1;
+            link.sync_open = true;
+            for e in &entries {
+                link.inflight.insert((e.rx, e.ry), now);
+            }
+            let after: Vec<String> = entries
+                .iter()
+                .map(|e| format!("({},{})e{}>{}", e.rx, e.ry, e.epoch, e.after_seq))
+                .collect();
+            info!(
+                "MONKEY (voxel): SYNC #{} map {map}: {} region(s) {} — {} synced so far",
+                link.sync_cmds,
+                entries.len(),
+                after.join(" "),
+                link.synced.len()
+            );
+            for c in wire::sync_commands(map16, &entries) {
+                say(&commands, c);
+            }
+        }
+        MonkeyVoxelMode::Idle | MonkeyVoxelMode::Relay => {}
+    }
+}
+
+/// Drain the brush's outbox through the current transport: SERVER → `.mvox` EDIT, RELAY → a
+/// `MV2:<hex>` guild addon line, PROBING → held (≤ 10 s) until the mode is known.
 fn monkey_voxel_drain_outbox(
     mut net: ResMut<MonkeyVoxelNet>,
+    mut link: ResMut<MonkeyVoxelLink>,
     self_guid: Res<SelfGuid>,
     commands: Res<NetCommands>,
 ) {
@@ -62,33 +502,239 @@ fn monkey_voxel_drain_outbox(
         net.outbox.clear();
         return;
     }
-    for edit in net.outbox.drain(..).collect::<Vec<_>>() {
-        let _ = commands.0.send(ClientCommand::AddonMessage {
-            distribution: AddonDistribution::Guild,
-            text: format!("{MONKEY_VOXEL_PREFIX}{}", edit.to_hex()),
-        });
+    match link.mode {
+        MonkeyVoxelMode::Idle | MonkeyVoxelMode::Probing => {
+            let n = net.outbox.len();
+            if n > HOLD_CAP {
+                net.outbox.drain(..n - HOLD_CAP);
+            }
+        }
+        MonkeyVoxelMode::Server => {
+            for edit in net.outbox.drain(..).collect::<Vec<_>>() {
+                link.sent_nonces.insert(edit.nonce);
+                debug!("MONKEY (voxel): -> EDIT nonce {}", edit.nonce);
+                say(&commands, wire::edit_command(&edit));
+            }
+        }
+        MonkeyVoxelMode::Relay => {
+            for edit in net.outbox.drain(..).collect::<Vec<_>>() {
+                let _ = commands.0.send(ClientCommand::AddonMessage {
+                    distribution: AddonDistribution::Guild,
+                    text: format!("{MONKEY_VOXEL_PREFIX}{}", edit.to_hex()),
+                });
+            }
+        }
     }
 }
 
-/// Receive side: an addon line tagged `MV2:<hex>` from **another** player decodes into the inbox.
-/// Our own echo (same sender guid) is skipped so what we did locally isn't applied twice. A
-/// malformed / invalid body (bad length, NaN, radius out of range, unknown mode) is dropped.
+/// Receive side.
+/// - `MONKEYVOXEL<TAB><hex>` addon whisper from OURSELVES (the server's self-whisper; a player can't
+///   forge that sender) → decoded records queued for the tick.
+/// - `MV2:<hex>` guild line from **another** player → the inbox, unless in SERVER mode (then the
+///   server is the only source of truth). A malformed body is dropped.
 fn monkey_voxel_recv(
     In(ev): In<SessionEvent>,
     mut net: ResMut<MonkeyVoxelNet>,
+    mut link: ResMut<MonkeyVoxelLink>,
     self_guid: Res<SelfGuid>,
 ) {
     let SessionEvent::Chat(m) = ev else {
         return;
     };
+    if !m.is_addon() {
+        return;
+    }
+    if let Some(hex) = wire::server_payload(&m.text) {
+        if self_guid.0 != Some(m.sender_guid)
+            || !matches!(m.chat_type, CHAT_WHISPER | CHAT_WHISPER_INFORM)
+        {
+            warn!(
+                "MONKEY (voxel): ignoring a MONKEYVOXEL line not whispered by the server to us \
+                 (type {:#04x}, sender {:#x})",
+                m.chat_type, m.sender_guid
+            );
+            return;
+        }
+        let (records, err) = wire::decode_records(hex);
+        if let Some(e) = err {
+            warn!("MONKEY (voxel): bad MONKEYVOXEL payload ({e:?}): {hex:?}");
+        }
+        debug!("MONKEY (voxel): <- {} record(s)", records.len());
+        link.rx.extend(records);
+        return;
+    }
     let Some(hex) = m.text.strip_prefix(MONKEY_VOXEL_PREFIX) else {
         return;
     };
-    if self_guid.0 == Some(m.sender_guid) {
+    if self_guid.0 == Some(m.sender_guid) || link.mode == MonkeyVoxelMode::Server {
         return;
     }
     match MonkeyVoxelEdit::from_hex(hex) {
         Some(edit) => net.inbox.push(edit),
         None => warn!("MONKEY (voxel): dropping a malformed MV2 payload {:?}", m.text),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn op(nonce: u16, x: f32, seq: Option<u32>, local: bool) -> MonkeyVoxelEdit {
+        MonkeyVoxelEdit {
+            map: 0,
+            pos: [x, 10.0, 5.0],
+            radius: 2.0,
+            mode: 0,
+            strength: 255,
+            nonce,
+            seq,
+            local,
+        }
+    }
+
+    #[test]
+    fn route_confirms_own_echo_and_applies_others() {
+        let mut link = MonkeyVoxelLink::default();
+        let pending = vec![op(7, 10.0, None, true)];
+        let mut ev = Vec::new();
+        let recs = vec![
+            ServerRecord::Edit(op(7, 10.0, Some(41), false)), // our echo
+            ServerRecord::Edit(op(7, 30.0, Some(42), false)), // another GM, same nonce
+            ServerRecord::Reject { nonce: 9, reason: 1 },
+        ];
+        monkey_voxel_route(&mut link, 0, &pending, recs, &mut ev);
+        assert_eq!(
+            ev[0],
+            MonkeyVoxelNetEvent::Confirm {
+                map: 0,
+                nonce: 7,
+                seq: 41
+            }
+        );
+        assert!(matches!(ev[1], MonkeyVoxelNetEvent::Edit(e) if e.seq == Some(42)));
+        assert_eq!(ev[2], MonkeyVoxelNetEvent::DropLocal { map: 0, nonce: 9 });
+    }
+
+    #[test]
+    fn route_reset_then_edits_then_done_keeps_order_and_sync_state() {
+        let mut link = MonkeyVoxelLink::default();
+        link.inflight.insert((0, 0), 0.0);
+        let mut ev = Vec::new();
+        let recs = vec![
+            ServerRecord::Reset {
+                map: 0,
+                rx: 0,
+                ry: 0,
+                epoch: 3,
+            },
+            ServerRecord::Edit(op(1, 10.0, Some(5), false)),
+            ServerRecord::Done {
+                map: 0,
+                rx: 0,
+                ry: 0,
+                epoch: 3,
+                last_seq: 5,
+                more: false,
+            },
+        ];
+        // A stale prediction from an earlier session (never sent this session) in that region.
+        let pending = vec![op(99, 12.0, None, true)];
+        monkey_voxel_route(&mut link, 0, &pending, recs, &mut ev);
+        assert!(matches!(ev[0], MonkeyVoxelNetEvent::Reset { epoch: 3, .. }));
+        assert!(matches!(ev[1], MonkeyVoxelNetEvent::Edit(_)));
+        assert!(matches!(
+            ev[2],
+            MonkeyVoxelNetEvent::SyncPoint {
+                epoch: 3,
+                last_seq: 5,
+                ..
+            }
+        ));
+        assert_eq!(ev[3], MonkeyVoxelNetEvent::DropLocal { map: 0, nonce: 99 });
+        assert!(link.synced.contains(&(0, 0)));
+        assert!(link.again.is_empty(), "the X arrived inside the SYNC reply: no extra re-ask");
+        // A live E in the now-synced region moves its sync point.
+        ev.clear();
+        monkey_voxel_route(
+            &mut link,
+            0,
+            &[],
+            vec![ServerRecord::Edit(op(2, 11.0, Some(8), false))],
+            &mut ev,
+        );
+        assert!(matches!(
+            ev[1],
+            MonkeyVoxelNetEvent::SyncPoint {
+                last_seq: 8,
+                epoch: 3,
+                ..
+            }
+        ));
+        // A live X (revert) outside a SYNC re-asks the region from 0.
+        ev.clear();
+        monkey_voxel_route(
+            &mut link,
+            0,
+            &[],
+            vec![ServerRecord::Reset {
+                map: 0,
+                rx: 0,
+                ry: 0,
+                epoch: 4,
+            }],
+            &mut ev,
+        );
+        assert_eq!(link.again.front(), Some(&(0, 0)));
+        assert!(!link.synced.contains(&(0, 0)));
+        let b = monkey_voxel_sync_batch(&mut link, &[], |_| RegionSync::default());
+        assert_eq!(
+            b,
+            vec![SyncEntry {
+                rx: 0,
+                ry: 0,
+                epoch: 4,
+                after_seq: 0
+            }]
+        );
+    }
+
+    #[test]
+    fn sync_batches_at_most_twelve_nearest_first_and_more_reasks() {
+        let mut link = MonkeyVoxelLink::default();
+        let near = regions_near(32.0, 32.0, SYNC_RADIUS);
+        assert!(near.len() > 24, "{} regions within 200 yd", near.len());
+        assert_eq!(near[0].0, (0, 0), "nearest first");
+        let b1 = monkey_voxel_sync_batch(&mut link, &near, |r| RegionSync {
+            epoch: 1,
+            last_seq: (r.0 as i32 + 100) as u32,
+        });
+        assert_eq!(b1.len(), 12);
+        assert_eq!(b1[0].after_seq, 100);
+        for e in &b1 {
+            link.inflight.insert((e.rx, e.ry), 0.0);
+        }
+        // A D more=1 for (0,0) puts it at the head of the next batch.
+        let mut ev = Vec::new();
+        monkey_voxel_route(
+            &mut link,
+            0,
+            &[],
+            vec![ServerRecord::Done {
+                map: 0,
+                rx: 0,
+                ry: 0,
+                epoch: 1,
+                last_seq: 300,
+                more: true,
+            }],
+            &mut ev,
+        );
+        let b2 = monkey_voxel_sync_batch(&mut link, &near, |_| RegionSync::default());
+        assert_eq!(b2.len(), 12);
+        assert_eq!((b2[0].rx, b2[0].ry, b2[0].after_seq), (0, 0, 300));
+        assert!(b2[1..].iter().all(|e| !b1.iter().any(|x| x.rx == e.rx && x.ry == e.ry)));
+        let cmds = wire::sync_commands(0, &b2);
+        assert_eq!(cmds.len(), 1);
+        assert_eq!(cmds[0].len(), ".mvox ".len() + 2 * (4 + 10 * 12));
     }
 }

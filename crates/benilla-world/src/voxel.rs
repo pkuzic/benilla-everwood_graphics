@@ -37,7 +37,8 @@ use crate::terrain_stream::TerrainStreamer;
 use crate::view::WorldCamera;
 use benilla_assets::coords::{bevy_to_wow, wow_to_bevy};
 use benilla_assets::AdtTile;
-pub use benilla_voxel::world::{RegionSync, VoxelEditOp};
+pub use benilla_voxel::wire;
+pub use benilla_voxel::world::{region_of, RegionSync, VoxelEditOp, REGION_YARDS};
 use benilla_voxel::world::{
     chunk_key_at, raymarch, window_origin, ChunkKey, ColumnKey, ColumnSeed, JournalInsert,
     VoxelJournal, VoxelWorldData, CHUNK_YARDS, SEED_LIFT,
@@ -72,6 +73,10 @@ pub struct MonkeyVoxelChunk(pub ChunkKey);
 ///   never re-applies it);
 /// - `resets`: `(map, rx, ry, epoch)` — `X` REGION-RESET (drops that region's journal, rebuilds);
 /// - `region_done`: `(map, rx, ry, epoch, last_seq)` — `D` REGION-DONE (persists the sync point).
+///
+/// MONKEY (voxel): the server lane uses `events` instead — the SAME records, applied in ARRIVAL
+/// order (an `X` followed by the region's `E`s in one SYNC reply must reset first, then apply).
+/// The typed vecs above are drained first each frame (the guild relay still uses `inbox`).
 #[derive(Resource, Default)]
 pub struct MonkeyVoxelNet {
     pub outbox: Vec<VoxelEditOp>,
@@ -79,6 +84,22 @@ pub struct MonkeyVoxelNet {
     pub confirms: Vec<(u16, u32)>,
     pub resets: Vec<(u16, i16, i16, u16)>,
     pub region_done: Vec<(u16, i16, i16, u16, u32)>,
+    pub events: Vec<MonkeyVoxelNetEvent>,
+}
+
+/// MONKEY (voxel): one server-lane record for [`MonkeyVoxelNet::events`] (applied in order).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum MonkeyVoxelNetEvent {
+    /// A server `E` that is not our own prediction (seq: Some).
+    Edit(VoxelEditOp),
+    /// The server echo of our prediction `nonce` on `map` as `seq` (no re-apply).
+    Confirm { map: u16, nonce: u16, seq: u32 },
+    /// `X` REGION-RESET.
+    Reset { map: u16, rx: i16, ry: i16, epoch: u16 },
+    /// The region's persisted sync point (a `D`, or a live edit in a synced region).
+    SyncPoint { map: u16, rx: i16, ry: i16, epoch: u16, last_seq: u32 },
+    /// Drop our prediction `nonce` on `map` (an `R` reject, or a stale one the server never got).
+    DropLocal { map: u16, nonce: u16 },
 }
 
 /// Whether the local player is a GM (`PLAYER_FLAGS & 0x8`, i.e. `.gm on`). benilla-world can't read
@@ -132,6 +153,8 @@ pub struct MonkeyVoxelWorld {
     /// MONKEY (voxel): the live local edits of this frame awaiting their perf line —
     /// `(radius, ingest ms)`; the stream adds its build + mesh + collider time.
     perf: Vec<(f32, f32)>,
+    /// MONKEY (voxel): the drain of a live edit's hot chunks over frames: (frames, max stream ms).
+    perf_drain: Option<(u32, f32)>,
 }
 
 impl Default for MonkeyVoxelWorld {
@@ -160,6 +183,7 @@ impl Default for MonkeyVoxelWorld {
             last_dig: None,
             timing_logs: 40,
             perf: Vec::new(),
+            perf_drain: None,
         }
     }
 }
@@ -361,6 +385,20 @@ impl MonkeyVoxelWorld {
                 }
             }
         }
+    }
+
+    /// SERVER LANE: drop our refused / stale prediction `nonce` and rebuild what it touched.
+    pub fn drop_local(&mut self, map: u16, nonce: u16) -> Option<VoxelEditOp> {
+        let e = self.journal.maps.get_mut(&map)?.remove_pending(nonce)?;
+        self.journal_dirty = true;
+        if self.current_map_u16() == Some(map) {
+            for k in e.touched_chunks() {
+                if self.data.is_active(k) {
+                    self.rebuild.insert(k);
+                }
+            }
+        }
+        Some(e)
     }
 
     /// SERVER LANE: REGION-DONE — persist the region's sync point.
@@ -960,7 +998,7 @@ fn monkey_voxel_autoedit_stroke(
     if !stroke.armed {
         return;
     }
-    let settled = world.dirty.is_empty() && world.need_seed.is_empty() && world.rebuild.is_empty();
+    let settled = world.dirty.is_empty() && world.hot.is_empty() && world.need_seed.is_empty() && world.rebuild.is_empty();
     if stroke.step == 0 && stroke.quiet < 3.0 {
         stroke.quiet = if settled { stroke.quiet + time.delta_secs() } else { 0.0 };
         return;
@@ -1025,6 +1063,62 @@ fn monkey_voxel_apply_inbox(mut net: ResMut<MonkeyVoxelNet>, mut world: ResMut<M
     }
     for (map, rx, ry, epoch, last_seq) in std::mem::take(&mut net.region_done) {
         world.region_done(map, rx, ry, epoch, last_seq);
+    }
+    // MONKEY (voxel): the server lane, in arrival order.
+    let events = std::mem::take(&mut net.events);
+    if events.is_empty() {
+        return;
+    }
+    let (mut applied, mut dup, mut confirmed) = (Vec::new(), 0usize, Vec::new());
+    for ev in events {
+        match ev {
+            MonkeyVoxelNetEvent::Edit(mut e) => {
+                e.local = false;
+                if !e.is_valid() {
+                    continue;
+                }
+                match world.ingest(e, true) {
+                    JournalInsert::Duplicate => dup += 1,
+                    _ => applied.push(e.seq.unwrap_or(0)),
+                }
+            }
+            MonkeyVoxelNetEvent::Confirm { map, nonce, seq } => {
+                world.confirm(map, nonce, seq);
+                confirmed.push(seq);
+            }
+            MonkeyVoxelNetEvent::Reset { map, rx, ry, epoch } => {
+                world.reset_region(map, rx, ry, epoch);
+                info!(
+                    "MONKEY (voxel): region ({rx}, {ry}) on map {map} RESET to epoch {epoch} — its \
+                     journal dropped, chunks rebuilding"
+                );
+            }
+            MonkeyVoxelNetEvent::SyncPoint {
+                map,
+                rx,
+                ry,
+                epoch,
+                last_seq,
+            } => world.region_done(map, rx, ry, epoch, last_seq),
+            MonkeyVoxelNetEvent::DropLocal { map, nonce } => {
+                if let Some(e) = world.drop_local(map, nonce) {
+                    info!(
+                        "MONKEY (voxel): dropped local prediction nonce {nonce} at WoW ({:.1}, \
+                         {:.1}, {:.1}) r={} — chunks rebuilding",
+                        e.pos[0], e.pos[1], e.pos[2], e.radius
+                    );
+                }
+            }
+        }
+    }
+    if !applied.is_empty() || dup > 0 {
+        info!(
+            "MONKEY (voxel): server edits APPLIED seq {:?} ({} duplicate(s) skipped)",
+            applied, dup
+        );
+    }
+    if !confirmed.is_empty() {
+        info!("MONKEY (voxel): own edits CONFIRMED by seq {confirmed:?} (not re-applied)");
     }
 }
 
@@ -1130,24 +1224,36 @@ fn monkey_voxel_stream(
         world.carve_dirty = true;
     }
 
-    // 3. Mesh: every hot chunk now (the brush must stay live), then dirty ones within budget.
+    // 3. Mesh within the frame budget: hot chunks (live edits) FIRST, then dirty ones.
+    //    MONKEY (voxel): a held 8-yd brush touches ~8 chunks per edit (~15 ms of mesh + trimesh
+    //    collider in one frame); the hot set is now also spread over frames by the
+    //    [`MESH_BUDGET_MS`] budget (≥ 1 chunk per frame), nearest-to-the-edit order irrelevant:
+    //    a chunk meshes the CURRENT density when its turn comes, so the latest density always wins,
+    //    and a chunk touched again while queued is meshed once.
     let t0 = Instant::now();
-    let mut queue: Vec<ChunkKey> = world.hot.drain().collect();
-    let hot_n = queue.len();
-    for k in &queue {
-        world.dirty.remove(k);
-    }
+    let mut queue: Vec<ChunkKey> = Vec::new();
+    let hot_n = world.hot.len();
     let (mut meshed_n, mut tris_n, mut i) = (0usize, 0usize, 0usize);
     loop {
         if i >= queue.len() {
-            if t0.elapsed().as_secs_f32() * 1000.0 >= MESH_BUDGET_MS {
+            if i > 0 && t0.elapsed().as_secs_f32() * 1000.0 >= MESH_BUDGET_MS {
                 break;
             }
-            let Some(&k) = world.dirty.iter().next() else {
-                break;
+            let next = match world.hot.iter().next().copied() {
+                Some(k) => {
+                    world.hot.remove(&k);
+                    world.dirty.remove(&k);
+                    k
+                }
+                None => {
+                    let Some(&k) = world.dirty.iter().next() else {
+                        break;
+                    };
+                    world.dirty.remove(&k);
+                    k
+                }
             };
-            world.dirty.remove(&k);
-            queue.push(k);
+            queue.push(next);
         }
         let k = queue[i];
         i += 1;
@@ -1219,7 +1325,7 @@ fn monkey_voxel_stream(
                 "MONKEY (voxel): remeshed {meshed_n} chunk(s) ({hot_n} hot, {tris_n} tris) + \
                  colliders in {ms:.2} ms; {} active, {} still queued",
                 world.data.chunks.len(),
-                world.dirty.len()
+                world.dirty.len() + world.hot.len()
             );
         } else {
             debug!("MONKEY (voxel): remeshed {meshed_n} chunk(s) in {ms:.2} ms");
@@ -1228,8 +1334,24 @@ fn monkey_voxel_stream(
 
     // MONKEY (voxel): one perf line per live local edit (ingest + this frame's build / mesh /
     // collider work), the 2-yd / 8-yd numbers the brush has to stay under.
+    // MONKEY (voxel): + the hot-queue drain — how many frames the budget spread a live edit's
+    // remesh over, and the worst stream frame meanwhile (the held-brush hitch number).
+    let frame_ms_now = t_stream.elapsed().as_secs_f32() * 1000.0;
+    if !world.perf.is_empty() || world.perf_drain.is_some() {
+        let (frames, worst) = world.perf_drain.unwrap_or((0, 0.0));
+        world.perf_drain = Some((frames + 1, worst.max(frame_ms_now)));
+        if world.hot.is_empty() {
+            let (frames, worst) = world.perf_drain.take().unwrap_or_default();
+            if world.timing_logs > 0 || frames > 1 {
+                info!(
+                    "MONKEY (voxel): perf drain — live remesh spread over {frames} frame(s), \
+                     worst stream frame {worst:.2} ms (budget {MESH_BUDGET_MS} ms)"
+                );
+            }
+        }
+    }
     if !world.perf.is_empty() {
-        let frame_ms = t_stream.elapsed().as_secs_f32() * 1000.0;
+        let frame_ms = frame_ms_now;
         for (r, ingest_ms) in std::mem::take(&mut world.perf) {
             info!(
                 "MONKEY (voxel): perf edit r={r:.1} yd: ingest {ingest_ms:.2} ms + build/mesh/collider {frame_ms:.2} ms ({meshed_n} chunk(s) meshed this frame, {} active)",
