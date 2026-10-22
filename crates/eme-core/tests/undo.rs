@@ -1,22 +1,20 @@
-//! The server-confirmed undo/redo state machine.
+//! The server-confirmed undo/redo state machine (CONTRACT v3 §10, §13).
 
 use eme_core::api::{EmeDiscardReason, EmeEvent, EmeHistoryHook};
-use eme_core::service::{
-    EmeOverlayLayer, EmeRequestId, EmeServiceError, EmeServiceReply, EmeServiceRequest, EmeTxId,
-};
+use eme_core::service::*;
 use eme_core::transport::EmeRejectReason;
 use eme_core::undo::*;
 use std::sync::{Arc, Mutex};
 
 fn ok() -> EmeServiceReply {
-    EmeServiceReply::ok(EmeRequestId(0))
+    EmeServiceReply::ok(EmeRequestId(1))
 }
 
 fn err(code: &str) -> EmeServiceReply {
-    EmeServiceReply::error(EmeRequestId(0), code)
+    EmeServiceReply::error(EmeRequestId(1), code)
 }
 
-/// A committed stroke `stroke` with one edit (nonce = stroke * 10).
+/// A committed voxel stroke `stroke` with one edit (nonce = stroke * 10).
 fn committed_stroke(s: &mut EmeUndoStack, stroke: u16) -> EmeEntryId {
     let id = s.note_edit(0, "sculpt", stroke, stroke * 10);
     s.close_stroke(stroke, false);
@@ -35,6 +33,15 @@ fn one_request(s: &mut EmeUndoStack) -> EmeHistoryRequest {
     r.pop().unwrap()
 }
 
+fn voxel_undo(stroke: u16, force: bool) -> EmeServiceRequest {
+    EmeServiceRequest::Undo(EmeUndoArgs {
+        stroke: Some(stroke),
+        layer: Some(EmeLayer::Voxel),
+        force,
+        sid: None,
+    })
+}
+
 #[test]
 fn stroke_commits_after_every_edit_answers_in_any_order() {
     let mut s = EmeUndoStack::new();
@@ -42,7 +49,7 @@ fn stroke_commits_after_every_edit_answers_in_any_order() {
     s.note_edit(10, "sculpt", 1, 101);
     s.note_edit(20, "sculpt", 1, 102);
     assert_eq!(state(&s, id), EmeEntryState::Open);
-    // Confirms out of order, one arrives before the brush is released.
+    // Confirms out of order, one before the brush is released.
     assert!(s.on_edit_confirmed(102, 503));
     s.close_stroke(1, false);
     assert_eq!(state(&s, id), EmeEntryState::Committing);
@@ -66,46 +73,54 @@ fn a_fully_rejected_stroke_is_discarded() {
     let id = s.note_edit(0, "sculpt", 1, 7);
     s.close_stroke(1, false);
     s.drain_events();
-    s.on_edit_rejected(7, EmeRejectReason::Rank);
+    s.on_edit_rejected(7, EmeRejectReason::from_code(6));
     assert!(s.get(id).is_none());
     assert!(!s.can_undo());
     let ev = s.drain_events();
     assert!(matches!(
         &ev[..],
         [EmeEvent::EntryDiscarded {
-            reason: EmeDiscardReason::CommitFailed(EmeServiceError::Rank),
+            reason: EmeDiscardReason::CommitFailed(EmeServiceError::Stroke),
             ..
         }]
     ));
 }
 
 #[test]
-fn undo_and_redo_are_server_confirmed() {
+fn undo_and_redo_are_server_confirmed_and_learn_the_sid() {
     let mut s = EmeUndoStack::new();
     let a = committed_stroke(&mut s, 1);
     assert_eq!(s.undo(), Ok(EmeUndoStarted::Sent(a)));
     let r = one_request(&mut s);
-    assert_eq!(
-        r.request,
-        EmeServiceRequest::Undo {
-            stroke: 1,
-            force: false
-        }
-    );
+    assert_eq!(r.request, voxel_undo(1, false));
     assert_eq!(state(&s, a), EmeEntryState::UndoPending);
-    assert!(
-        !s.can_redo() || s.redo().is_err(),
-        "redo of an in-flight undo is busy"
+    assert_eq!(
+        s.redo(),
+        Err(EmeUndoError::Busy(a)),
+        "redo of an in-flight undo"
     );
-    assert!(s.on_reply(r.ticket, &ok()));
+    let reply = ok()
+        .with("sid", 412)
+        .with("layer", "voxel")
+        .with("reverted", 1)
+        .with("revert_id", 57);
+    assert!(s.on_reply(r.ticket, &reply));
     assert_eq!(state(&s, a), EmeEntryState::Undone);
+    assert_eq!(s.get(a).unwrap().sid(), Some(412));
     assert!(!s.can_undo());
 
     assert_eq!(s.redo(), Ok(a));
     let r = one_request(&mut s);
-    assert_eq!(r.request, EmeServiceRequest::Redo { stroke: 1 });
+    assert_eq!(
+        r.request,
+        EmeServiceRequest::Redo(EmeUndoArgs {
+            sid: Some(412),
+            ..Default::default()
+        }),
+        "redo names the exact stroke row"
+    );
     assert_eq!(state(&s, a), EmeEntryState::RedoPending);
-    s.on_reply(r.ticket, &ok());
+    s.on_reply(r.ticket, &ok().with("sid", 412).with("restored", 1));
     assert_eq!(state(&s, a), EmeEntryState::Applied);
     assert!(s.can_undo() && !s.can_redo());
 }
@@ -130,7 +145,7 @@ fn server_rejection_restores_the_previous_state() {
     s.on_reply(r.ticket, &ok());
     s.redo().unwrap();
     let r = one_request(&mut s);
-    s.on_reply(r.ticket, &err("not_found"));
+    s.on_reply(r.ticket, &err("rate"));
     assert_eq!(
         state(&s, a),
         EmeEntryState::Undone,
@@ -139,13 +154,24 @@ fn server_rejection_restores_the_previous_state() {
 }
 
 #[test]
-fn already_counts_as_success() {
+fn redo_conflict_discards_the_entry() {
     let mut s = EmeUndoStack::new();
     let a = committed_stroke(&mut s, 1);
     s.undo().unwrap();
     let r = one_request(&mut s);
-    s.on_reply(r.ticket, &err("already"));
-    assert_eq!(state(&s, a), EmeEntryState::Undone);
+    s.on_reply(r.ticket, &ok());
+    s.redo().unwrap();
+    let r = one_request(&mut s);
+    s.drain_events();
+    s.on_reply(r.ticket, &err("conflict"));
+    assert!(s.get(a).is_none());
+    assert!(matches!(
+        &s.drain_events()[..],
+        [EmeEvent::EntryDiscarded {
+            reason: EmeDiscardReason::RedoConflict,
+            ..
+        }]
+    ));
 }
 
 #[test]
@@ -161,7 +187,7 @@ fn rapid_undos_target_successive_entries_and_settle_out_of_order() {
     assert_eq!(s.cursor(), 1);
     // B's reply first, then C fails.
     s.on_reply(reqs[1].ticket, &ok());
-    s.on_reply(reqs[0].ticket, &err("busy"));
+    s.on_reply(reqs[0].ticket, &err("internal"));
     assert_eq!(state(&s, b), EmeEntryState::Undone);
     assert_eq!(state(&s, c), EmeEntryState::Applied);
     assert_eq!(state(&s, a), EmeEntryState::Applied);
@@ -217,14 +243,7 @@ fn undo_of_an_unconfirmed_stroke_is_queued_until_commit() {
     assert!(s.drain_requests().is_empty());
     assert_eq!(s.undo(), Err(EmeUndoError::Nothing), "already queued");
     s.on_edit_confirmed(5, 77);
-    let r = one_request(&mut s);
-    assert_eq!(
-        r.request,
-        EmeServiceRequest::Undo {
-            stroke: 1,
-            force: false
-        }
-    );
+    assert_eq!(one_request(&mut s).request, voxel_undo(1, false));
     assert_eq!(state(&s, a), EmeEntryState::UndoPending);
 }
 
@@ -256,19 +275,25 @@ fn a_new_stroke_closes_a_split_one() {
 }
 
 #[test]
-fn others_after_asks_for_confirmation() {
+fn others_edited_asks_for_confirmation() {
     let mut s = EmeUndoStack::new();
     let a = committed_stroke(&mut s, 1);
     s.undo().unwrap();
     let r = one_request(&mut s);
-    let mut warn = err("others_after");
-    warn.rows = Some(vec![serde_json::json!({"guid": 815, "name": "Zara"})]);
     s.drain_events();
-    s.on_reply(r.ticket, &warn);
+    s.on_reply(
+        r.ticket,
+        &err("others_edited")
+            .with("others", ["Geoff"])
+            .with("count", 3),
+    );
     let EmeEntryState::NeedsConfirm(others) = state(&s, a) else {
         panic!()
     };
-    assert_eq!(others[0].name, "Zara");
+    assert_eq!(
+        (others.others.clone(), others.count),
+        (vec!["Geoff".to_owned()], 3)
+    );
     assert!(matches!(
         &s.drain_events()[..],
         [EmeEvent::UndoNeedsConfirm { .. }]
@@ -279,13 +304,7 @@ fn others_after_asks_for_confirmation() {
     // Undo anyway → force.
     s.confirm_undo(a).unwrap();
     let r = one_request(&mut s);
-    assert_eq!(
-        r.request,
-        EmeServiceRequest::Undo {
-            stroke: 1,
-            force: true
-        }
-    );
+    assert_eq!(r.request, voxel_undo(1, true));
     s.on_reply(r.ticket, &ok());
     assert_eq!(state(&s, a), EmeEntryState::Undone);
 }
@@ -296,7 +315,7 @@ fn declining_the_confirmation_keeps_the_stroke() {
     let a = committed_stroke(&mut s, 1);
     s.undo().unwrap();
     let r = one_request(&mut s);
-    s.on_reply(r.ticket, &err("others_after"));
+    s.on_reply(r.ticket, &err("others_edited"));
     s.cancel_confirm(a).unwrap();
     assert_eq!(state(&s, a), EmeEntryState::Applied);
     assert_eq!(s.confirm_undo(a), Err(EmeUndoError::InvalidEntry));
@@ -347,7 +366,7 @@ fn a_failed_undo_of_a_doomed_entry_keeps_it() {
     s.undo().unwrap();
     let ra = one_request(&mut s);
     committed_stroke(&mut s, 2);
-    s.on_reply(ra.ticket, &err("busy"));
+    s.on_reply(ra.ticket, &err("rate"));
     assert_eq!(
         state(&s, a),
         EmeEntryState::Applied,
@@ -356,14 +375,10 @@ fn a_failed_undo_of_a_doomed_entry_keeps_it() {
 }
 
 #[test]
-fn overlay_batches_join_one_entry() {
+fn overlay_batches_join_one_entry_and_undo_by_layer() {
     let mut s = EmeUndoStack::new();
-    let backend = EmeUndoBackend::Overlay {
-        layer: EmeOverlayLayer::Liquid,
-        stroke: 9,
-    };
-    let a = s.push_committing(0, "water", backend);
-    assert_eq!(s.push_committing(5, "water", backend), a);
+    let a = s.push_overlay(0, "water", EmeOverlayLayer::Liquid, 9);
+    assert_eq!(s.push_overlay(5, "water", EmeOverlayLayer::Liquid, 9), a);
     assert!(s.on_commit_reply(a, &ok()));
     assert_eq!(state(&s, a), EmeEntryState::Committing);
     assert!(s.on_commit_reply(a, &err("range")));
@@ -373,66 +388,180 @@ fn overlay_batches_join_one_entry() {
     let r = one_request(&mut s);
     assert_eq!(
         r.request,
-        EmeServiceRequest::OvUndo {
-            layer: EmeOverlayLayer::Liquid,
-            stroke: 9,
-            force: false
-        }
+        EmeServiceRequest::Undo(EmeUndoArgs {
+            stroke: Some(9),
+            layer: Some(EmeLayer::Liquid),
+            ..Default::default()
+        })
     );
     s.on_reply(r.ticket, &ok());
     s.redo().unwrap();
     assert_eq!(
         one_request(&mut s).request,
-        EmeServiceRequest::OvRedo {
-            layer: EmeOverlayLayer::Liquid,
-            stroke: 9
-        }
+        EmeServiceRequest::Redo(EmeUndoArgs {
+            stroke: Some(9),
+            layer: Some(EmeLayer::Liquid),
+            ..Default::default()
+        })
     );
 }
 
+fn spawn(tx: u32) -> EmeServiceRequest {
+    EmeServiceRequest::ObjSpawn(EmeObjSpawn {
+        kind: EmeObjectKind::Go,
+        entry: 2910,
+        map: 0,
+        x: 1.0,
+        y: 2.0,
+        z: 3.0,
+        o: 0.5,
+        scale: 1.0,
+        tx: EmeTxId(tx),
+    })
+}
+
+fn row(guid: u32) -> EmeObjectRow {
+    EmeObjectRow {
+        guid,
+        kind: EmeObjectKind::Go,
+        entry: 2910,
+        name: None,
+        map: 0,
+        x: 1.0,
+        y: 2.0,
+        z: 3.0,
+        o: 0.5,
+        scale: 1.0,
+        owner: None,
+        tx: None,
+    }
+}
+
 #[test]
-fn object_entries_undo_by_transaction() {
+fn one_shared_ctrl_z_across_terrain_and_objects() {
     let mut s = EmeUndoStack::new();
     let terrain = committed_stroke(&mut s, 1);
-    let obj = s.push_committing(
-        0,
-        "objects",
-        EmeUndoBackend::Object {
-            tx: EmeTxId(7),
-            action: EmeObjectAction::Move,
-        },
-    );
-    s.on_commit_reply(obj, &ok());
-    // One shared Ctrl+Z: newest first, across backends.
+    let tx = s.alloc_tx();
+    let obj = s.push_object(0, "objects", spawn(tx.0)).unwrap();
+    s.on_commit_reply(obj, &ok().with("row", row(123)).with("tx", tx));
+    assert_eq!(s.get(obj).unwrap().object_guid(), Some(123));
     s.undo().unwrap();
     assert_eq!(
         one_request(&mut s).request,
-        EmeServiceRequest::ObjUndo { tx: EmeTxId(7) }
+        EmeServiceRequest::ObjUndo { tx, actor: None }
     );
     s.undo().unwrap();
-    assert_eq!(
-        one_request(&mut s).request,
-        EmeServiceRequest::Undo {
-            stroke: 1,
-            force: false
-        }
-    );
+    assert_eq!(one_request(&mut s).request, voxel_undo(1, false));
     assert_eq!(state(&s, terrain), EmeEntryState::UndoPending);
 }
 
 #[test]
-fn a_refused_object_commit_is_discarded() {
+fn object_redo_reissues_the_op_and_follows_new_guids() {
     let mut s = EmeUndoStack::new();
-    let obj = s.push_committing(
-        0,
-        "objects",
+    // Spawn G123, then move it.
+    let tx1 = s.alloc_tx();
+    let sp = s.push_object(0, "objects", spawn(tx1.0)).unwrap();
+    s.on_commit_reply(sp, &ok().with("row", row(123)));
+    let tx2 = s.alloc_tx();
+    let mv_req = EmeServiceRequest::ObjMove(EmeObjMove {
+        kind: EmeObjectKind::Go,
+        guid: 123,
+        x: 5.0,
+        y: 5.0,
+        z: 5.0,
+        o: 1.0,
+        scale: 2.0,
+        tx: tx2,
+    });
+    let mv = s.push_object(0, "objects", mv_req).unwrap();
+    s.on_commit_reply(mv, &ok().with("row", row(123)));
+
+    // Undo both (move back, then the spawn deletes it).
+    for _ in 0..2 {
+        s.undo().unwrap();
+        let r = one_request(&mut s);
+        s.on_reply(r.ticket, &ok().with("row", Option::<EmeObjectRow>::None));
+    }
+    // Redo the spawn: the original op again with a fresh tx; the server makes G200.
+    s.redo().unwrap();
+    let r = one_request(&mut s);
+    let EmeServiceRequest::ObjSpawn(again) = &r.request else {
+        panic!("{r:?}")
+    };
+    assert_ne!(again.tx, tx1, "fresh tx");
+    let fresh = again.tx;
+    s.on_reply(r.ticket, &ok().with("row", row(200)).with("tx", fresh));
+    assert_eq!(
+        s.get(sp).unwrap().meta().backend,
         EmeUndoBackend::Object {
-            tx: EmeTxId(1),
-            action: EmeObjectAction::Spawn,
-        },
+            tx: fresh,
+            action: EmeObjectAction::Spawn
+        }
     );
-    s.on_commit_reply(obj, &err("denied"));
+    // Redo the move: it now names G200, not the dead G123.
+    s.redo().unwrap();
+    let r = one_request(&mut s);
+    let EmeServiceRequest::ObjMove(m) = &r.request else {
+        panic!("{r:?}")
+    };
+    assert_eq!((m.guid, m.scale), (200, 2.0));
+    assert_ne!(m.tx, tx2);
+    // And a later undo of the spawn uses the fresh tx.
+    s.on_reply(r.ticket, &ok().with("row", row(200)));
+    s.undo().unwrap();
+    s.drain_requests();
+    s.undo().unwrap();
+    assert_eq!(
+        one_request(&mut s).request,
+        EmeServiceRequest::ObjUndo {
+            tx: fresh,
+            actor: None
+        }
+    );
+}
+
+#[test]
+fn undo_of_a_delete_aliases_the_respawned_guid() {
+    let mut s = EmeUndoStack::new();
+    let tx = s.alloc_tx();
+    let del = s
+        .push_object(
+            0,
+            "objects",
+            EmeServiceRequest::ObjDelete {
+                kind: EmeObjectKind::Go,
+                guid: 123,
+                tx,
+            },
+        )
+        .unwrap();
+    s.on_commit_reply(del, &ok().with("row", row(123)));
+    s.undo().unwrap();
+    let r = one_request(&mut s);
+    s.on_reply(r.ticket, &ok().with("row", row(124)).with("replaces", 123));
+    assert_eq!(s.resolve_guid(EmeObjectKind::Go, 123), 124);
+    assert_eq!(
+        s.resolve_guid(EmeObjectKind::Npc, 123),
+        123,
+        "kinds do not share guids"
+    );
+    s.redo().unwrap();
+    let r = one_request(&mut s);
+    assert!(
+        matches!(r.request, EmeServiceRequest::ObjDelete { guid: 124, .. }),
+        "{r:?}"
+    );
+}
+
+#[test]
+fn refused_object_commits_are_discarded() {
+    let mut s = EmeUndoStack::new();
+    let obj = s.push_object(0, "objects", spawn(1)).unwrap();
+    s.on_commit_reply(obj, &err("fief"));
     assert!(s.get(obj).is_none());
+    assert!(s
+        .push_object(0, "objects", EmeServiceRequest::Caps)
+        .is_none());
 }
 
 #[test]
@@ -473,30 +602,39 @@ fn capacity_evicts_the_oldest_settled_entries() {
     assert!(s.get(first).is_none());
 }
 
+#[test]
+fn tx_ids_are_unique_and_resumable() {
+    let mut s = EmeUndoStack::new().with_tx_start(8812);
+    assert_eq!(s.alloc_tx(), EmeTxId(8812));
+    assert_eq!(s.alloc_tx(), EmeTxId(8813));
+}
+
 #[derive(Default)]
 struct Recorder(Mutex<Vec<String>>);
 
 struct Hook(Arc<Recorder>);
 
+impl Hook {
+    fn log(&self, s: String) {
+        self.0 .0.lock().unwrap().push(s);
+    }
+}
+
 impl EmeHistoryHook for Hook {
     fn on_push(&self, m: &EmeUndoEntryMeta) {
-        self.0 .0.lock().unwrap().push(format!("push {}", m.id.0));
+        self.log(format!("push {}", m.id.0));
     }
     fn on_commit(&self, m: &EmeUndoEntryMeta) {
-        self.0 .0.lock().unwrap().push(format!("commit {}", m.id.0));
+        self.log(format!("commit {}", m.id.0));
     }
     fn on_undo(&self, m: &EmeUndoEntryMeta) {
-        self.0 .0.lock().unwrap().push(format!("undo {}", m.id.0));
+        self.log(format!("undo {}", m.id.0));
     }
     fn on_redo(&self, m: &EmeUndoEntryMeta) {
-        self.0 .0.lock().unwrap().push(format!("redo {}", m.id.0));
+        self.log(format!("redo {}", m.id.0));
     }
     fn on_discard(&self, m: &EmeUndoEntryMeta, r: &EmeDiscardReason) {
-        self.0
-             .0
-            .lock()
-            .unwrap()
-            .push(format!("discard {} {r:?}", m.id.0));
+        self.log(format!("discard {} {r:?}", m.id.0));
     }
 }
 

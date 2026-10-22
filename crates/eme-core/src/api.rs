@@ -9,8 +9,8 @@
 
 use crate::perm::{EmeCapability, EmePermissions};
 use crate::service::{
-    EmeActorRow, EmeRequestId, EmeServiceEnvelope, EmeServiceError, EmeServiceReply,
-    EmeServiceRequest, EME_MAX_FRAME_BYTES,
+    EmeOthersEdited, EmeRequestId, EmeServiceEnvelope, EmeServiceError, EmeServiceReply,
+    EmeServiceRequest, EME_MAX_FRAME_BYTES, EME_MAX_REQUEST_ID,
 };
 use crate::transport::EmeTransport;
 use crate::undo::EmeUndoEntryMeta;
@@ -30,6 +30,9 @@ pub enum EmeDiscardReason {
     LinkLost,
     /// The host cleared the stack.
     Cleared,
+    /// The server refused a redo for good (`err:"conflict"`: a newer stroke or a revert made it
+    /// non-redoable).
+    RedoConflict,
 }
 
 /// Something EME did. Hosts read these; EME never needs to.
@@ -55,7 +58,7 @@ pub enum EmeEvent {
         /// The entry.
         meta: EmeUndoEntryMeta,
         /// Who edited after it.
-        others: Vec<EmeActorRow>,
+        others: EmeOthersEdited,
     },
     /// An undo or redo request failed; the entry is back in its previous state.
     RequestFailed {
@@ -212,7 +215,7 @@ impl<R> EmeServiceClient<R> {
         if !transport.state().is_usable() {
             return Err(EmeSendError::LinkDown);
         }
-        let len = EmeServiceEnvelope::new(EmeRequestId(u32::MAX), request.clone())
+        let len = EmeServiceEnvelope::new(EmeRequestId(EME_MAX_REQUEST_ID), request.clone())
             .to_json()
             .len();
         if len > EME_MAX_FRAME_BYTES {

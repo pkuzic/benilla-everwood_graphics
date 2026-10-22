@@ -10,6 +10,7 @@
 
 use crate::service::{
     EmeRequestId, EmeServiceEnvelope, EmeServicePush, EmeServiceReply, EmeServiceRequest,
+    EME_MAX_REQUEST_ID,
 };
 
 /// One voxel brush application as EME emits it (the EDIT3 fields minus the op byte).
@@ -17,7 +18,7 @@ use crate::service::{
 pub struct EmeVoxelEdit {
     /// Per-sender nonce, echoed by the server's confirmation.
     pub nonce: u16,
-    /// Stroke id; 0 = no stroke (a v2 server).
+    /// Stroke id 1..=65535 (wraps 65535 → 1); 0 = "no stroke" (not undoable per stroke).
     pub stroke: u16,
     /// Map id.
     pub map: u16,
@@ -29,7 +30,8 @@ pub struct EmeVoxelEdit {
     pub mode: u8,
     /// Strength /255.
     pub strength: u8,
-    /// Mode parameter (flatten: plane offset in cm; paint: material; roughen: seed).
+    /// Mode parameter: flatten = plane offset in cm as an **i16** two's complement
+    /// (`z_plane = z + (param as i16) / 100`); paint = material id; roughen = PRNG seed; else 0.
     pub param: u16,
 }
 
@@ -41,7 +43,7 @@ pub mod mode {
     pub const BUILD: u8 = 1;
     /// Smooth (not idempotent).
     pub const SMOOTH: u8 = 2;
-    /// Pull toward a plane `z = pos.z + param / 100`.
+    /// Pull toward the plane `z = pos.z + (param as i16) / 100`.
     pub const FLATTEN: u8 = 3;
     /// Paint material `param`.
     pub const PAINT: u8 = 4;
@@ -67,6 +69,8 @@ pub enum EmeRejectReason {
     Invalid,
     /// 5: map not allowed.
     Map,
+    /// 6: the stroke id was undone / reverted, or reused after being closed: start a new stroke.
+    Stroke,
     /// Any other code.
     Other(u8),
 }
@@ -80,6 +84,7 @@ impl EmeRejectReason {
             3 => Self::Rate,
             4 => Self::Invalid,
             5 => Self::Map,
+            6 => Self::Stroke,
             c => Self::Other(c),
         }
     }
@@ -92,6 +97,7 @@ impl EmeRejectReason {
             Self::Rate => 3,
             Self::Invalid => 4,
             Self::Map => 5,
+            Self::Stroke => 6,
             Self::Other(c) => c,
         }
     }
@@ -160,19 +166,20 @@ pub trait EmeTransport {
     fn state(&self) -> EmeLink;
 }
 
-/// Allocates service request ids for a transport (wrapping, never 0).
+/// Allocates service request ids for a transport: 1..=32767, wrapping (0 is the push id).
 #[derive(Debug, Clone, Default)]
 pub struct EmeRequestIdAlloc {
-    last: u32,
+    last: u16,
 }
 
 impl EmeRequestIdAlloc {
     /// The next id.
     pub fn next_id(&mut self) -> EmeRequestId {
-        self.last = self.last.wrapping_add(1);
-        if self.last == 0 {
-            self.last = 1;
-        }
+        self.last = if self.last >= EME_MAX_REQUEST_ID {
+            1
+        } else {
+            self.last + 1
+        };
         EmeRequestId(self.last)
     }
 

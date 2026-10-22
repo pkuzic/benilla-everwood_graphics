@@ -11,9 +11,10 @@
 //! is a server row. Smooth / flatten / roughen keep the time trigger (holding them still keeps
 //! working the ground).
 
-use crate::service::EmeLimits;
 use crate::transport::{mode, EmeVoxelEdit};
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU16, Ordering};
+use std::sync::Arc;
 
 /// Coalescing parameters.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -24,7 +25,7 @@ pub struct EmeStrokeConfig {
     pub move_fraction: f32,
     /// Below this movement (fraction of radius) an idempotent brush counts as stationary.
     pub stationary_fraction: f32,
-    /// Split into a new stroke after this many edits (server `limits.stroke_edits`).
+    /// Split into a new stroke after this many edits (host policy; the contract sets no cap).
     pub max_edits: Option<u32>,
 }
 
@@ -36,18 +37,6 @@ impl Default for EmeStrokeConfig {
             stationary_fraction: 0.05,
             max_edits: None,
         }
-    }
-}
-
-impl EmeStrokeConfig {
-    /// The defaults tightened by the server's `caps.limits`.
-    pub fn from_limits(limits: &EmeLimits) -> Self {
-        let mut c = Self::default();
-        if let Some(rate) = limits.edit_rate.filter(|r| *r > 0.0) {
-            c.min_interval_ms = c.min_interval_ms.max((1000.0 / rate).ceil() as u64);
-        }
-        c.max_edits = limits.stroke_edits.filter(|n| *n > 0);
-        c
     }
 }
 
@@ -87,11 +76,47 @@ struct Active {
     pending: Option<EmeBrushSample>,
 }
 
+/// The character's stroke-id counter, shared by every tool that opens strokes (voxel brushes and
+/// overlay tools number strokes from one sequence, CONTRACT §9.4). Ids run 1..=65535 and wrap to 1
+/// (0 = "no stroke"). Cloning shares the counter.
+#[derive(Debug, Clone)]
+pub struct EmeStrokeIds(Arc<AtomicU16>);
+
+impl Default for EmeStrokeIds {
+    fn default() -> Self {
+        Self::starting_at(1)
+    }
+}
+
+impl EmeStrokeIds {
+    /// A counter whose next id is `next` (0 is taken as 1). After a relog, seed it past the newest
+    /// own stroke the server knows (`strokes` with scope `mine`), or the server answers `R 6`.
+    pub fn starting_at(next: u16) -> Self {
+        Self(Arc::new(AtomicU16::new(next.max(1))))
+    }
+
+    /// Take the next id.
+    pub fn next_id(&self) -> u16 {
+        let prev = self
+            .0
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |s| {
+                Some(if s == u16::MAX { 1 } else { s + 1 })
+            })
+            .expect("closure always returns Some");
+        prev.max(1)
+    }
+
+    /// The id the next call returns.
+    pub fn peek(&self) -> u16 {
+        self.0.load(Ordering::Relaxed).max(1)
+    }
+}
+
 /// Coalesces a held brush into strokes of rate-limited edits.
 #[derive(Debug, Clone)]
 pub struct EmeStrokeBuilder {
     config: EmeStrokeConfig,
-    next_stroke: u16,
+    ids: EmeStrokeIds,
     next_nonce: u16,
     last_sent_ms: Option<u64>,
     active: Option<Active>,
@@ -106,11 +131,11 @@ impl Default for EmeStrokeBuilder {
 }
 
 impl EmeStrokeBuilder {
-    /// A builder with `config`; stroke ids start at 1, nonces at 0.
+    /// A builder with `config` and its own stroke-id counter (starting at 1); nonces start at 0.
     pub fn new(config: EmeStrokeConfig) -> Self {
         Self {
             config,
-            next_stroke: 1,
+            ids: EmeStrokeIds::default(),
             next_nonce: 0,
             last_sent_ms: None,
             active: None,
@@ -121,8 +146,14 @@ impl EmeStrokeBuilder {
     /// Continue numbering after a previous session's ids (stroke ids are per character on the
     /// server, so a client that knows its last stroke id resumes after it).
     pub fn with_start(mut self, next_stroke: u16, next_nonce: u16) -> Self {
-        self.next_stroke = if next_stroke == 0 { 1 } else { next_stroke };
+        self.ids = EmeStrokeIds::starting_at(next_stroke);
         self.next_nonce = next_nonce;
+        self
+    }
+
+    /// Share a stroke-id counter with other tools.
+    pub fn with_ids(mut self, ids: EmeStrokeIds) -> Self {
+        self.ids = ids;
         self
     }
 
@@ -147,12 +178,7 @@ impl EmeStrokeBuilder {
     }
 
     fn alloc_stroke(&mut self) -> u16 {
-        let s = self.next_stroke;
-        self.next_stroke = self.next_stroke.wrapping_add(1);
-        if self.next_stroke == 0 {
-            self.next_stroke = 1;
-        }
-        s
+        self.ids.next_id()
     }
 
     fn alloc_nonce(&mut self) -> u16 {

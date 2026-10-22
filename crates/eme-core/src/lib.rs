@@ -45,7 +45,7 @@ pub use service::{
     EmeCaps, EmeDownlink, EmeRequestId, EmeServiceEnvelope, EmeServiceError, EmeServicePush,
     EmeServiceReply, EmeServiceRequest, EmeTxId,
 };
-pub use stroke::{EmeBrushSample, EmeStrokeBuilder, EmeStrokeConfig, EmeStrokeEnd};
+pub use stroke::{EmeBrushSample, EmeStrokeBuilder, EmeStrokeConfig, EmeStrokeEnd, EmeStrokeIds};
 pub use tool::{
     EmeInputCtx, EmeOptionField, EmeOptionKind, EmeOptionValue, EmeOptions, EmePreview, EmeTool,
     EmeToolId, EmeToolRegistry,

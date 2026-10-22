@@ -1,4 +1,4 @@
-//! Tools, registry, permission gating and the dispatcher end to end over the loopback transport.
+//! Tools, reg        .map(|i| EmeAreaCell { ax: i, ay: i, area_id: 1519 })stry, permission gating and the dispatcher end to end over the loopback transport.
 
 use eme_core::api::{EmeEvent, EmeSendError, EmeServiceClient};
 use eme_core::bus::{EmeDispatcher, EmeRoute};
@@ -146,8 +146,11 @@ fn caps(rank: u8, tools: &[&str]) -> EmeCaps {
     EmeCaps {
         rank: EmeRank(rank),
         tools: tools.iter().map(|s| s.to_string()).collect(),
+        wire: 3,
+        perms: Vec::new(),
+        enforced: false,
+        enforced_layers: Vec::new(),
         limits: EmeLimits::default(),
-        enforced: EmeEnforced::default(),
     }
 }
 
@@ -243,10 +246,10 @@ fn service_client_gates_sizes_and_times_out() {
         c.send(
             &mut t,
             0,
-            EmeServiceRequest::Undo {
-                stroke: 1,
-                force: false
-            },
+            EmeServiceRequest::Undo(EmeUndoArgs {
+                stroke: Some(1),
+                ..Default::default()
+            }),
             3
         ),
         Err(EmeSendError::NotPermitted(EmeCapability::Edit))
@@ -263,8 +266,8 @@ fn service_client_gates_sizes_and_times_out() {
     c.set_permissions(perms(3));
     let cells = (0..200)
         .map(|i| EmeAreaCell {
-            cx: i,
-            cy: i,
+            ax: i,
+            ay: i,
             area_id: 1519,
         })
         .collect();
@@ -401,10 +404,11 @@ fn a_held_brush_becomes_one_undoable_stroke() {
     ));
     assert_eq!(
         w.t.sent_services.last().unwrap().1,
-        EmeServiceRequest::Undo {
-            stroke,
-            force: false
-        }
+        EmeServiceRequest::Undo(EmeUndoArgs {
+            stroke: Some(stroke),
+            layer: Some(EmeLayer::Voxel),
+            ..Default::default()
+        })
     );
     w.answer_services(|_| None);
     w.disp.pump(t + 600, &mut w.t);
@@ -442,7 +446,10 @@ fn rank_2_is_read_only_at_the_bus() {
             mark: EmeStrokeMark::End { trailing: false },
         },
     );
-    sink.push(EmeCommand::Object(EmeObjectRequest::Delete { guid: 5 }));
+    sink.push(EmeCommand::Object(EmeObjectRequest::Delete {
+        kind: EmeObjectKind::Npc,
+        guid: 5,
+    }));
     sink.push(EmeCommand::Service(EmeServiceRequest::Log(
         EmeLogQuery::default(),
     )));
@@ -496,15 +503,19 @@ fn objects_get_transaction_ids_and_one_shared_ctrl_z() {
     let spawn = EmeObjSpawn {
         kind: EmeObjectKind::Go,
         entry: 180000,
-        pos: [1.0, 2.0, 3.0],
-        ori: 0.0,
-        pitch: 0.0,
-        roll: 0.0,
+        map: 0,
+        x: 1.0,
+        y: 2.0,
+        z: 3.0,
+        o: 0.0,
         scale: 1.0,
         tx: EmeTxId(0),
     };
     sink.push(EmeCommand::Object(EmeObjectRequest::Spawn(spawn)));
-    sink.push(EmeCommand::Object(EmeObjectRequest::Delete { guid: 77 }));
+    sink.push(EmeCommand::Object(EmeObjectRequest::Delete {
+        kind: EmeObjectKind::Go,
+        guid: 77,
+    }));
     w.disp.dispatch(0, &mut w.t, &mut sink);
     let txs: Vec<EmeTxId> =
         w.t.sent_services
@@ -517,14 +528,17 @@ fn objects_get_transaction_ids_and_one_shared_ctrl_z() {
             .collect();
     assert_eq!(txs, vec![EmeTxId(1), EmeTxId(2)]);
     // The delete is refused by the placement policy; the spawn lands.
-    w.answer_services(|r| matches!(r, EmeServiceRequest::ObjDelete { .. }).then_some("not_owner"));
+    w.answer_services(|r| matches!(r, EmeServiceRequest::ObjDelete { .. }).then_some("rank"));
     let out = w.disp.pump(10, &mut w.t);
     assert_eq!(out.replies.len(), 2, "tools see their commit replies");
     assert_eq!(w.disp.undo_stack().entries().len(), 1);
     w.disp.undo(20, &mut w.t).unwrap();
     assert_eq!(
         w.t.sent_services.last().unwrap().1,
-        EmeServiceRequest::ObjUndo { tx: EmeTxId(1) }
+        EmeServiceRequest::ObjUndo {
+            tx: EmeTxId(1),
+            actor: None
+        }
     );
 }
 
@@ -541,11 +555,12 @@ fn link_loss_fails_requests_and_settles_history() {
             kind: EmeLiquidKind::Water,
             level: 5.0,
             flags: 0,
-            depth_fade: 0,
+            fade: 0,
         }],
     }));
     sink.push(EmeCommand::Service(EmeServiceRequest::SnapshotList {
         radius: None,
+        limit: None,
     }));
     w.disp.dispatch(0, &mut w.t, &mut sink);
     assert_eq!(w.disp.undo_stack().entries().len(), 1);
@@ -565,6 +580,7 @@ fn link_loss_fails_requests_and_settles_history() {
     let mut sink = EmeCommandSink::new();
     sink.push(EmeCommand::Service(EmeServiceRequest::SnapshotList {
         radius: None,
+        limit: None,
     }));
     let errs = w.disp.dispatch(20, &mut w.t, &mut sink);
     assert_eq!(errs[0].error, EmeSendError::LinkDown);
@@ -578,8 +594,8 @@ fn queued_undo_goes_out_when_the_commit_reply_arrives() {
         map: 1,
         stroke: 2,
         cells: vec![EmeAreaCell {
-            cx: 0,
-            cy: 0,
+            ax: 0,
+            ay: 0,
             area_id: 12,
         }],
     }));
@@ -592,20 +608,29 @@ fn queued_undo_goes_out_when_the_commit_reply_arrives() {
     w.disp.pump(10, &mut w.t);
     assert_eq!(
         w.t.sent_services.last().unwrap().1,
-        EmeServiceRequest::OvUndo {
-            layer: EmeOverlayLayer::Area,
-            stroke: 2,
-            force: false
-        }
+        EmeServiceRequest::Undo(EmeUndoArgs {
+            stroke: Some(2),
+            layer: Some(EmeLayer::Area),
+            ..Default::default()
+        })
     );
 }
 
 #[test]
 fn pushes_reach_the_host_and_caps_pushes_update_permissions() {
     let mut w = World::new(3);
-    w.t.deliver(EmeInbound::Push(EmeServicePush::Caps(caps(2, &["log"]))));
+    let sent = w.t.sent_services.len();
+    w.t.deliver(EmeInbound::Push(EmeServicePush::CapsChanged {
+        rank: EmeRank(2),
+    }));
     let out = w.disp.pump(0, &mut w.t);
     assert_eq!(out.pushes.len(), 1);
+    assert_eq!(w.t.sent_services.len(), sent + 1, "caps re-requested");
+    assert_eq!(w.t.sent_services.last().unwrap().1, EmeServiceRequest::Caps);
+    assert_eq!(w.disp.caps().unwrap().rank, EmeRank(2));
+    w.t.deliver(EmeInbound::Push(EmeServicePush::Enforce { enforced: true }));
+    w.disp.pump(1, &mut w.t);
+    assert!(w.disp.caps().unwrap().enforced);
     assert_eq!(w.disp.permissions().rank(), EmeRank(2));
     assert!(!w.disp.permissions().has(EmeCapability::Edit));
 }

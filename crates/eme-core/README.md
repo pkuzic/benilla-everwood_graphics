@@ -12,7 +12,7 @@ included), unit-tested with fixtures. Licence: MIT OR Apache-2.0, like the rest 
 | `undo` | `EmeUndoStack`: one Ctrl+Z for terrain strokes, overlay strokes and object transactions |
 | `stroke` | `EmeStrokeBuilder`: a held brush → one stroke id of ≤ 8 edits/s, each with a nonce |
 | `transport` | `EmeTransport` trait, `EmeVoxelEdit`, `EmeInbound`, `EmeLoopbackTransport` for tests |
-| `service` | the `.mveme` JSON: requests, replies, pushes, typed rows (`caps`, `log`, `strokes`, …) |
+| `service` | the `.mveme` JSON exactly as CONTRACT v3 §12–§13 (`voxel-v2/CONTRACT.md`): requests, replies, pushes, typed results |
 | `perm` | rank → capability: 2 read-only, 3 mutate, 4 revert others |
 | `api` | the public integration surface: `EmeEvent(s)`, `EmeHistoryHook`, `EmeServiceClient` |
 
@@ -42,7 +42,9 @@ the area afterwards). See the `undo` module docs for the full machine.
      touch the network, the voxel journal or the UI toolkit; tools never reference each other.
      A brush tool owns an `EmeStrokeBuilder` and emits `EmeCommand::VoxelStroke` with the
      builder's edits; on release it sends `EmeStrokeMark::End { trailing }` and keeps calling
-     `builder.tick(now)` on later frames so a rate-limited release edit still goes out.
+     `builder.tick(now)` on later frames so a rate-limited release edit still goes out. Every tool that
+     opens strokes (brushes and overlay tools alike) takes its stroke ids from one shared
+     `EmeStrokeIds` counter, since the server numbers a character's strokes in one sequence.
    - `options_ui_model()` / `set_option()` — declarative option fields; the UI renders them.
    - `preview(ctx)` — a ring, plane, outline or cell tint for the viewport to draw.
 2. One registration line: `app.register_eme_tool(MyTool::new())` (the Bevy plugin forwards to
@@ -64,5 +66,5 @@ stack; hooks see server-confirmed transitions only (push, commit, undo, redo, di
 ## Tests
 
 `cargo test -p eme-core`. Example wire frames live in `tests/fixtures/` (`requests.json`,
-`replies.json`, `pushes.json` round-trip canonically; `replies_lua.json` holds the shapes a Lua
+`replies.json`, `pushes.json` are the CONTRACT v3 examples, round-tripped; `replies_lua.json` holds the shapes a Lua
 JSON encoder emits — `{}` for an empty list, `0`/`1` for flags — which the types accept).

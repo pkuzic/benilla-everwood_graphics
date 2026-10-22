@@ -11,13 +11,13 @@
 use crate::api::{EmeEvent, EmeEvents, EmeSendError, EmeServiceClient};
 use crate::command::{EmeCommand, EmeCommandSink, EmeObjectRequest, EmeStrokeMark};
 use crate::perm::{EmeCapability, EmePermissions};
-use crate::service::{EmeCaps, EmeServicePush, EmeServiceReply, EmeServiceRequest, EmeTxId};
+use crate::service::{
+    EmeCaps, EmeRequestId, EmeServiceEnvelope, EmeServicePush, EmeServiceReply, EmeServiceRequest,
+    EME_MAX_FRAME_BYTES, EME_MAX_REQUEST_ID,
+};
 use crate::tool::EmeToolId;
 use crate::transport::{EmeInbound, EmeLink, EmeTransport};
-use crate::undo::{
-    EmeEntryId, EmeHistoryTicket, EmeObjectAction, EmeUndoBackend, EmeUndoError, EmeUndoStack,
-    EmeUndoStarted,
-};
+use crate::undo::{EmeEntryId, EmeHistoryTicket, EmeUndoError, EmeUndoStack, EmeUndoStarted};
 
 /// Where a service reply goes.
 #[derive(Debug, Clone, PartialEq)]
@@ -70,7 +70,6 @@ pub struct EmeDispatcher {
     client: EmeServiceClient<EmeRoute>,
     caps: Option<EmeCaps>,
     events: EmeEvents,
-    next_tx: u32,
 }
 
 /// Default service request timeout, ms.
@@ -90,7 +89,6 @@ impl EmeDispatcher {
             client: EmeServiceClient::new(timeout_ms),
             caps: None,
             events: EmeEvents::default(),
-            next_tx: 1,
         }
     }
 
@@ -162,12 +160,6 @@ impl EmeDispatcher {
             .map(|_| ())
     }
 
-    fn alloc_tx(&mut self) -> EmeTxId {
-        let tx = EmeTxId(self.next_tx);
-        self.next_tx = self.next_tx.wrapping_add(1).max(1);
-        tx
-    }
-
     /// Route every command in `sink`. Commands the caller may not issue, or that cannot be sent,
     /// are dropped and reported.
     pub fn dispatch(
@@ -211,31 +203,49 @@ impl EmeDispatcher {
                     }
                 }
                 EmeCommand::Overlay(edit) => {
-                    let backend = EmeUndoBackend::Overlay {
-                        layer: edit.layer(),
-                        stroke: edit.stroke(),
-                    };
+                    if !link_ok {
+                        errors.push(EmeDispatchError {
+                            origin,
+                            error: EmeSendError::LinkDown,
+                        });
+                        continue;
+                    }
+                    let (layer, stroke) = (edit.layer(), edit.stroke());
                     let request = EmeServiceRequest::OvEdit(edit);
-                    self.send_commit(now_ms, transport, origin, backend, request, &mut errors);
+                    if let Err(error) = Self::check_size(&request) {
+                        errors.push(EmeDispatchError { origin, error });
+                        continue;
+                    }
+                    let entry = self.undo.push_overlay(now_ms, tool, layer, stroke);
+                    self.send_commit(now_ms, transport, origin, entry, request, &mut errors);
                 }
                 EmeCommand::Object(obj) => {
-                    let tx = self.alloc_tx();
-                    let (action, request) = match obj {
+                    if !link_ok {
+                        errors.push(EmeDispatchError {
+                            origin,
+                            error: EmeSendError::LinkDown,
+                        });
+                        continue;
+                    }
+                    let tx = self.undo.alloc_tx();
+                    let request = match obj {
                         EmeObjectRequest::Spawn(mut s) => {
                             s.tx = tx;
-                            (EmeObjectAction::Spawn, EmeServiceRequest::ObjSpawn(s))
+                            EmeServiceRequest::ObjSpawn(s)
                         }
                         EmeObjectRequest::Move(mut m) => {
                             m.tx = tx;
-                            (EmeObjectAction::Move, EmeServiceRequest::ObjMove(m))
+                            EmeServiceRequest::ObjMove(m)
                         }
-                        EmeObjectRequest::Delete { guid } => (
-                            EmeObjectAction::Delete,
-                            EmeServiceRequest::ObjDelete { guid, tx },
-                        ),
+                        EmeObjectRequest::Delete { kind, guid } => {
+                            EmeServiceRequest::ObjDelete { kind, guid, tx }
+                        }
                     };
-                    let backend = EmeUndoBackend::Object { tx, action };
-                    self.send_commit(now_ms, transport, origin, backend, request, &mut errors);
+                    let entry = self
+                        .undo
+                        .push_object(now_ms, tool, request.clone())
+                        .expect("object mutation");
+                    self.send_commit(now_ms, transport, origin, entry, request, &mut errors);
                 }
                 EmeCommand::Service(request) => {
                     if let Err(error) =
@@ -251,33 +261,31 @@ impl EmeDispatcher {
         errors
     }
 
+    fn check_size(request: &EmeServiceRequest) -> Result<(), EmeSendError> {
+        let len = EmeServiceEnvelope::new(EmeRequestId(EME_MAX_REQUEST_ID), request.clone())
+            .to_json()
+            .len();
+        if len > EME_MAX_FRAME_BYTES {
+            return Err(EmeSendError::TooLarge(len));
+        }
+        Ok(())
+    }
+
     fn send_commit(
         &mut self,
         now_ms: u64,
         transport: &mut dyn EmeTransport,
         origin: Option<EmeToolId>,
-        backend: EmeUndoBackend,
+        entry: EmeEntryId,
         request: EmeServiceRequest,
         errors: &mut Vec<EmeDispatchError>,
     ) {
-        // Check first so a refused send never leaves a phantom history entry.
-        if !transport.state().is_usable() {
-            errors.push(EmeDispatchError {
-                origin,
-                error: EmeSendError::LinkDown,
-            });
-            return;
-        }
-        let tool = origin.map_or("host", |t| t.as_str());
-        let entry = self.undo.push_committing(now_ms, tool, backend);
         if let Err(error) =
             self.client
                 .send(transport, now_ms, request, EmeRoute::Commit(entry, origin))
         {
-            self.undo.on_commit_reply(
-                entry,
-                &EmeServiceReply::error(crate::service::EmeRequestId(0), error_code(&error)),
-            );
+            let reply = EmeServiceReply::error(EmeRequestId::PUSH, error_code(&error));
+            self.undo.on_commit_reply(entry, &reply);
             errors.push(EmeDispatchError { origin, error });
         }
     }
@@ -289,8 +297,7 @@ impl EmeDispatcher {
                 self.client
                     .send(transport, now_ms, r.request, EmeRoute::History(r.ticket))
             {
-                let reply =
-                    EmeServiceReply::error(crate::service::EmeRequestId(0), error_code(&error));
+                let reply = EmeServiceReply::error(EmeRequestId::PUSH, error_code(&error));
                 self.undo.on_reply(r.ticket, &reply);
             }
         }
@@ -339,6 +346,7 @@ impl EmeDispatcher {
     /// Drain the transport and route everything; expire timed-out requests.
     pub fn pump(&mut self, now_ms: u64, transport: &mut dyn EmeTransport) -> EmePumpOutput {
         let mut out = EmePumpOutput::default();
+        let mut refresh_caps = false;
         for inbound in transport.poll() {
             match inbound {
                 EmeInbound::EditConfirmed { nonce, seq, .. } => {
@@ -353,8 +361,22 @@ impl EmeDispatcher {
                     }
                 }
                 EmeInbound::Push(push) => {
-                    if let EmeServicePush::Caps(caps) = &push {
-                        self.set_caps(caps.clone());
+                    match &push {
+                        EmeServicePush::CapsChanged { rank } => {
+                            // Rank changed: act on the new rank at once, then refresh the caps.
+                            self.client
+                                .set_permissions(EmePermissions::from_rank(*rank));
+                            if let Some(c) = self.caps.as_mut() {
+                                c.rank = *rank;
+                            }
+                            refresh_caps = true;
+                        }
+                        EmeServicePush::Enforce { enforced } => {
+                            if let Some(c) = self.caps.as_mut() {
+                                c.enforced = *enforced;
+                            }
+                        }
+                        EmeServicePush::Obj { .. } => {}
                     }
                     out.pushes.push(push);
                 }
@@ -371,6 +393,10 @@ impl EmeDispatcher {
         }
         for done in self.client.expire(now_ms) {
             self.route(done.route, done.op, done.reply, &mut out);
+        }
+        if refresh_caps && transport.state().is_usable() {
+            // Best effort: a failure surfaces as the stale caps the host already holds.
+            let _ = self.request_caps(now_ms, transport);
         }
         // A commit that just settled may have released a queued undo.
         self.flush_history(now_ms, transport);

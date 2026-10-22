@@ -1,16 +1,19 @@
-//! `EmeUndoStack`: EME's one shared Ctrl+Z under server authority (DESIGN-EME §3.2, §3.3).
+//! `EmeUndoStack`: EME's one shared Ctrl+Z under server authority (DESIGN-EME §3.2–§3.3,
+//! CONTRACT v3 §10, §13).
 //!
-//! The server owns the truth. Undo is not an inverse edit: it is a **request** (`undo`, `ov_undo`,
-//! `obj_undo`) that reverts an entry's rows server-side; redo un-reverts them. So every entry moves
-//! through server-confirmed states:
+//! The server owns the truth. Undo is not an inverse edit: it is a **request** that reverts an
+//! entry's rows server-side (`undo` for voxel and overlay strokes, `obj_undo` for an object
+//! transaction); redo un-reverts them (`redo`), or for objects re-issues the original op with a
+//! fresh transaction id. So every entry moves through server-confirmed states:
 //!
 //! ```text
-//!   Open ──close──► Committing ──all confirmed / commit ok──► Applied ◄──────────────┐
-//!                       │ every edit rejected / commit failed → discarded              │
-//!   Applied ──undo()──► UndoPending ──ok──► Undone ──redo()──► RedoPending ──ok──────┘
-//!                         │ others_after → NeedsConfirm ──confirm_undo()──► UndoPending
-//!                         │ error        → Applied (RequestFailed event)
-//!                                           Undone ◄── error ── RedoPending
+//!   Open ──close──► Committing ──all confirmed / commit ok──► Applied ◄───────────────┐
+//!                       │ every edit rejected / commit failed → discarded               │
+//!   Applied ──undo()──► UndoPending ──ok──► Undone ──redo()──► RedoPending ──ok───────┘
+//!                         │ others_edited → NeedsConfirm ──confirm_undo()──► UndoPending
+//!                         │ other error   → Applied (RequestFailed event)
+//!                                            Undone ◄── error ── RedoPending
+//!                                            discarded ◄── conflict ──┘ (no longer redoable)
 //! ```
 //!
 //! - **Targets.** Ctrl+Z acts on the NEWEST entry that is not already undone or being undone;
@@ -20,9 +23,11 @@
 //!   (the entry has since moved on, e.g. after a link loss) is ignored.
 //! - **Not yet committed.** Undo of an entry still `Committing` is queued and sent the moment the
 //!   server confirms its work. An `Open` stroke (brush held) cannot be undone.
-//! - **New work clears redo.** Pushing a new entry discards every `Undone` entry; one whose undo is
-//!   still in flight is discarded when it settles.
-//! - The stack is session-local; durable history is server-side (logs, `strokes`).
+//! - **New work clears redo** (the server sets `redo_ok = 0` too): pushing a new entry discards
+//!   every `Undone` entry; one whose undo is still in flight is discarded when it settles.
+//! - **Objects.** An object undo that re-spawns a deleted object gets a NEW guid; the stack keeps a
+//!   guid alias table so later redo requests name the live object.
+//! - The stack is session-local; durable history is server-side (`strokes`, `log`).
 //!
 //! The stack never touches the network: it queues [`EmeHistoryRequest`]s
 //! ([`EmeUndoStack::drain_requests`]) which the host sends (usually through
@@ -30,7 +35,8 @@
 
 use crate::api::{EmeDiscardReason, EmeEvent, EmeEvents, EmeHistoryHook};
 use crate::service::{
-    EmeActorRow, EmeOverlayLayer, EmeServiceError, EmeServiceReply, EmeServiceRequest, EmeTxId,
+    EmeLayer, EmeObjectAction, EmeObjectKind, EmeObjectResult, EmeOthersEdited, EmeOverlayLayer,
+    EmeServiceError, EmeServiceReply, EmeServiceRequest, EmeTxId, EmeUndoArgs, EmeUndoResult,
 };
 use crate::transport::EmeRejectReason;
 use std::collections::HashMap;
@@ -39,35 +45,24 @@ use std::collections::HashMap;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct EmeEntryId(pub u64);
 
-/// What kind of object operation an object entry records.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum EmeObjectAction {
-    /// `obj_spawn`.
-    Spawn,
-    /// `obj_move`.
-    Move,
-    /// `obj_delete`.
-    Delete,
-}
-
 /// Which server backend an entry undoes through.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum EmeUndoBackend {
-    /// A voxel stroke: `undo` / `redo` by stroke id.
+    /// A voxel stroke.
     Stroke {
         /// The stroke id.
         stroke: u16,
     },
-    /// An overlay stroke: `ov_undo` / `ov_redo`.
+    /// An overlay stroke.
     Overlay {
         /// Layer.
         layer: EmeOverlayLayer,
         /// The stroke id.
         stroke: u16,
     },
-    /// An object transaction: `obj_undo` / `obj_redo`.
+    /// An object transaction (the tx changes when a redo re-issues the op).
     Object {
-        /// The transaction.
+        /// The live transaction.
         tx: EmeTxId,
         /// What it did.
         action: EmeObjectAction,
@@ -99,11 +94,20 @@ pub enum EmeEntryState {
     /// An undo request is in flight.
     UndoPending,
     /// The server warned that others edited after this entry; waiting for the user.
-    NeedsConfirm(Vec<EmeActorRow>),
+    NeedsConfirm(EmeOthersEdited),
     /// Reverted on the server.
     Undone,
     /// A redo request is in flight.
     RedoPending,
+}
+
+/// The original op of an object entry, kept so a redo can re-issue it.
+#[derive(Debug, Clone, PartialEq)]
+struct ObjectOp {
+    request: EmeServiceRequest,
+    kind: EmeObjectKind,
+    /// The object the entry is about (learned from the reply for a spawn).
+    guid: Option<u32>,
 }
 
 /// One history entry.
@@ -118,6 +122,8 @@ pub struct EmeUndoEntry {
     rejected: u32,
     first_seq: Option<u32>,
     last_seq: Option<u32>,
+    sid: Option<u32>,
+    object: Option<ObjectOp>,
     awaiting_trailing: bool,
     undo_queued: bool,
     drop_on_settle: bool,
@@ -134,21 +140,29 @@ impl EmeUndoEntry {
     pub fn state(&self) -> &EmeEntryState {
         &self.state
     }
-    /// Edits the server confirmed (strokes).
+    /// Edits (strokes) or batches (overlay / object) the server accepted.
     pub fn confirmed(&self) -> u32 {
         self.confirmed
     }
-    /// Edits the server rejected (strokes).
+    /// Edits or batches the server rejected.
     pub fn rejected(&self) -> u32 {
         self.rejected
     }
-    /// Edits (strokes) or batches (overlay / object) still awaiting confirmation.
+    /// Edits or batches still awaiting confirmation.
     pub fn pending(&self) -> usize {
         self.pending_nonces.len() + self.pending_commits as usize
     }
-    /// Server seq range of the confirmed edits (strokes).
+    /// Server seq range of the confirmed voxel edits.
     pub fn seq_range(&self) -> Option<(u32, u32)> {
         Some((self.first_seq?, self.last_seq?))
+    }
+    /// The server's stroke row id, once an undo reply named it.
+    pub fn sid(&self) -> Option<u32> {
+        self.sid
+    }
+    /// The object the entry is about (object entries).
+    pub fn object_guid(&self) -> Option<u32> {
+        self.object.as_ref().and_then(|o| o.guid)
     }
     /// An undo is queued until the work is confirmed.
     pub fn undo_queued(&self) -> bool {
@@ -163,7 +177,7 @@ impl EmeUndoEntry {
         self.last_reject
     }
 
-    /// Settled on the "applied" side (what Ctrl+Z may target).
+    /// On the "applied" side (what Ctrl+Z may target).
     fn on_applied_side(&self) -> bool {
         match self.state {
             EmeEntryState::Open
@@ -186,6 +200,33 @@ impl EmeUndoEntry {
             _ => false,
         }
     }
+
+    fn layer(&self) -> Option<EmeLayer> {
+        match self.meta.backend {
+            EmeUndoBackend::Stroke { .. } => Some(EmeLayer::Voxel),
+            EmeUndoBackend::Overlay { layer, .. } => Some(layer.into()),
+            EmeUndoBackend::Object { .. } => None,
+        }
+    }
+
+    fn stroke_args(&self, force: bool) -> EmeUndoArgs {
+        match (self.sid, self.meta.backend) {
+            (Some(sid), _) => EmeUndoArgs {
+                sid: Some(sid),
+                force,
+                ..Default::default()
+            },
+            (None, EmeUndoBackend::Stroke { stroke } | EmeUndoBackend::Overlay { stroke, .. }) => {
+                EmeUndoArgs {
+                    stroke: Some(stroke),
+                    layer: self.layer(),
+                    force,
+                    sid: None,
+                }
+            }
+            (None, EmeUndoBackend::Object { .. }) => EmeUndoArgs::default(),
+        }
+    }
 }
 
 /// A request the stack wants sent, and the ticket its reply must be routed back with.
@@ -205,7 +246,7 @@ pub struct EmeHistoryTicket {
     generation: u32,
 }
 
-/// What an undo / redo call did.
+/// What an undo call did.
 #[derive(Debug, Clone, PartialEq)]
 pub enum EmeUndoStarted {
     /// A request was queued for sending.
@@ -214,7 +255,7 @@ pub enum EmeUndoStarted {
     Queued(EmeEntryId),
     /// The user must confirm first (others edited afterwards); call
     /// [`EmeUndoStack::confirm_undo`] or [`EmeUndoStack::cancel_confirm`].
-    NeedsConfirmation(EmeEntryId, Vec<EmeActorRow>),
+    NeedsConfirmation(EmeEntryId, EmeOthersEdited),
 }
 
 /// Why an undo / redo did nothing.
@@ -235,8 +276,10 @@ pub const EME_UNDO_CAPACITY: usize = 200;
 pub struct EmeUndoStack {
     entries: Vec<EmeUndoEntry>,
     next_id: u64,
+    next_tx: u32,
     capacity: usize,
     nonce_owner: HashMap<u16, EmeEntryId>,
+    guid_alias: HashMap<(EmeObjectKind, u32), u32>,
     outbox: Vec<EmeHistoryRequest>,
     events: EmeEvents,
     hooks: Vec<Box<dyn EmeHistoryHook>>,
@@ -269,17 +312,33 @@ impl EmeUndoStack {
         Self {
             entries: Vec::new(),
             next_id: 1,
+            next_tx: 1,
             capacity: capacity.max(1),
             nonce_owner: HashMap::new(),
+            guid_alias: HashMap::new(),
             outbox: Vec::new(),
             events: EmeEvents::default(),
             hooks: Vec::new(),
         }
     }
 
+    /// Continue object transaction ids after `last` (tx ids are unique per character on the
+    /// server; a repeat of a processed `(character, tx)` is replayed, not applied).
+    pub fn with_tx_start(mut self, next_tx: u32) -> Self {
+        self.next_tx = next_tx.max(1);
+        self
+    }
+
     /// Register a host hook (§2.5).
     pub fn add_hook(&mut self, hook: Box<dyn EmeHistoryHook>) {
         self.hooks.push(hook);
+    }
+
+    /// A fresh object transaction id.
+    pub fn alloc_tx(&mut self) -> EmeTxId {
+        let tx = EmeTxId(self.next_tx);
+        self.next_tx = self.next_tx.checked_add(1).unwrap_or(1);
+        tx
     }
 
     /// Entries, oldest first.
@@ -305,6 +364,18 @@ impl EmeUndoStack {
     /// Whether Ctrl+Y has a target.
     pub fn can_redo(&self) -> bool {
         self.redo_target().is_some()
+    }
+
+    /// The live guid of an object the stack has seen re-spawned (follows the alias chain).
+    pub fn resolve_guid(&self, kind: EmeObjectKind, guid: u32) -> u32 {
+        let mut g = guid;
+        for _ in 0..64 {
+            match self.guid_alias.get(&(kind, g)) {
+                Some(&next) if next != g => g = next,
+                _ => break,
+            }
+        }
+        g
     }
 
     /// Requests to send, oldest first.
@@ -337,7 +408,7 @@ impl EmeUndoStack {
         backend: EmeUndoBackend,
         tool: &str,
         state: EmeEntryState,
-    ) -> EmeEntryId {
+    ) -> usize {
         self.clear_redo_branch();
         let id = EmeEntryId(self.next_id);
         self.next_id += 1;
@@ -357,6 +428,8 @@ impl EmeUndoStack {
             rejected: 0,
             first_seq: None,
             last_seq: None,
+            sid: None,
+            object: None,
             awaiting_trailing: false,
             undo_queued: false,
             drop_on_settle: false,
@@ -368,7 +441,7 @@ impl EmeUndoStack {
         }
         self.events.push(EmeEvent::EntryPushed(meta));
         self.evict();
-        id
+        self.index(id).expect("just pushed")
     }
 
     /// New work clears the redo branch: undone entries go now, in-flight undos when they settle,
@@ -418,12 +491,12 @@ impl EmeUndoStack {
         });
     }
 
-    /// A stroke edit was uplinked: records `nonce` under `stroke`, opening the stroke's entry on its
-    /// first edit. Opening a new stroke closes any other still-open stroke (a split stroke).
+    /// A stroke edit was uplinked: records `nonce` under `stroke`, opening the stroke's entry on
+    /// its first edit. Opening a new stroke closes any other still-open stroke (a split stroke).
     pub fn note_edit(&mut self, now_ms: u64, tool: &str, stroke: u16, nonce: u16) -> EmeEntryId {
         let idx = match self.stroke_entry(stroke) {
             Some(i)
-                if matches!(self.entries[i].state, EmeEntryState::Open)
+                if self.entries[i].state == EmeEntryState::Open
                     || self.entries[i].awaiting_trailing =>
             {
                 i
@@ -441,23 +514,19 @@ impl EmeUndoStack {
                 for s in open {
                     self.close_stroke(s, false);
                 }
-                let id = self.push(
+                self.push(
                     now_ms,
                     EmeUndoBackend::Stroke { stroke },
                     tool,
                     EmeEntryState::Open,
-                );
-                self.index(id).expect("just pushed")
+                )
             }
         };
         let e = &mut self.entries[idx];
         e.pending_nonces.push(nonce);
         let id = e.meta.id;
-        if e.awaiting_trailing {
-            // The trailing release edit arrived: the stroke is now fully sent.
-            e.awaiting_trailing = false;
-            self.settle_commit_if_done(idx);
-        }
+        // The trailing release edit arrived: the stroke is now fully sent.
+        e.awaiting_trailing = false;
         self.nonce_owner.insert(nonce, id);
         id
     }
@@ -476,34 +545,64 @@ impl EmeUndoStack {
         self.settle_commit_if_done(i);
     }
 
-    /// Overlay / object work was sent (the host sent `ov_edit` / `obj_*`); route its reply to
-    /// [`Self::on_commit_reply`]. A further `ov_edit` batch of the same overlay stroke, while that
-    /// stroke is still the newest entry, joins its entry instead of opening a new one.
-    pub fn push_committing(
+    /// An `ov_edit` batch was sent; route its reply to [`Self::on_commit_reply`]. A further batch of
+    /// the same overlay stroke, while that stroke is still the newest entry, joins its entry.
+    pub fn push_overlay(
         &mut self,
         now_ms: u64,
         tool: &str,
-        backend: EmeUndoBackend,
+        layer: EmeOverlayLayer,
+        stroke: u16,
     ) -> EmeEntryId {
-        if matches!(backend, EmeUndoBackend::Overlay { .. }) {
-            if let Some(last) = self.entries.last_mut() {
-                if last.meta.backend == backend
-                    && !last.undo_queued
-                    && matches!(
-                        last.state,
-                        EmeEntryState::Committing | EmeEntryState::Applied
-                    )
-                {
-                    last.state = EmeEntryState::Committing;
-                    last.pending_commits += 1;
-                    return last.meta.id;
-                }
+        let backend = EmeUndoBackend::Overlay { layer, stroke };
+        if let Some(last) = self.entries.last_mut() {
+            if last.meta.backend == backend
+                && !last.undo_queued
+                && matches!(
+                    last.state,
+                    EmeEntryState::Committing | EmeEntryState::Applied
+                )
+            {
+                last.state = EmeEntryState::Committing;
+                last.pending_commits += 1;
+                return last.meta.id;
             }
         }
-        let id = self.push(now_ms, backend, tool, EmeEntryState::Committing);
-        let i = self.index(id).expect("just pushed");
+        let i = self.push(now_ms, backend, tool, EmeEntryState::Committing);
         self.entries[i].pending_commits = 1;
-        id
+        self.entries[i].meta.id
+    }
+
+    /// An object mutation (`obj_spawn` / `obj_move` / `obj_delete`, with its `tx` set) was sent;
+    /// route its reply to [`Self::on_commit_reply`]. Other requests are refused (`None`).
+    pub fn push_object(
+        &mut self,
+        now_ms: u64,
+        tool: &str,
+        request: EmeServiceRequest,
+    ) -> Option<EmeEntryId> {
+        let (tx, action, kind, guid) = match &request {
+            EmeServiceRequest::ObjSpawn(s) => (s.tx, EmeObjectAction::Spawn, s.kind, None),
+            EmeServiceRequest::ObjMove(m) => (m.tx, EmeObjectAction::Move, m.kind, Some(m.guid)),
+            EmeServiceRequest::ObjDelete { kind, guid, tx } => {
+                (*tx, EmeObjectAction::Delete, *kind, Some(*guid))
+            }
+            _ => return None,
+        };
+        let i = self.push(
+            now_ms,
+            EmeUndoBackend::Object { tx, action },
+            tool,
+            EmeEntryState::Committing,
+        );
+        let e = &mut self.entries[i];
+        e.pending_commits = 1;
+        e.object = Some(ObjectOp {
+            request,
+            kind,
+            guid,
+        });
+        Some(e.meta.id)
     }
 
     /// The reply to a request that carried an entry's own work (`ov_edit`, `obj_*`). The entry
@@ -519,6 +618,11 @@ impl EmeUndoStack {
         e.pending_commits -= 1;
         if reply.ok {
             e.confirmed += 1;
+            if let Some(obj) = e.object.as_mut() {
+                if let Ok(EmeObjectResult { row: Some(row), .. }) = reply.extra_as() {
+                    obj.guid = Some(row.guid);
+                }
+            }
         } else {
             e.rejected += 1;
             e.last_error = Some(reply.error_code().unwrap_or(EmeServiceError::Invalid));
@@ -577,10 +681,7 @@ impl EmeUndoStack {
             return;
         }
         if e.confirmed == 0 {
-            let reason = match e.last_reject {
-                Some(r) => EmeServiceError::parse(reject_code(r)),
-                None => EmeServiceError::Invalid,
-            };
+            let reason = EmeServiceError::parse(reject_code(e.last_reject));
             self.remove_at(i, EmeDiscardReason::CommitFailed(reason));
         } else {
             self.commit(i);
@@ -613,43 +714,60 @@ impl EmeUndoStack {
         self.entries.iter().position(|e| e.on_undone_side())
     }
 
-    fn issue_undo(&mut self, i: usize, force: bool) {
+    fn ticket(&mut self, i: usize) -> EmeHistoryTicket {
         let e = &mut self.entries[i];
         e.generation += 1;
-        e.state = EmeEntryState::UndoPending;
         e.last_error = None;
-        let request = match e.meta.backend {
-            EmeUndoBackend::Stroke { stroke } => EmeServiceRequest::Undo { stroke, force },
-            EmeUndoBackend::Overlay { layer, stroke } => EmeServiceRequest::OvUndo {
-                layer,
-                stroke,
-                force,
-            },
-            EmeUndoBackend::Object { tx, .. } => EmeServiceRequest::ObjUndo { tx },
-        };
-        let ticket = EmeHistoryTicket {
+        EmeHistoryTicket {
             entry: e.meta.id,
             generation: e.generation,
+        }
+    }
+
+    fn issue_undo(&mut self, i: usize, force: bool) {
+        let ticket = self.ticket(i);
+        let e = &mut self.entries[i];
+        e.state = EmeEntryState::UndoPending;
+        let request = match e.meta.backend {
+            EmeUndoBackend::Object { tx, .. } => EmeServiceRequest::ObjUndo { tx, actor: None },
+            _ => EmeServiceRequest::Undo(e.stroke_args(force)),
         };
         self.outbox.push(EmeHistoryRequest { ticket, request });
     }
 
     fn issue_redo(&mut self, i: usize) {
-        let e = &mut self.entries[i];
-        e.generation += 1;
-        e.state = EmeEntryState::RedoPending;
-        e.last_error = None;
-        let request = match e.meta.backend {
-            EmeUndoBackend::Stroke { stroke } => EmeServiceRequest::Redo { stroke },
-            EmeUndoBackend::Overlay { layer, stroke } => {
-                EmeServiceRequest::OvRedo { layer, stroke }
+        let request = match self.entries[i].meta.backend {
+            EmeUndoBackend::Object { action, .. } => {
+                // Objects redo client-side: the original op again, fresh tx, live guid.
+                let tx = self.alloc_tx();
+                let obj = self.entries[i].object.clone().expect("object entry");
+                let live = obj.guid.map(|g| self.resolve_guid(obj.kind, g));
+                let request = match obj.request {
+                    EmeServiceRequest::ObjSpawn(mut s) => {
+                        s.tx = tx;
+                        EmeServiceRequest::ObjSpawn(s)
+                    }
+                    EmeServiceRequest::ObjMove(mut m) => {
+                        m.tx = tx;
+                        m.guid = live.unwrap_or(m.guid);
+                        EmeServiceRequest::ObjMove(m)
+                    }
+                    EmeServiceRequest::ObjDelete { kind, guid, .. } => {
+                        EmeServiceRequest::ObjDelete {
+                            kind,
+                            guid: live.unwrap_or(guid),
+                            tx,
+                        }
+                    }
+                    other => other,
+                };
+                self.entries[i].meta.backend = EmeUndoBackend::Object { tx, action };
+                request
             }
-            EmeUndoBackend::Object { tx, .. } => EmeServiceRequest::ObjRedo { tx },
+            _ => EmeServiceRequest::Redo(self.entries[i].stroke_args(false)),
         };
-        let ticket = EmeHistoryTicket {
-            entry: e.meta.id,
-            generation: e.generation,
-        };
+        let ticket = self.ticket(i);
+        self.entries[i].state = EmeEntryState::RedoPending;
         self.outbox.push(EmeHistoryRequest { ticket, request });
     }
 
@@ -705,6 +823,12 @@ impl EmeUndoStack {
         Ok(())
     }
 
+    fn alias(&mut self, kind: EmeObjectKind, old: u32, new: u32) {
+        if old != new {
+            self.guid_alias.insert((kind, old), new);
+        }
+    }
+
     /// Route a reply to an undo / redo request. Returns false for a stale or unknown ticket.
     pub fn on_reply(&mut self, ticket: EmeHistoryTicket, reply: &EmeServiceReply) -> bool {
         let Some(i) = self.index(ticket.entry) else {
@@ -716,7 +840,8 @@ impl EmeUndoStack {
         let err = reply.error_code();
         match self.entries[i].state {
             EmeEntryState::UndoPending => match err {
-                None | Some(EmeServiceError::Already) => {
+                None => {
+                    self.learn_from_undo(i, reply);
                     let e = &mut self.entries[i];
                     e.state = EmeEntryState::Undone;
                     let meta = e.meta.clone();
@@ -729,8 +854,8 @@ impl EmeUndoStack {
                         self.remove_at(i, EmeDiscardReason::RedoBranchCleared);
                     }
                 }
-                Some(EmeServiceError::OthersAfter) if !self.entries[i].drop_on_settle => {
-                    let others: Vec<EmeActorRow> = reply.rows_as().unwrap_or_default();
+                Some(EmeServiceError::OthersEdited) if !self.entries[i].drop_on_settle => {
+                    let others: EmeOthersEdited = reply.extra_as().unwrap_or_default();
                     let e = &mut self.entries[i];
                     e.state = EmeEntryState::NeedsConfirm(others.clone());
                     self.events.push(EmeEvent::UndoNeedsConfirm {
@@ -751,7 +876,8 @@ impl EmeUndoStack {
                 }
             },
             EmeEntryState::RedoPending => match err {
-                None | Some(EmeServiceError::Already) => {
+                None => {
+                    self.learn_from_redo(i, reply);
                     let e = &mut self.entries[i];
                     e.state = EmeEntryState::Applied;
                     let meta = e.meta.clone();
@@ -759,6 +885,10 @@ impl EmeUndoStack {
                         h.on_redo(&meta);
                     }
                     self.events.push(EmeEvent::EntryRedone(meta));
+                }
+                Some(EmeServiceError::Conflict) => {
+                    self.entries[i].last_error = Some(EmeServiceError::Conflict);
+                    self.remove_at(i, EmeDiscardReason::RedoConflict);
                 }
                 Some(error) => {
                     let e = &mut self.entries[i];
@@ -776,9 +906,42 @@ impl EmeUndoStack {
         true
     }
 
+    fn learn_from_undo(&mut self, i: usize, reply: &EmeServiceReply) {
+        if self.entries[i].object.is_some() {
+            // Undo of a delete re-spawns the object under a NEW guid.
+            if let Ok(EmeObjectResult {
+                row: Some(row),
+                replaces: Some(old),
+                ..
+            }) = reply.extra_as()
+            {
+                let kind = self.entries[i].object.as_ref().expect("object").kind;
+                self.alias(kind, old, row.guid);
+            }
+        } else if let Ok(EmeUndoResult { sid: Some(sid), .. }) = reply.extra_as() {
+            self.entries[i].sid = Some(sid);
+        }
+    }
+
+    fn learn_from_redo(&mut self, i: usize, reply: &EmeServiceReply) {
+        let Some(obj) = self.entries[i].object.clone() else {
+            return;
+        };
+        // A re-issued spawn creates a new object: later entries naming the old guid follow it.
+        if let Ok(EmeObjectResult { row: Some(row), .. }) = reply.extra_as() {
+            if let Some(old) = obj.guid {
+                let live = self.resolve_guid(obj.kind, old);
+                self.alias(obj.kind, live, row.guid);
+            }
+            if let Some(o) = self.entries[i].object.as_mut() {
+                o.guid = Some(row.guid);
+            }
+        }
+    }
+
     /// The link dropped: in-flight undo/redo requests fail back to their previous state (their
     /// late replies are ignored), held strokes close, and work the server never confirmed is
-    /// discarded (a stroke with some confirmed edits stays, as those rows exist).
+    /// discarded (an entry with some confirmed work stays, as those rows exist).
     pub fn on_link_lost(&mut self) {
         let mut i = 0;
         while i < self.entries.len() {
@@ -795,16 +958,18 @@ impl EmeUndoStack {
                     e.last_error = Some(EmeServiceError::LinkLost);
                 }
                 EmeEntryState::Open | EmeEntryState::Committing => {
-                    for n in std::mem::take(&mut e.pending_nonces) {
-                        self.nonce_owner.remove(&n);
-                    }
-                    let e = &mut self.entries[i];
+                    let nonces = std::mem::take(&mut e.pending_nonces);
                     e.awaiting_trailing = false;
                     e.undo_queued = false;
                     e.pending_commits = 0;
-                    if e.confirmed > 0 {
+                    let keep = e.confirmed > 0;
+                    if keep {
                         e.state = EmeEntryState::Applied;
-                    } else {
+                    }
+                    for n in nonces {
+                        self.nonce_owner.remove(&n);
+                    }
+                    if !keep {
                         self.remove_at(i, EmeDiscardReason::LinkLost);
                         continue;
                     }
@@ -822,16 +987,18 @@ impl EmeUndoStack {
             self.remove_at(0, EmeDiscardReason::Cleared);
         }
         self.nonce_owner.clear();
+        self.guid_alias.clear();
         self.outbox.clear();
     }
 }
 
-fn reject_code(r: EmeRejectReason) -> &'static str {
+fn reject_code(r: Option<EmeRejectReason>) -> &'static str {
     match r {
-        EmeRejectReason::Rank => "rank",
-        EmeRejectReason::Range => "range",
-        EmeRejectReason::Rate => "rate",
-        EmeRejectReason::Invalid | EmeRejectReason::Other(_) => "invalid",
-        EmeRejectReason::Map => "map",
+        Some(EmeRejectReason::Rank) => "rank",
+        Some(EmeRejectReason::Range) => "range",
+        Some(EmeRejectReason::Rate) => "rate",
+        Some(EmeRejectReason::Map) => "map",
+        Some(EmeRejectReason::Stroke) => "stroke",
+        Some(EmeRejectReason::Invalid | EmeRejectReason::Other(_)) | None => "invalid",
     }
 }

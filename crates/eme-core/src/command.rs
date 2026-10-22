@@ -2,7 +2,7 @@
 //! routes them.
 
 use crate::perm::EmeCapability;
-use crate::service::{EmeObjMove, EmeObjSpawn, EmeOverlayEdit, EmeServiceRequest};
+use crate::service::{EmeObjMove, EmeObjSpawn, EmeObjectKind, EmeOverlayEdit, EmeServiceRequest};
 use crate::tool::EmeToolId;
 use crate::transport::EmeVoxelEdit;
 
@@ -29,8 +29,10 @@ pub enum EmeObjectRequest {
     Move(EmeObjMove),
     /// Delete.
     Delete {
-        /// Object guid.
-        guid: u64,
+        /// Kind (guid namespaces overlap between kinds).
+        kind: EmeObjectKind,
+        /// Object guid (low).
+        guid: u32,
     },
 }
 

@@ -1,6 +1,5 @@
 //! Stroke coalescing with an injected clock.
 
-use eme_core::service::EmeLimits;
 use eme_core::stroke::*;
 use eme_core::transport::mode;
 
@@ -162,22 +161,12 @@ fn a_quick_restroke_queues_behind_the_trailing_edit() {
 }
 
 #[test]
-fn limits_tighten_the_config_and_split_long_strokes() {
-    let limits = EmeLimits {
-        edit_rate: Some(4.0),
-        stroke_edits: Some(3),
+fn a_capped_config_splits_long_strokes() {
+    let cfg = EmeStrokeConfig {
+        min_interval_ms: 250,
+        max_edits: Some(3),
         ..Default::default()
     };
-    let cfg = EmeStrokeConfig::from_limits(&limits);
-    assert_eq!(cfg.min_interval_ms, 250);
-    assert_eq!(cfg.max_edits, Some(3));
-    // A server can only tighten the 8/s contract.
-    let loose = EmeStrokeConfig::from_limits(&EmeLimits {
-        edit_rate: Some(100.0),
-        ..Default::default()
-    });
-    assert_eq!(loose.min_interval_ms, 125);
-
     let mut b = EmeStrokeBuilder::new(cfg);
     let (s1, _) = b.begin(0, sample(0.0, mode::DIG));
     let mut strokes = vec![s1];
@@ -209,4 +198,20 @@ fn cancel_drops_everything() {
     b.cancel();
     assert!(b.is_idle());
     assert!(b.tick(1000).is_none());
+}
+
+#[test]
+fn tools_share_one_stroke_id_sequence() {
+    let ids = EmeStrokeIds::starting_at(40);
+    let mut brush = EmeStrokeBuilder::default().with_ids(ids.clone());
+    let (s1, _) = brush.begin(0, sample(0.0, mode::DIG));
+    // An overlay tool takes the next id from the same counter.
+    let overlay_stroke = ids.next_id();
+    brush.end(10, None);
+    let (s2, _) = brush.begin(1000, sample(0.0, mode::DIG));
+    assert_eq!((s1, overlay_stroke, s2), (40, 41, 42));
+    assert_eq!(ids.peek(), 43);
+    let wrap = EmeStrokeIds::starting_at(u16::MAX);
+    assert_eq!((wrap.next_id(), wrap.next_id()), (u16::MAX, 1));
+    assert_eq!(EmeStrokeIds::starting_at(0).next_id(), 1);
 }
