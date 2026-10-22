@@ -68,16 +68,27 @@ impl VoxelCarveRect {
 }
 
 /// MONKEY (voxel): the v2 carve — the UNION of the world voxel layer's surface columns (16 × 16 yd,
-/// `(kx, ky) = floor(wow_xy / 16)`), each as one rectangle inset by `inset` ONLY on the sides whose
-/// neighbour column is not carved too. Internal edges between two carved columns are therefore
-/// shared exactly (no slit), the union's outer boundary keeps `inset` of real ground under the
-/// voxel skirt (CONTRACT §1). Clipping a chunk applies every rectangle reaching it in turn.
+/// `(kx, ky) = floor(wow_xy / 16)`), each inset by `inset` ONLY on the sides whose neighbour column
+/// is not carved too. Internal edges between two carved columns are therefore shared exactly (no
+/// slit), the union's outer boundary keeps `inset` of real ground under the voxel skirt (CONTRACT
+/// §1). Clipping a chunk applies every rectangle reaching it in turn.
+///
+/// MONKEY (voxel fix): a CONCAVE corner of the union — both side neighbours carved, the diagonal
+/// one not — is notched by `inset` × `inset` too. The voxel mesh there needs the missing diagonal
+/// chunk's quad around the shared corner, so without the notch the carve removed ground nobody
+/// covers (a small sky hole at every inner corner of an L-shaped site). A notched column is
+/// split into up to three bands along x; every side between two pieces of the union (a column
+/// edge with a carved neighbour, or a band seam) is INCLUSIVE in [`Self::contains_strict`].
 #[derive(Clone, Debug, Default)]
 pub struct VoxelCarve {
     rects: Vec<VoxelCarveRect>,
-    by_column: std::collections::HashMap<(i32, i32), usize>,
+    /// Per rect: whether its `x0, x1, y0, y1` side is internal to the union (inclusive).
+    incl: Vec<[bool; 4]>,
+    /// Column → its rects `start..end`.
+    by_column: std::collections::HashMap<(i32, i32), (usize, usize)>,
     column_yards: f32,
     sig: u64,
+    columns: usize,
 }
 
 impl VoxelCarve {
@@ -93,33 +104,91 @@ impl VoxelCarve {
         cols.dedup();
         let set: std::collections::HashSet<(i32, i32)> = cols.iter().copied().collect();
         let mut rects = Vec::with_capacity(cols.len());
+        let mut incl = Vec::with_capacity(cols.len());
         let mut by_column = std::collections::HashMap::with_capacity(cols.len());
         let mut h = 0xcbf29ce484222325u64;
         for &(kx, ky) in &cols {
-            let ins = |dx: i32, dy: i32| {
-                if set.contains(&(kx + dx, ky + dy)) {
-                    0.0
-                } else {
-                    inset
+            let has = |dx: i32, dy: i32| set.contains(&(kx + dx, ky + dy));
+            let ins = |dx: i32, dy: i32| if has(dx, dy) { 0.0 } else { inset };
+            let (cx0, cy0) = (kx as f32 * column_yards, ky as f32 * column_yards);
+            let (cx1, cy1) = (cx0 + column_yards, cy0 + column_yards);
+            let (x0, x1) = (cx0 + ins(-1, 0), cx1 - ins(1, 0));
+            let (y0, y1) = (cy0 + ins(0, -1), cy1 - ins(0, 1));
+            // A notch where both side neighbours are carved but the diagonal is not.
+            let notch = |dx: i32, dy: i32| has(dx, 0) && has(0, dy) && !has(dx, dy);
+            let (n_mm, n_mp, n_pm, n_pp) = (notch(-1, -1), notch(-1, 1), notch(1, -1), notch(1, 1));
+            let start = rects.len();
+            let mut push = |r: VoxelCarveRect, i: [bool; 4]| {
+                if r.x1 > r.x0 && r.y1 > r.y0 {
+                    h = (h ^ r.sig()).wrapping_mul(0x100000001b3);
+                    rects.push(r);
+                    incl.push(i);
                 }
             };
-            let (x0, y0) = (kx as f32 * column_yards, ky as f32 * column_yards);
-            let r = VoxelCarveRect {
-                x0: x0 + ins(-1, 0),
-                x1: x0 + column_yards - ins(1, 0),
-                y0: y0 + ins(0, -1),
-                y1: y0 + column_yards - ins(0, 1),
-            };
-            by_column.insert((kx, ky), rects.len());
-            rects.push(r);
-            h = (h ^ r.sig()).wrapping_mul(0x100000001b3);
+            let (in_y0, in_y1) = (has(0, -1), has(0, 1));
+            let mx0 = if n_mm || n_mp { x0 + inset } else { x0 };
+            let mx1 = if n_pm || n_pp { x1 - inset } else { x1 };
+            if mx0 > x0 {
+                let (lo, hi) = (
+                    if n_mm { y0 + inset } else { y0 },
+                    if n_mp { y1 - inset } else { y1 },
+                );
+                push(
+                    VoxelCarveRect {
+                        x0,
+                        x1: mx0,
+                        y0: lo,
+                        y1: hi,
+                    },
+                    [has(-1, 0), true, in_y0 && !n_mm, in_y1 && !n_mp],
+                );
+            }
+            push(
+                VoxelCarveRect {
+                    x0: mx0,
+                    x1: mx1,
+                    y0,
+                    y1,
+                },
+                // A band seam belongs to the NOTCHED band (inclusive there), so the notch's own
+                // edge on the seam line stays outside.
+                [
+                    mx0 == x0 && has(-1, 0),
+                    mx1 == x1 && has(1, 0),
+                    in_y0,
+                    in_y1,
+                ],
+            );
+            if mx1 < x1 {
+                let (lo, hi) = (
+                    if n_pm { y0 + inset } else { y0 },
+                    if n_pp { y1 - inset } else { y1 },
+                );
+                push(
+                    VoxelCarveRect {
+                        x0: mx1,
+                        x1,
+                        y0: lo,
+                        y1: hi,
+                    },
+                    [true, has(1, 0), in_y0 && !n_pm, in_y1 && !n_pp],
+                );
+            }
+            by_column.insert((kx, ky), (start, rects.len()));
         }
         Self {
             rects,
+            incl,
             by_column,
             column_yards,
             sig: if cols.is_empty() { 0 } else { h | 1 },
+            columns: cols.len(),
         }
+    }
+
+    /// How many surface columns the union holds.
+    pub fn columns(&self) -> usize {
+        self.columns
     }
 
     /// Whether nothing is carved.
@@ -137,26 +206,26 @@ impl VoxelCarve {
         self.sig
     }
 
-    /// Whether the column `(x, y)` lies strictly inside the union (an inset rectangle never
-    /// leaves its own column, so the column under the point decides). MONKEY (voxel): strict only
-    /// on the union's OUTER boundary — a side shared with another carved column (no inset, so it
-    /// sits exactly on the column edge) is inclusive, or a point lying exactly on an internal
-    /// column edge would answer the old ADT height (a zero-width slit in the height query).
+    /// Whether the column `(x, y)` lies strictly inside the union (a rect never leaves its own
+    /// column, so the column under the point decides). MONKEY (voxel): strict only on the union's
+    /// OUTER boundary — a side shared with another piece of the union (a carved neighbour column,
+    /// a notch band seam) is inclusive, or a point lying exactly on it would answer the old ADT
+    /// height (a zero-width slit in the height query).
     pub fn contains_strict(&self, x: f32, y: f32) -> bool {
         if self.rects.is_empty() {
             return false;
         }
         let cy = self.column_yards;
         let (kx, ky) = ((x / cy).floor() as i32, (y / cy).floor() as i32);
-        let Some(&i) = self.by_column.get(&(kx, ky)) else {
+        let Some(&(a, b)) = self.by_column.get(&(kx, ky)) else {
             return false;
         };
-        let r = &self.rects[i];
-        let (ex0, ex1) = (kx as f32 * cy, (kx + 1) as f32 * cy);
-        let (ey0, ey1) = (ky as f32 * cy, (ky + 1) as f32 * cy);
-        let lo = |v: f32, side: f32, edge: f32| v > side || (v == side && side == edge);
-        let hi = |v: f32, side: f32, edge: f32| v < side || (v == side && side == edge);
-        lo(x, r.x0, ex0) && hi(x, r.x1, ex1) && lo(y, r.y0, ey0) && hi(y, r.y1, ey1)
+        let lo = |v: f32, side: f32, inc: bool| v > side || (inc && v == side);
+        let hi = |v: f32, side: f32, inc: bool| v < side || (inc && v == side);
+        (a..b).any(|i| {
+            let (r, f) = (&self.rects[i], self.incl[i]);
+            lo(x, r.x0, f[0]) && hi(x, r.x1, f[1]) && lo(y, r.y0, f[2]) && hi(y, r.y1, f[3])
+        })
     }
 
     /// The rectangles whose interior reaches the XY box `[lo, hi]`.
@@ -585,5 +654,51 @@ mod tests {
             y1: 10.0,
         };
         assert!(clip_chunk_outside_rect(&flat_chunk(0), &r).is_none());
+    }
+
+    /// MONKEY (voxel fix): the L's inner corner — (4,4) has carved neighbours on +x (5,4) and +y
+    /// (4,5) but not the diagonal (5,5) — keeps an inset × inset notch of real ground; the seams
+    /// between the notched column's bands stay inclusive; the clip removes exactly the union.
+    #[test]
+    fn union_inner_corner_is_notched() {
+        let carve = l_carve();
+        // The notch at (96 - 16 = 80, 80): the corner square [80, 80.5]² of (5,4) / (4,5) side is
+        // already inset; (4,4)'s own corner [79.5, 80]² must keep its ground too.
+        assert!(!carve.contains_strict(79.75, 79.75));
+        assert!(!carve.contains_strict(80.0, 80.0));
+        // Right next to the notch the column is carved, also exactly on its band seam (x = 79.5).
+        assert!(carve.contains_strict(79.75, 79.25) && carve.contains_strict(79.25, 79.75));
+        assert!(carve.contains_strict(79.5, 72.0) && carve.contains_strict(79.5, 79.4));
+        // Still inclusive on the internal column edges away from the corner.
+        assert!(carve.contains_strict(80.0, 72.0) && carve.contains_strict(72.0, 80.0));
+        // The clip leaves the notch's ground and nothing strictly inside the union.
+        let src = flat_chunk(0);
+        let c = carve.clip_chunk(&src).expect("reaches");
+        let lo = 100.0 - CHUNK_SIZE;
+        let carved: f32 = carve
+            .rects()
+            .iter()
+            .map(|r| {
+                let w = (r.x1.min(100.0) - r.x0.max(lo)).max(0.0);
+                let h = (r.y1.min(100.0) - r.y0.max(lo)).max(0.0);
+                w * h
+            })
+            .sum();
+        let full: f32 = tris(&src).iter().map(|t| tri_area(t).abs()).sum();
+        let kept: f32 = tris(&c).iter().map(|t| tri_area(t).abs()).sum();
+        assert!(
+            (kept - (full - carved)).abs() < 1.0e-2,
+            "kept {kept} vs {}",
+            full - carved
+        );
+        for t in tris(&c) {
+            let cx = (t[0][0] + t[1][0] + t[2][0]) / 3.0;
+            let cy = (t[0][1] + t[1][1] + t[2][1]) / 3.0;
+            assert!(
+                !carve.contains_strict(cx, cy),
+                "triangle {t:?} reaches inside the union"
+            );
+        }
+        assert_eq!(carve.columns(), 3);
     }
 }

@@ -74,6 +74,9 @@ const LIVE_EDITS_PER_FRAME: usize = 8;
 const LIVE_APPLY_MS: f32 = 2.0;
 /// Column seeds sampled per frame at most (each = 36² raw height queries).
 const SEEDS_PER_FRAME: usize = 16;
+/// MONKEY (voxel): how far a chunk's skirt hangs below its open lip (yd) — well past the
+/// [`SEED_LIFT`] slit to the real ground under it, on any slope the 0.5-yd overlap can carry.
+const SKIRT_DEPTH: f32 = 1.0;
 
 /// Marks one world voxel chunk's entity.
 #[derive(Component)]
@@ -201,6 +204,11 @@ pub struct MonkeyVoxelWorld {
     phase_ms: [f32; 7],
     /// MONKEY (voxel): consecutive frames hot results have been held for their siblings.
     hot_hold: u32,
+    /// MONKEY (voxel): per-column mesh generation (bumped when any chunk of the column attaches a
+    /// new mesh) and a global epoch (any attach or carve change) — the ground-effect re-placement
+    /// ([`monkey_voxel_clutter`]) redoes only the MCNKs whose columns / carve changed.
+    clutter_col_gen: HashMap<ColumnKey, u64>,
+    clutter_epoch: u64,
 }
 
 impl Default for MonkeyVoxelWorld {
@@ -247,6 +255,8 @@ impl Default for MonkeyVoxelWorld {
             meshed_total: 0,
             phase_ms: [0.0; 7],
             hot_hold: 0,
+            clutter_col_gen: HashMap::new(),
+            clutter_epoch: 0,
         }
     }
 }
@@ -508,7 +518,17 @@ impl MonkeyVoxelWorld {
             gen: self.mesh_seq,
             hot,
             window: self.data.window_i8(k),
+            skirts: self.skirt_sides(k),
         }
+    }
+
+    /// MONKEY (voxel): the horizontal sides (−x, +x, −y, +y) of chunk `k` where the voxel layer
+    /// ENDS — the neighbour chunk is not active, so the surface's lip hangs over the real ground
+    /// and needs a skirt ([`benilla_voxel::world::add_skirts`]). A neighbour activating later
+    /// remeshes this chunk (`dirty_around`), dropping the skirt there.
+    fn skirt_sides(&self, k: ChunkKey) -> [bool; 4] {
+        [(-1, 0), (1, 0), (0, -1), (0, 1)]
+            .map(|(dx, dy)| !self.data.is_active([k[0] + dx, k[1] + dy, k[2]]))
     }
 
     /// MONKEY (voxel): a mesh came back (task done). Keeps only the newest pending result per
@@ -760,6 +780,8 @@ impl MonkeyVoxelWorld {
         self.mesh_ready.clear();
         self.shown_gen.clear();
         self.hot_wait.clear();
+        self.clutter_col_gen.clear();
+        self.clutter_epoch += 1;
     }
 }
 
@@ -1068,6 +1090,8 @@ impl Plugin for MonkeyVoxelPlugin {
                 monkey_voxel_tile_materials,
                 // Carve the real ADT ground under the surface columns after this frame's meshes.
                 monkey_voxel_hide_terrain,
+                // Re-place the ground effects of carved MCNKs onto the voxel tops.
+                monkey_voxel_clutter,
                 monkey_voxel_probe_rays,
                 monkey_voxel_journal_autosave,
                 monkey_voxel_clock_end,
@@ -1537,6 +1561,8 @@ struct MonkeyMeshDispatch {
     gen: u64,
     hot: bool,
     window: Vec<i8>,
+    /// MONKEY (voxel): the sides that get a skirt ([`MonkeyVoxelWorld::skirt_sides`]).
+    skirts: [bool; 4],
 }
 
 /// MONKEY (voxel): what a mesh task hands back: the Bevy mesh + its AABB + the trimesh collider
@@ -1564,8 +1590,9 @@ struct MonkeyMeshReady {
 
 /// MONKEY (voxel): the off-thread half of a remesh: surface nets over the snapshot, the Bevy mesh,
 /// its AABB and the parry trimesh collider (the expensive BVH build).
-fn monkey_voxel_mesh_job(window: &[i8]) -> MonkeyMeshOut {
-    let vm = benilla_voxel::world::mesh_window(window);
+fn monkey_voxel_mesh_job(window: &[i8], skirts: [bool; 4]) -> MonkeyMeshOut {
+    let mut vm = benilla_voxel::world::mesh_window(window);
+    benilla_voxel::world::add_skirts(&mut vm, skirts, SKIRT_DEPTH);
     if vm.indices.len() < 3 {
         return MonkeyMeshOut {
             mesh: None,
@@ -1752,6 +1779,8 @@ fn monkey_voxel_stream(
         world.shown_gen.insert(k, r.gen);
         world.meshed.insert(k);
         world.carve_dirty = true;
+        *world.clutter_col_gen.entry([k[0], k[1]]).or_default() += 1;
+        world.clutter_epoch += 1;
         world.hot_wait.remove(&k);
         world.meshed_total += 1;
         attached += 1;
@@ -1821,8 +1850,8 @@ fn monkey_voxel_stream(
     // 6. Dispatch remeshes (hot first; bulk under the in-flight cap + dispatch budget).
     let mut dispatched = 0usize;
     for d in world.take_mesh_jobs(dispatch_deadline) {
-        let window = d.window;
-        let task = pool.spawn(async move { monkey_voxel_mesh_job(&window) });
+        let (window, skirts) = (d.window, d.skirts);
+        let task = pool.spawn(async move { monkey_voxel_mesh_job(&window, skirts) });
         world.meshing.push(MonkeyMeshTask {
             key: d.key,
             gen: d.gen,
@@ -1910,10 +1939,215 @@ fn monkey_voxel_stream(
                 world.data.chunks.len()
             );
             world.carve_cols = cols;
+            world.clutter_epoch += 1;
+            if std::env::var_os("WOW_VOXEL_COVERAGE").is_some() {
+                monkey_voxel_coverage_audit(world);
+            }
         }
     }
     world.phase_ms[5] = t_phase.elapsed().as_secs_f32() * 1000.0;
     world.phase_ms[6] = t_stream.elapsed().as_secs_f32() * 1000.0;
+}
+
+/// MONKEY (voxel): a ground-effect tuft re-placed onto the voxel layer grows only on a top whose
+/// normal is at least this upright — where the voxel shader draws the ground layers (its top
+/// weight is `smoothstep(0.5, 0.7, n.z)`), not the wall texture.
+const CLUTTER_MIN_UP: f32 = 0.65;
+/// How far above / below its ADT height a tuft looks for its voxel top (yd).
+const CLUTTER_REACH: f32 = 24.0;
+/// Frame budget (ms) for re-placing MCNK clutter sets (~1–3 ms each); at least one per frame,
+/// the rest wait for the next frame.
+const CLUTTER_MS: f32 = 2.0;
+
+/// MONKEY (voxel): the signature of the voxel state an MCNK's clutter must be re-placed for — 0
+/// when the carve does not reach its XY box (the ADT scatter stands as is), else the rectangles
+/// reaching it + the mesh generations of the columns under it.
+fn clutter_sig(world: &MonkeyVoxelWorld, lo: [f32; 2], hi: [f32; 2]) -> u64 {
+    let Some(carve) = world.carve.as_ref() else {
+        return 0;
+    };
+    let base = carve.sig_for_box(lo, hi);
+    if base == 0 {
+        return 0;
+    }
+    let mut h = base;
+    let c = |v: f32| (v / CHUNK_YARDS).floor() as i32;
+    for kx in c(lo[0])..=c(hi[0]) {
+        for ky in c(lo[1])..=c(hi[1]) {
+            let g = world.clutter_col_gen.get(&[kx, ky]).copied().unwrap_or(0);
+            h = (h ^ g.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ ((kx as u64) << 32 | ky as u32 as u64))
+                .wrapping_mul(0x100000001b3);
+        }
+    }
+    h | 1
+}
+
+/// MONKEY (voxel): one MCNK's ADT scatter re-placed onto the voxel layer. A tuft outside the carve
+/// keeps its place; inside it, it moves onto the voxel TOP nearest its old height (a dug pit's
+/// floor, a mound's crown, the untouched surface 0.15 yd above the ADT) and takes that top's
+/// normal — Blizzlike: grass grows on the ground layer's tops, the same MCNK layer the voxel
+/// shader draws there — and is DROPPED where the column has no top (a pit wall, inside a mound's
+/// flank, air).
+fn clutter_replace(
+    data: &VoxelWorldData,
+    carve: &VoxelCarve,
+    raw: &[(String, Vec<crate::clutter::ShadedPlacement>)],
+) -> Vec<(String, Vec<crate::clutter::ShadedPlacement>)> {
+    raw.iter()
+        .map(|(model, ps)| {
+            let kept = ps
+                .iter()
+                .filter_map(|sp| {
+                    let [x, y, z] = sp.placement.position;
+                    if !carve.contains_strict(x, y) {
+                        return Some(sp.clone());
+                    }
+                    let (top, n) = data.top_near(x, y, z, CLUTTER_REACH, CLUTTER_MIN_UP)?;
+                    let mut sp = sp.clone();
+                    sp.placement.position[2] = top;
+                    sp.ground_normal = wow_to_bevy(n).to_array();
+                    Some(sp)
+                })
+                .collect::<Vec<_>>();
+            (model.clone(), kept)
+        })
+        .filter(|(_, ps)| !ps.is_empty())
+        .collect()
+}
+
+/// MONKEY (voxel): keep the terrain's ground effects (grass / clutter tufts) on the voxel layer.
+/// The ADT scatter stays at the OLD ground height, so over a dug pit it floats and inside a raised
+/// mound it is buried. Each MCNK's clutter whose box the carve reaches is re-placed
+/// ([`clutter_replace`]) when the carve or a column's voxel meshes under it change, its built
+/// meshes dropped (`stream_chunk_clutter` rebuilds them); it is restored when the carve leaves.
+fn monkey_voxel_clutter(
+    mut commands: Commands,
+    world: Res<MonkeyVoxelWorld>,
+    mut chunks: Query<&mut crate::clutter::ClutterChunk>,
+    mut seen_epoch: Local<u64>,
+    mut backlog: Local<bool>,
+    mut logs: Local<u32>,
+) {
+    // A freshly streamed tile's chunks need a look too (the carve may already reach them).
+    if *seen_epoch == world.clutter_epoch
+        && !*backlog
+        && (world.carve.is_none() || !chunks.iter_mut().any(|c| c.is_added()))
+    {
+        return;
+    }
+    *seen_epoch = world.clutter_epoch;
+    *backlog = false;
+    if *logs == 0 && world.carve.is_some() && std::env::var_os("WOW_VOXEL_COVERAGE").is_some() {
+        info!(
+            "MONKEY (voxel): ground effects — {} MCNK clutter set(s) resident",
+            chunks.iter().count()
+        );
+    }
+    let t0 = Instant::now();
+    let mut done = 0;
+    for mut cc in &mut chunks {
+        // Bevy → WoW: wow_x = -bevy_z, wow_y = -bevy_x.
+        let (blo, bhi) = cc.bounds;
+        let lo = [-bhi.z, -bhi.x];
+        let hi = [-blo.z, -blo.x];
+        let sig = clutter_sig(&world, lo, hi);
+        if sig == cc.voxel_sig {
+            continue;
+        }
+        if done > 0 && t0.elapsed().as_secs_f32() * 1000.0 >= CLUTTER_MS {
+            *backlog = true;
+            break;
+        }
+        done += 1;
+        let raw = match cc.raw_models.take() {
+            Some(r) => r,
+            None => std::mem::take(&mut cc.models),
+        };
+        match world.carve.as_ref().filter(|_| sig != 0) {
+            Some(carve) => {
+                cc.models = clutter_replace(&world.data, carve, &raw);
+                if *logs < 24 {
+                    *logs += 1;
+                    let n = |m: &[(String, Vec<crate::clutter::ShadedPlacement>)]| {
+                        m.iter().map(|(_, p)| p.len()).sum::<usize>()
+                    };
+                    info!(
+                        "MONKEY (voxel): ground effects re-placed on the voxel tops — {} of {} \
+                         tuft(s) kept",
+                        n(&cc.models),
+                        n(&raw)
+                    );
+                }
+                cc.raw_models = Some(raw);
+            }
+            None => {
+                cc.models = raw;
+            }
+        }
+        cc.voxel_sig = sig;
+        for e in cc.built.drain(..) {
+            commands.entity(e).try_despawn();
+        }
+    }
+}
+
+/// MONKEY (voxel): `WOW_VOXEL_COVERAGE=1` dev audit — every point (0.1-yd grid) the carve removes
+/// the real ground from must be covered (XY) by a voxel triangle, or the sky shows through. Logs
+/// the gap count and a sample of the gap points with their column's surface chunks.
+fn monkey_voxel_coverage_audit(world: &MonkeyVoxelWorld) {
+    let Some(carve) = world.carve.as_ref() else {
+        return;
+    };
+    let meshes: Vec<(ChunkKey, benilla_voxel::VoxelMesh)> = world
+        .data
+        .chunks
+        .keys()
+        .map(|&k| (k, world.data.mesh(k)))
+        .collect();
+    let cols: Vec<ColumnKey> = world.carve_cols.iter().copied().collect();
+    let gaps = benilla_voxel::world::xy_coverage_gaps(&meshes, &cols, 0.1, |x, y| {
+        carve.contains_strict(x, y)
+    });
+    info!(
+        "MONKEY (voxel): coverage audit — {} carved column(s), {} gap point(s) (0.1 yd grid).",
+        cols.len(),
+        gaps.len()
+    );
+    for (col, kzs) in &world.wanted {
+        if world.carve_cols.contains(col) {
+            continue;
+        }
+        let surf = world.data.seeds.get(col).and_then(|s| s.surface_chunks());
+        let meshed: Vec<i32> = kzs
+            .iter()
+            .copied()
+            .filter(|&kz| world.meshed.contains(&[col[0], col[1], kz]))
+            .collect();
+        info!(
+            "MONKEY (voxel):   NOT carved: col {col:?} surface {surf:?} wanted kz {kzs:?} meshed {meshed:?}"
+        );
+    }
+    for g in gaps.iter().step_by((gaps.len() / 40).max(1)) {
+        let col = [
+            (g[0] / CHUNK_YARDS).floor() as i32,
+            (g[1] / CHUNK_YARDS).floor() as i32,
+        ];
+        let surf = world.data.seeds.get(&col).and_then(|s| s.surface_chunks());
+        let kzs: Vec<i32> = world
+            .wanted
+            .get(&col)
+            .map(|s| s.iter().copied().collect())
+            .unwrap_or_default();
+        let d = |z: f32| world.data.density_at([g[0], g[1], z]);
+        let z_hit = (0..400)
+            .map(|i| 140.0 - i as f32 * 0.25)
+            .find(|&z| d(z) < 0.0);
+        info!(
+            "MONKEY (voxel):   gap at ({:.2}, {:.2}) col {col:?} surface {surf:?} active kz {kzs:?} \
+             first solid z {z_hit:?}",
+            g[0], g[1]
+        );
+    }
 }
 
 /// MONKEY (voxel): `WOW_VOXEL_PROBE_RAY=1` — every 2 s (10 times) after a local dig, cast a
@@ -2260,6 +2494,180 @@ mod tests {
         Instant::now() + std::time::Duration::from_secs(3600)
     }
 
+    /// MONKEY (voxel fix): ground effects follow the voxel layer — a tuft outside the carve keeps
+    /// its place, one over a dug pit drops onto the pit floor, one inside the carve on untouched
+    /// ground rides the seeded surface, one on a pit wall is dropped, one under a mound moves to
+    /// its crown.
+    #[test]
+    fn clutter_is_replaced_onto_voxel_tops() {
+        use crate::clutter::ShadedPlacement;
+        use benilla_formats::GroundDoodadPlacement;
+        let mut data = VoxelWorldData::default();
+        let col = [0, 0];
+        data.seeds.insert(col, Arc::new(ColumnSeed::from_fn(col, |_, _| Some(20.0))));
+        let keys = [[0, 0, 1]];
+        let pit = dig([6.0, 6.0, 20.0], 3.0);
+        let mound = VoxelEditOp { mode: 1, ..dig([11.0, 11.0, 20.0], 2.5) };
+        data.build(&keys, [pit, mound].iter());
+        let carve = VoxelCarve::from_columns([(0, 0)], CHUNK_YARDS, CARVE_INSET);
+        let tuft = |x: f32, y: f32| ShadedPlacement {
+            placement: GroundDoodadPlacement {
+                model: "grass.m2".into(),
+                position: [x, y, 20.0],
+                yaw: 0.0,
+                scale: 1.0,
+            },
+            tint: 1.0,
+            ground_normal: [0.0, 1.0, 0.0],
+        };
+        let raw = vec![(
+            "grass.m2".to_string(),
+            vec![tuft(-3.0, 4.0), tuft(6.0, 6.0), tuft(2.0, 13.0), tuft(8.9, 6.0), tuft(11.0, 11.0)],
+        )];
+        let out = clutter_replace(&data, &carve, &raw);
+        let ps: Vec<[f32; 3]> = out[0].1.iter().map(|s| s.placement.position).collect();
+        assert_eq!(ps.len(), 4, "the pit-wall tuft is dropped: {ps:?}");
+        assert_eq!(ps[0], [-3.0, 4.0, 20.0], "outside the carve: untouched");
+        assert!((ps[1][2] - 17.0).abs() < 0.3, "pit floor {:?}", ps[1]);
+        assert!((ps[2][2] - 20.15).abs() < 0.1, "seeded surface {:?}", ps[2]);
+        assert!((ps[3][2] - 22.5).abs() < 0.3, "mound crown {:?}", ps[3]);
+        assert!(out[0].1[1].ground_normal[1] > 0.9, "Bevy +Y up normal");
+    }
+
+    /// Ray / triangle (Möller–Trumbore): the hit distance along `d` (unit) or `None`.
+    fn ray_tri(o: [f32; 3], d: [f32; 3], t: [[f32; 3]; 3]) -> Option<f32> {
+        let sub = |a: [f32; 3], b: [f32; 3]| [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
+        let cross = |a: [f32; 3], b: [f32; 3]| {
+            [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]]
+        };
+        let dot = |a: [f32; 3], b: [f32; 3]| a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+        let (e1, e2) = (sub(t[1], t[0]), sub(t[2], t[0]));
+        let p = cross(d, e2);
+        let det = dot(e1, p);
+        if det.abs() < 1.0e-9 {
+            return None;
+        }
+        let s = sub(o, t[0]);
+        let u = dot(s, p) / det;
+        let q = cross(s, e1);
+        let v = dot(d, q) / det;
+        let tt = dot(e2, q) / det;
+        (u >= -1.0e-5 && v >= -1.0e-5 && u + v <= 1.0 + 1.0e-5 && tt > 0.0).then_some(tt)
+    }
+
+    /// MONKEY (voxel fix, owner's "wounds"): wherever the carve removes the real ground, the voxel
+    /// layer must cover it — straight down (the concave-corner notch) AND for grazing views across
+    /// the union's outer edge (the skirt under the SEED_LIFT lip). Sloped, bumpy ground that
+    /// crosses the 16-yd z-chunk boundary, an L-shaped union (one inner corner) and a dig. Without
+    /// the notch the inner corner leaves sky holes; without the skirt, rays from
+    /// outside slip under the lip past the terrain's carved edge.
+    #[test]
+    fn carved_ground_is_always_covered_and_never_shows_the_sky() {
+        let ground = |x: f32, y: f32| 15.0 + 0.06 * x - 0.04 * y + (x * 0.4).sin() * 0.5;
+        let cols: [ColumnKey; 3] = [[0, 0], [1, 0], [0, 1]];
+        let mut data = VoxelWorldData::default();
+        let mut keys = Vec::new();
+        for c in cols {
+            let s = ColumnSeed::from_fn(c, |x, y| Some(ground(x, y)));
+            let (lo, hi) = s.surface_chunks().unwrap();
+            for kz in lo..=hi {
+                keys.push([c[0], c[1], kz]);
+            }
+            data.seeds.insert(c, Arc::new(s));
+        }
+        assert!(keys.iter().any(|k| k[2] == 0) && keys.iter().any(|k| k[2] == 1));
+        let pit = dig([6.0, 24.0, ground(6.0, 24.0)], 2.0);
+        data.build(&keys, [pit].iter());
+        let skirts = |k: ChunkKey| {
+            [(-1, 0), (1, 0), (0, -1), (0, 1)]
+                .map(|(dx, dy)| !data.is_active([k[0] + dx, k[1] + dy, k[2]]))
+        };
+        let meshes: Vec<(ChunkKey, benilla_voxel::VoxelMesh)> = keys
+            .iter()
+            .map(|&k| {
+                let mut m = data.mesh(k);
+                benilla_voxel::world::add_skirts(&mut m, skirts(k), SKIRT_DEPTH);
+                (k, m)
+            })
+            .collect();
+        let carve = VoxelCarve::from_columns(
+            cols.iter().map(|c| (c[0], c[1])),
+            CHUNK_YARDS,
+            CARVE_INSET,
+        );
+        // 1. Straight down: every carved point is under a voxel triangle.
+        let gaps = benilla_voxel::world::xy_coverage_gaps(&meshes, &cols, 0.05, |x, y| {
+            carve.contains_strict(x, y)
+        });
+        assert!(
+            gaps.is_empty(),
+            "{} uncovered carved point(s), e.g. {:?}",
+            gaps.len(),
+            &gaps[..gaps.len().min(4)]
+        );
+        // 2. Grazing rays across the outer edge, from the open sides into the union.
+        let tris: Vec<[[f32; 3]; 3]> = meshes
+            .iter()
+            .flat_map(|(k, m)| {
+                let o = window_origin(*k);
+                m.indices.chunks_exact(3).map(move |t| {
+                    [t[0], t[1], t[2]].map(|i| {
+                        let p = m.positions[i as usize];
+                        [p[0] + o[0], p[1] + o[1], p[2] + o[2]]
+                    })
+                })
+            })
+            .collect();
+        let mut leaks = Vec::new();
+        let mut rays = 0;
+        // Eyes outside the −x, −y and +x edges (and past the inner corner), looking at the ground
+        // inside at shallow angles.
+        let mut eyes = Vec::new();
+        for i in 0..24 {
+            let s = 1.0 + i as f32 * 1.3;
+            eyes.push(([-6.0, s], [6.0, s]));
+            eyes.push(([s, -6.0], [s, 6.0]));
+            eyes.push(([38.0, s * 0.5], [26.0, s * 0.5]));
+            eyes.push(([22.0 + s * 0.2, 22.0 + s * 0.2], [12.0, 12.0 + s * 0.3]));
+        }
+        for (e, t) in eyes {
+            for (hi, tz) in [(0.6, -0.3), (1.0, -0.2), (2.0, 0.0), (0.4, -0.05)] {
+                let o = [e[0], e[1], ground(e[0], e[1]) + hi];
+                let tgt = [t[0], t[1], ground(t[0], t[1]) + tz];
+                let d = [tgt[0] - o[0], tgt[1] - o[1], tgt[2] - o[2]];
+                let len = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+                let d = [d[0] / len, d[1] / len, d[2] / len];
+                rays += 1;
+                let t_vox = tris
+                    .iter()
+                    .filter_map(|&t| ray_tri(o, d, t))
+                    .fold(f32::INFINITY, f32::min);
+                // March: the first terrain hit (ground kept outside the carve) or a point inside
+                // the carve below the ground — the void the sky shows through.
+                let mut s = 0.0;
+                while s < t_vox.min(60.0) {
+                    let p = [o[0] + d[0] * s, o[1] + d[1] * s, o[2] + d[2] * s];
+                    let g = ground(p[0], p[1]);
+                    if !carve.contains_strict(p[0], p[1]) {
+                        if p[2] <= g {
+                            break; // the real ground
+                        }
+                    } else if p[2] < g - 0.05 {
+                        leaks.push((o, tgt, p));
+                        break;
+                    }
+                    s += 0.01;
+                }
+            }
+        }
+        assert!(
+            leaks.is_empty(),
+            "{} of {rays} grazing ray(s) see under the voxel lip, e.g. {:?}",
+            leaks.len(),
+            &leaks[..leaks.len().min(3)]
+        );
+    }
+
     fn dig(pos: [f32; 3], radius: f32) -> VoxelEditOp {
         VoxelEditOp {
             map: 0,
@@ -2363,7 +2771,7 @@ mod tests {
             key: d.key,
             gen: d.gen,
             hot: true,
-            out: monkey_voxel_mesh_job(&d.window),
+            out: monkey_voxel_mesh_job(&d.window, d.skirts),
         };
         // The newer finishes first and is shown …
         world.mesh_returned(ready(&b[0]));
@@ -2416,7 +2824,7 @@ mod tests {
         for &k in &keys {
             assert_eq!(sync.chunks[&k], world.data.chunks[&k], "chunk {k:?}");
             // The off-thread mesh job == the sync mesh.
-            let out = monkey_voxel_mesh_job(&world.data.window_i8(k));
+            let out = monkey_voxel_mesh_job(&world.data.window_i8(k), [false; 4]);
             assert_eq!(out.tris, sync.mesh(k).tri_count(), "chunk {k:?} mesh");
             assert_eq!(out.collider.is_some(), out.tris > 0);
         }

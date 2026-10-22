@@ -338,6 +338,21 @@ Replaces the single Ctrl+P "site" with the CONTRACT §1–2 world voxel layer (`
   ground, height query `None`). Perf (this box, debug-opt build): 2-yd live edit 2–4 ms (1–2 chunks remeshed
   + trimesh colliders), 8-yd live edit ~15 ms (8 chunks); journal replay of 16 chunks ~14 ms in one frame
   (`BUILDS_PER_FRAME` 16).
+- **Sky "wounds" fix (2026-10-22)**: two causes, both reproduced offline from the owner's Northshire journal.
+  (1) Where the layer ENDS, its surface is a lip `SEED_LIFT` above the real ground it overlaps; a grazing ray
+  slipped into that 0.15-yd slit, passed the terrain's carved edge and saw the void under the voxel surface — a
+  long thin sky line along the union's outer edge, wavy with the ground. Fix: `add_skirts` hangs a skirt (0.6-yd
+  outward ledge, then straight down to 1 yd) from every open boundary edge on a side whose neighbour chunk is
+  inactive (`skirt_sides`; a neighbour activating remeshes this chunk and drops it). (2) At a CONCAVE corner of
+  the union (both side neighbours carved, the diagonal not) the carve removed ground the mesh does not cover
+  (the corner quad belongs to the missing diagonal chunk): the carve now notches inset × inset there (up to three
+  bands per column, seams inclusive). Dev audit `WOW_VOXEL_COVERAGE=1` logs carved points no voxel triangle
+  covers (0 at the owner's site after the fix, 4 before).
+- **Ground effects on the voxel layer (2026-10-22)**: a carved MCNK's clutter tufts are re-placed onto the voxel
+  TOP nearest their ADT height (`top_near`, normal z ≥ 0.65 = where the shader draws the ground layers) or dropped
+  (pit walls, buried, air); redone per MCNK when the carve or a column's meshes under it change, restored when
+  the carve leaves (`monkey_voxel_clutter`, 2 ms/frame budget). Offline captures need `WOW_CLUTTER_DENSITY=2`:
+  the capture harness has no clutter otherwise.
 - **Server-lane hooks** (`benilla_world::voxel`): push into `MonkeyVoxelNet` — `inbox` (E records, `seq: Some`),
   `confirms` `(nonce, seq)`, `resets` `(map, rx, ry, epoch)`, `region_done` `(map, rx, ry, epoch, last_seq)`;
   drain `outbox` for uplink; read `MonkeyVoxelWorld::pending_local(map)` (resend) and `region_sync(map, rx, ry)`
