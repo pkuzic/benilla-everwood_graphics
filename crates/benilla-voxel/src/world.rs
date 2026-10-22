@@ -101,6 +101,10 @@ pub struct VoxelEditOp {
     pub nonce: u16,
     /// Server sequence once confirmed; `None` = local prediction / guild relay (no server).
     pub seq: Option<u32>,
+    /// MONKEY (voxel): THIS client made the edit (brush / AUTOEDIT). Only local edits are uplink
+    /// candidates ([`MapJournal::pending_local`]) and nonce-confirmable; relay / server records
+    /// are `false`. Not on the wire (journal flag bit 1 only).
+    pub local: bool,
 }
 
 impl VoxelEditOp {
@@ -198,6 +202,7 @@ impl VoxelEditOp {
             mode: b[21],
             strength: b[22],
             seq: None,
+            local: false,
         };
         e.is_valid().then_some(e)
     }
@@ -735,8 +740,12 @@ impl MapJournal {
     }
 
     /// The local predictions still waiting for a server seq (arrival order).
-    pub fn pending_local(&self) -> &[VoxelEditOp] {
-        &self.edits[self.confirmed..]
+    pub fn pending_local(&self) -> Vec<VoxelEditOp> {
+        self.edits[self.confirmed..]
+            .iter()
+            .filter(|e| e.local)
+            .copied()
+            .collect()
     }
 
     /// Whether a confirmed `seq` is already in the journal.
@@ -779,7 +788,7 @@ impl MapJournal {
     pub fn confirm(&mut self, nonce: u16, seq: u32) -> Option<(VoxelEditOp, JournalInsert)> {
         let i = self.edits[self.confirmed..]
             .iter()
-            .position(|e| e.nonce == nonce)?
+            .position(|e| e.local && e.nonce == nonce)?
             + self.confirmed;
         let mut e = self.edits.remove(i);
         e.seq = Some(seq);
@@ -852,7 +861,7 @@ const JOURNAL_VERSION: u16 = 2;
 impl VoxelJournal {
     /// Serialise (little-endian): `"MVXW", u16 version, u16 maps`, then per map `u16 map,
     /// u32 regions × (i16 rx, i16 ry, u16 epoch, u32 last_seq), u32 edits × (f32 x, f32 y, f32 z,
-    /// f32 radius, u8 mode, u8 strength, u16 nonce, u8 has_seq, u32 seq)`.
+    /// f32 radius, u8 mode, u8 strength, u16 nonce, u8 flags (bit0 has_seq, bit1 local), u32 seq)`.
     pub fn encode(&self) -> Vec<u8> {
         let mut b = Vec::new();
         b.extend_from_slice(JOURNAL_MAGIC);
@@ -875,7 +884,8 @@ impl VoxelJournal {
                 b.push(e.mode);
                 b.push(e.strength);
                 b.extend_from_slice(&e.nonce.to_le_bytes());
-                b.push(e.seq.is_some() as u8);
+                // Flags: bit 0 = has seq, bit 1 = local.
+                b.push(e.seq.is_some() as u8 | (e.local as u8) << 1);
                 b.extend_from_slice(&e.seq.unwrap_or(0).to_le_bytes());
             }
         }
@@ -933,7 +943,8 @@ impl VoxelJournal {
                 let mode = r.u8()?;
                 let strength = r.u8()?;
                 let nonce = r.u16()?;
-                let has = r.u8()? != 0;
+                let flags = r.u8()?;
+                let has = flags & 1 != 0;
                 let seq = r.u32()?;
                 edits.push(VoxelEditOp {
                     map,
@@ -943,6 +954,7 @@ impl VoxelJournal {
                     strength,
                     nonce,
                     seq: has.then_some(seq),
+                    local: flags & 2 != 0,
                 });
             }
             // Re-establish the canonical order whatever the file held.
@@ -990,6 +1002,7 @@ mod tests {
             strength: 255,
             nonce: 0,
             seq: None,
+            local: true,
         }
     }
 
@@ -1130,6 +1143,7 @@ mod tests {
             strength: 128,
             nonce: 0xbeef,
             seq: None,
+            local: false,
         };
         let h = e.to_hex();
         assert_eq!(h.len(), 46);

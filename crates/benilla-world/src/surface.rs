@@ -75,12 +75,6 @@ impl SurfaceUnderfoot<'_, '_> {
         terrain_height_under(&self.streamer, &self.adt_tiles, pos)
     }
 
-    /// MONKEY (voxel): original ADT height used when a fresh voxel volume samples its seed.
-    #[cfg(feature = "voxel")]
-    pub(crate) fn terrain_height_under_raw(&self, pos: Vec3) -> Option<f32> {
-        crate::terrain_stream::terrain_height_under_raw(&self.streamer, &self.adt_tiles, pos)
-    }
-
     /// Whether `feet_world` is inside a building: the faces-only down-ray raced against the
     /// terrain, so the grass above a mine's tunnels is outdoors.
     pub fn indoors_at(&self, feet_world: Vec3) -> bool {

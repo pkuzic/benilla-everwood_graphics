@@ -172,11 +172,11 @@ impl MonkeyVoxelWorld {
     }
 
     /// SERVER LANE: local edits still waiting for a server seq on `map` (send/resend these).
-    pub fn pending_local(&self, map: u16) -> &[VoxelEditOp] {
+    pub fn pending_local(&self, map: u16) -> Vec<VoxelEditOp> {
         self.journal
             .maps
             .get(&map)
-            .map_or(&[][..], |j| j.pending_local())
+            .map_or_else(Vec::new, |j| j.pending_local())
     }
 
     /// SERVER LANE: the persisted sync point of a region (`epoch`, `last_seq`) for a SYNC entry.
@@ -307,6 +307,7 @@ impl MonkeyVoxelWorld {
         };
         e.map = map;
         e.seq = None;
+        e.local = true;
         e.nonce = self.next_nonce;
         self.next_nonce = self.next_nonce.wrapping_add(1);
         if !e.is_valid() {
@@ -808,6 +809,7 @@ fn monkey_voxel_brush_edit(
         strength: if mode == 2 { 128 } else { 255 },
         nonce: 0,
         seq: None,
+        local: true,
     };
     world.local_edit(&mut net, e);
 }
@@ -904,6 +906,7 @@ fn monkey_voxel_autoedit(
                 strength: 255,
                 nonce: 0,
                 seq: None,
+                local: true,
             },
         );
         info!(
@@ -925,7 +928,8 @@ fn monkey_voxel_apply_inbox(mut net: ResMut<MonkeyVoxelNet>, mut world: ResMut<M
     }
     let edits: Vec<VoxelEditOp> = net.inbox.drain(..).collect();
     let n = edits.len();
-    for e in edits {
+    for mut e in edits {
+        e.local = false; // MONKEY (voxel): a remote record is never our own prediction
         if e.is_valid() {
             world.ingest(e, true);
         }
@@ -1308,6 +1312,7 @@ mod tests {
                 strength: 255,
                 nonce: 0,
                 seq: None,
+                local: true,
             },
         );
         assert_eq!(net.outbox.len(), 1);
