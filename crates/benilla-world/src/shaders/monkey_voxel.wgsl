@@ -201,7 +201,15 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     // Mapping weights. Tops up to ~45° take the ground's own planar mapping (as the real terrain,
     // which never triplanars); steeper faces go to a SHARP triplanar so no projection ghosts over
     // another; faces pointing down use the wall layer projected from below.
-    let top_w = smoothstep(0.5, 0.7, n.y);
+    // MONKEY (voxel): `edited` (vertex colour r, 0 = the seeded real ground, 1 = a dug / built
+    // face, `benilla_voxel::world::edited_weights`). Untouched slopes keep the ground's thresholds
+    // (a seeded hillside matches the real ground beside it); an EDITED face is a top only when it
+    // is nearly level (≥ ~0.86 up, ≤ ~30°), so a 45° pit wall reads as earth, not stretched grass.
+    var edited = 0.0;
+#ifdef VERTEX_COLORS
+    edited = clamp(in.color.r, 0.0, 1.0);
+#endif
+    let top_w = smoothstep(mix(0.5, 0.86, edited), mix(0.7, 0.95, edited), n.y);
     let under_w = smoothstep(0.5, 0.7, -n.y);
     let side_w = max(1.0 - top_w - under_w, 0.0);
     let sx = pow(an.x, 6.0);

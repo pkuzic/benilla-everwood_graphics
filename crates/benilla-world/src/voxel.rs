@@ -325,28 +325,27 @@ impl MonkeyVoxelWorld {
     }
 
     /// MONKEY (voxel): pick this frame's canonical builds and snapshot them into `Send` jobs (the
-    /// caller runs them on the pool, or inline in tests). Hot groups (a live edit's fresh chunks)
-    /// always go; bulk ones (rebuilds first, then never-built wanted chunks) while fewer than
-    /// [`MAX_BUILD_TASKS`] bulk groups are in flight and before `deadline`. A chunk already in
-    /// flight waits for its result. Also refreshes [`Self::unbuilt`].
+    /// caller runs them on the pool, or inline in tests). Candidates: hot (a live edit's fresh
+    /// chunks) first, then bulk rebuilds of active chunks, then never-built wanted chunks.
+    ///
+    /// CANONICAL REBUILD RULE (the server's P1 finding, `voxel-core/NAV-P1.md` §8): every candidate
+    /// is grown to its READ CLOSURE ([`MapJournal::read_closure`]: the chunks linked to it by
+    /// smooth edits, transitively — limited to wanted chunks with a loaded seed) and the closure is
+    /// rebuilt in lockstep; a chunk rebuilt alone would read its smooth partners at their CURRENT
+    /// density and diverge from the full replay. This covers the initial build (fresh chunks pull
+    /// in their active partners, which an earlier incremental smooth applied against a seed), the
+    /// out-of-order / reset rebuilds and the async pipeline alike. A closure with a member already
+    /// in flight waits for that result (its candidate stays queued). Closures are packed into jobs
+    /// of about [`BUILD_GROUP`] chunks (a union of closures is closed). Hot jobs always go; bulk
+    /// ones while fewer than [`MAX_BUILD_TASKS`] are in flight and before `deadline`. Also
+    /// refreshes [`Self::unbuilt`].
     fn take_build_jobs(&mut self, deadline: Instant) -> Vec<MonkeyBuildDispatch> {
         let mut out = Vec::new();
         let Some(map) = self.current_map_u16() else {
             return out;
         };
         let seeded = |s: &Self, k: &ChunkKey| s.data.seeds.contains_key(&[k[0], k[1]]);
-        // Hot: a live edit's not-yet-active chunks.
-        let mut hot: Vec<ChunkKey> = self
-            .hot_build
-            .iter()
-            .copied()
-            .filter(|k| !self.building.contains(k) && seeded(self, k))
-            .collect();
-        hot.retain(|k| !self.data.is_active(*k));
-        hot.sort();
-        for k in &hot {
-            self.hot_build.remove(k);
-        }
+        // Hot chunks another build activated meanwhile need nothing more.
         let active_hot: Vec<ChunkKey> = self
             .hot_build
             .iter()
@@ -356,14 +355,14 @@ impl MonkeyVoxelWorld {
         for k in active_hot {
             self.hot_build.remove(&k);
         }
-        // Bulk: out-of-order / reset rebuilds, then the wanted chunks never built.
-        let mut bulk: Vec<ChunkKey> = self
-            .rebuild
+        let mut hot: Vec<ChunkKey> = self
+            .hot_build
             .iter()
             .copied()
-            .filter(|k| !self.building.contains(k))
+            .filter(|k| !self.building.contains(k) && seeded(self, k))
             .collect();
-        bulk.retain(|k| self.data.is_active(*k));
+        hot.sort();
+        // Bulk: out-of-order / reset rebuilds, then the wanted chunks never built.
         let stale: Vec<ChunkKey> = self
             .rebuild
             .iter()
@@ -373,6 +372,12 @@ impl MonkeyVoxelWorld {
         for k in stale {
             self.rebuild.remove(&k); // never built: the unbuilt scan below builds it canonically
         }
+        let mut bulk: Vec<ChunkKey> = self
+            .rebuild
+            .iter()
+            .copied()
+            .filter(|k| !self.building.contains(k))
+            .collect();
         bulk.sort();
         let mut fresh: Vec<ChunkKey> = Vec::new();
         for (col, kzs) in &self.wanted {
@@ -381,32 +386,71 @@ impl MonkeyVoxelWorld {
             }
             for &kz in kzs {
                 let k = [col[0], col[1], kz];
-                if !self.data.is_active(k) && !self.building.contains(&k) && !hot.contains(&k) {
+                if !self.data.is_active(k) && !self.building.contains(&k) {
                     fresh.push(k);
                 }
             }
         }
         fresh.sort();
-        let mut groups: Vec<(Vec<ChunkKey>, bool)> = hot
-            .chunks(BUILD_GROUP)
-            .map(|g| (g.to_vec(), true))
-            .collect();
-        groups.extend(bulk.chunks(BUILD_GROUP).map(|g| (g.to_vec(), false)));
-        groups.extend(fresh.chunks(BUILD_GROUP).map(|g| (g.to_vec(), false)));
+        // Grow each candidate to its closure; pack closures into groups.
+        let journal = self.journal.maps.get(&map);
+        let wanted = |c: &ChunkKey| {
+            self.wanted
+                .get(&[c[0], c[1]])
+                .is_some_and(|s| s.contains(&c[2]))
+        };
+        let mut taken: HashSet<ChunkKey> = HashSet::new();
+        let mut groups: Vec<(Vec<ChunkKey>, bool)> = Vec::new();
         let mut bulk_in_flight = self.builds.iter().filter(|t| !t.hot).count();
-        let mut unbuilt = fresh.len();
-        for (keys, is_hot) in groups {
-            if !is_hot && (bulk_in_flight >= MAX_BUILD_TASKS || Instant::now() >= deadline) {
+        let (mut cur, mut cur_hot): (Vec<ChunkKey>, bool) = (Vec::new(), true);
+        let cands = hot
+            .iter()
+            .map(|k| (*k, true))
+            .chain(bulk.iter().map(|k| (*k, false)))
+            .chain(fresh.iter().map(|k| (*k, false)));
+        for (k, is_hot) in cands {
+            if cur_hot != is_hot && !cur.is_empty() {
+                groups.push((std::mem::take(&mut cur), cur_hot));
+                if !cur_hot {
+                    bulk_in_flight += 1;
+                }
+            }
+            cur_hot = is_hot;
+            if !is_hot
+                && cur.is_empty()
+                && (bulk_in_flight >= MAX_BUILD_TASKS || Instant::now() >= deadline)
+            {
                 break;
             }
-            if !is_hot {
-                bulk_in_flight += 1;
+            if taken.contains(&k) {
+                continue;
             }
-            let edits = self
-                .journal
-                .maps
-                .get(&map)
-                .map_or_else(Vec::new, |j| j.edits_for(&keys));
+            let closure: Vec<ChunkKey> = match journal {
+                Some(j) => j
+                    .read_closure(&[k])
+                    .into_iter()
+                    .filter(|c| *c == k || (wanted(c) && self.data.seeds.contains_key(&[c[0], c[1]])))
+                    .collect(),
+                None => vec![k],
+            };
+            if closure.iter().any(|c| self.building.contains(c)) {
+                continue; // a partner is in flight: wait for it, rebuild together next time
+            }
+            taken.extend(closure.iter().copied());
+            cur.extend(closure);
+            if cur.len() >= BUILD_GROUP {
+                groups.push((std::mem::take(&mut cur), is_hot));
+                if !is_hot {
+                    bulk_in_flight += 1;
+                }
+            }
+        }
+        if !cur.is_empty() {
+            groups.push((cur, cur_hot));
+        }
+        for (mut keys, is_hot) in groups {
+            keys.sort();
+            let edits = journal.map_or_else(Vec::new, |j| j.edits_for(&keys));
             let gens: Vec<u64> = keys
                 .iter()
                 .map(|k| self.edit_gen.get(k).copied().unwrap_or(0))
@@ -414,9 +458,7 @@ impl MonkeyVoxelWorld {
             for k in &keys {
                 self.building.insert(*k);
                 self.rebuild.remove(k);
-                if !self.data.is_active(*k) && !is_hot {
-                    unbuilt -= 1;
-                }
+                self.hot_build.remove(k);
             }
             let job = self.data.build_job(&keys, edits);
             out.push(MonkeyBuildDispatch {
@@ -426,7 +468,7 @@ impl MonkeyVoxelWorld {
                 job,
             });
         }
-        self.unbuilt = unbuilt;
+        self.unbuilt = fresh.iter().filter(|k| !taken.contains(*k)).count();
         out
     }
 
@@ -519,6 +561,8 @@ impl MonkeyVoxelWorld {
             hot,
             window: self.data.window_i8(k),
             skirts: self.skirt_sides(k),
+            seed_h: self.data.window_seed_heights(k),
+            origin_z: benilla_voxel::world::window_origin(k)[2],
         }
     }
 
@@ -606,6 +650,70 @@ impl MonkeyVoxelWorld {
         }
     }
 
+    /// MONKEY (voxel): the columns whose seeded surface chunks are ALL wanted (the carve's
+    /// candidates; meshing decides when they join it).
+    fn surface_columns(&self) -> HashSet<ColumnKey> {
+        self.wanted
+            .iter()
+            .filter_map(|(col, kzs)| {
+                let (lo, hi) = self.data.seeds.get(col)?.surface_chunks()?;
+                (lo..=hi).all(|kz| kzs.contains(&kz)).then_some(*col)
+            })
+            .collect()
+    }
+
+    /// MONKEY (voxel fix): at a CONCAVE corner of the surface-column union (both side neighbours
+    /// carved, the diagonal not) the voxel mesh needs the diagonal column's quad around the shared
+    /// corner, and the carve could only keep a 0.5 × 0.5-yd notch of real ADT ground there — which
+    /// pokes through as a grass square wherever a dig crosses that corner (the conductor's
+    /// fe805d0c audit). Instead the diagonal column is ACTIVATED (seeded, unedited: identical
+    /// ground) so the union has no concave corner at all; repeated to a fixpoint (filling one can
+    /// expose another). A diagonal whose seed is not loaded yet is wanted at the neighbour's
+    /// surface kz range and expands once its seed arrives. Returns how many columns it added.
+    fn fill_concave_corners(&mut self) -> usize {
+        let mut added = 0;
+        for _ in 0..64 {
+            let cols = self.surface_columns();
+            let mut todo: Vec<(ColumnKey, (i32, i32))> = Vec::new();
+            for c in &cols {
+                for (dx, dy) in [(-1, -1), (-1, 1), (1, -1), (1, 1)] {
+                    let d = [c[0] + dx, c[1] + dy];
+                    if !cols.contains(&[c[0] + dx, c[1]])
+                        || !cols.contains(&[c[0], c[1] + dy])
+                        || cols.contains(&d)
+                    {
+                        continue;
+                    }
+                    // The diagonal's own surface range once its seed is known; before that the
+                    // neighbour's (a column waiting for its seed is left alone).
+                    let range = match self.data.seeds.get(&d) {
+                        Some(s) => s.surface_chunks(),
+                        None if self.need_seed.contains(&d) => None,
+                        None => self.data.seeds.get(c).and_then(|s| s.surface_chunks()),
+                    };
+                    if let Some(r) = range {
+                        let wanted = self.wanted.get(&d);
+                        if (r.0..=r.1).any(|kz| !wanted.is_some_and(|w| w.contains(&kz))) {
+                            todo.push((d, r));
+                        }
+                    }
+                }
+            }
+            todo.sort();
+            todo.dedup_by_key(|(d, _)| *d);
+            if todo.is_empty() {
+                break;
+            }
+            for (d, (lo, hi)) in todo {
+                for kz in lo..=hi {
+                    self.want([d[0], d[1], kz]);
+                }
+                added += 1;
+            }
+        }
+        added
+    }
+
     /// Mark the meshes that can see `keys`' samples (the chunks + their 26 neighbours) dirty.
     fn dirty_around(&mut self, keys: &[ChunkKey], hot: bool) {
         for k in keys {
@@ -639,6 +747,20 @@ impl MonkeyVoxelWorld {
         self.journal_dirty |= how != JournalInsert::Duplicate;
         if self.current_map_u16() != Some(e.map) || how == JournalInsert::Duplicate {
             return how; // another map's edit: journalled for when we go there
+        }
+        if !e.is_applied() {
+            // MONKEY (voxel): 4 paint / 5 roughen are wire-defined (CONTRACT §9.3) but not
+            // implemented here yet: journalled (so a later client can apply them), no activation,
+            // no density change — like the server replica, which skips them too.
+            static NOOP_LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if !NOOP_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                info!(
+                    "MONKEY (voxel): edit mode {} (4 paint / 5 roughen) is not applied by this \
+                     client yet — journalled as a no-op (logged once)",
+                    e.mode
+                );
+            }
+            return how;
         }
         let touched = e.touched_chunks();
         self.bump_edit_gen(&touched);
@@ -1232,6 +1354,7 @@ fn monkey_voxel_brush_edit(
         nonce: 0,
         seq: None,
         local: true,
+        ..Default::default()
     };
     world.local_edit(&mut net, e);
 }
@@ -1333,6 +1456,7 @@ fn monkey_voxel_autoedit(
                 nonce: 0,
                 seq: None,
                 local: true,
+                ..Default::default()
             },
         );
         info!(
@@ -1411,6 +1535,7 @@ fn monkey_voxel_autoedit_stroke(
             nonce: 0,
             seq: None,
             local: true,
+            ..Default::default()
         },
     );
 }
@@ -1563,6 +1688,10 @@ struct MonkeyMeshDispatch {
     window: Vec<i8>,
     /// MONKEY (voxel): the sides that get a skirt ([`MonkeyVoxelWorld::skirt_sides`]).
     skirts: [bool; 4],
+    /// MONKEY (voxel): the window's seeded ground heights + its origin z (the per-vertex "edited"
+    /// weight, [`benilla_voxel::world::edited_weights`]).
+    seed_h: Vec<f32>,
+    origin_z: f32,
 }
 
 /// MONKEY (voxel): what a mesh task hands back: the Bevy mesh + its AABB + the trimesh collider
@@ -1590,9 +1719,18 @@ struct MonkeyMeshReady {
 
 /// MONKEY (voxel): the off-thread half of a remesh: surface nets over the snapshot, the Bevy mesh,
 /// its AABB and the parry trimesh collider (the expensive BVH build).
-fn monkey_voxel_mesh_job(window: &[i8], skirts: [bool; 4]) -> MonkeyMeshOut {
+fn monkey_voxel_mesh_job(
+    window: &[i8],
+    skirts: [bool; 4],
+    seed_h: &[f32],
+    origin_z: f32,
+) -> MonkeyMeshOut {
     let mut vm = benilla_voxel::world::mesh_window(window);
+    // MONKEY (voxel): edited weights for the surface; the skirt's vertices (appended below) are
+    // ground-coloured lips (0).
+    let mut edited = benilla_voxel::world::edited_weights(&vm, seed_h, origin_z);
     benilla_voxel::world::add_skirts(&mut vm, skirts, SKIRT_DEPTH);
+    edited.resize(vm.positions.len(), 0.0);
     if vm.indices.len() < 3 {
         return MonkeyMeshOut {
             mesh: None,
@@ -1600,7 +1738,13 @@ fn monkey_voxel_mesh_job(window: &[i8], skirts: [bool; 4]) -> MonkeyMeshOut {
             tris: 0,
         };
     }
-    let mesh = monkey_voxel_mesh_to_bevy(&vm);
+    let mut mesh = monkey_voxel_mesh_to_bevy(&vm);
+    // MONKEY (voxel): the "edited" weight rides in the vertex colour (r) — `monkey_voxel.wgsl`
+    // raises the top/wall slope threshold on edited faces so a dug wall reads as earth.
+    mesh.insert_attribute(
+        Mesh::ATTRIBUTE_COLOR,
+        edited.iter().map(|&e| [e, e, e, 1.0]).collect::<Vec<[f32; 4]>>(),
+    );
     let aabb = mesh.compute_aabb();
     MonkeyMeshOut {
         collider: monkey_voxel_collider(&vm),
@@ -1850,8 +1994,9 @@ fn monkey_voxel_stream(
     // 6. Dispatch remeshes (hot first; bulk under the in-flight cap + dispatch budget).
     let mut dispatched = 0usize;
     for d in world.take_mesh_jobs(dispatch_deadline) {
-        let (window, skirts) = (d.window, d.skirts);
-        let task = pool.spawn(async move { monkey_voxel_mesh_job(&window, skirts) });
+        let (window, skirts, seed_h, origin_z) = (d.window, d.skirts, d.seed_h, d.origin_z);
+        let task =
+            pool.spawn(async move { monkey_voxel_mesh_job(&window, skirts, &seed_h, origin_z) });
         world.meshing.push(MonkeyMeshTask {
             key: d.key,
             gen: d.gen,
@@ -1913,6 +2058,11 @@ fn monkey_voxel_stream(
     // 7. Carve = the surface columns whose surface chunks are all meshed. During a bulk replay it
     //    waits for the queues to drain, so the tile collider / render cells are re-clipped once,
     //    not once per finished column.
+    if world.carve_dirty {
+        // MONKEY (voxel): no concave corners in the union — activate the missing diagonal column
+        // first (its builds keep the carve waiting below until it is meshed).
+        world.fill_concave_corners();
+    }
     if world.carve_dirty && (world.bulk_idle() || hot_attached > 0) {
         world.carve_dirty = false;
         let cols: BTreeSet<ColumnKey> = world
@@ -1953,6 +2103,10 @@ fn monkey_voxel_stream(
 /// normal is at least this upright — where the voxel shader draws the ground layers (its top
 /// weight is `smoothstep(0.5, 0.7, n.z)`), not the wall texture.
 const CLUTTER_MIN_UP: f32 = 0.65;
+/// MONKEY (voxel): … and on an EDITED face (a top more than this many yd off the ADT ground) only
+/// at this uprightness — the shader's edited-face top band (`smoothstep(0.86, 0.95, n.z)`).
+const CLUTTER_EDITED_OFF: f32 = 0.55;
+const CLUTTER_EDITED_MIN_UP: f32 = 0.9;
 /// How far above / below its ADT height a tuft looks for its voxel top (yd).
 const CLUTTER_REACH: f32 = 24.0;
 /// Frame budget (ms) for re-placing MCNK clutter sets (~1–3 ms each); at least one per frame,
@@ -2003,6 +2157,12 @@ fn clutter_replace(
                         return Some(sp.clone());
                     }
                     let (top, n) = data.top_near(x, y, z, CLUTTER_REACH, CLUTTER_MIN_UP)?;
+                    // MONKEY (voxel): on an EDITED face (off the seeded ground) the shader draws
+                    // the ground layers only when it is nearly level — no tuft on a dug slope.
+                    let off = (top - z - benilla_voxel::world::SEED_LIFT).abs();
+                    if off > CLUTTER_EDITED_OFF && n[2] < CLUTTER_EDITED_MIN_UP {
+                        return None;
+                    }
                     let mut sp = sp.clone();
                     sp.placement.position[2] = top;
                     sp.ground_normal = wow_to_bevy(n).to_array();
@@ -2678,6 +2838,7 @@ mod tests {
             nonce: 0,
             seq: None,
             local: true,
+            ..Default::default()
         }
     }
 
@@ -2771,7 +2932,7 @@ mod tests {
             key: d.key,
             gen: d.gen,
             hot: true,
-            out: monkey_voxel_mesh_job(&d.window, d.skirts),
+            out: monkey_voxel_mesh_job(&d.window, d.skirts, &d.seed_h, d.origin_z),
         };
         // The newer finishes first and is shown …
         world.mesh_returned(ready(&b[0]));
@@ -2824,7 +2985,7 @@ mod tests {
         for &k in &keys {
             assert_eq!(sync.chunks[&k], world.data.chunks[&k], "chunk {k:?}");
             // The off-thread mesh job == the sync mesh.
-            let out = monkey_voxel_mesh_job(&world.data.window_i8(k), [false; 4]);
+            let out = monkey_voxel_mesh_job(&world.data.window_i8(k), [false; 4], &[], 0.0);
             assert_eq!(out.tris, sync.mesh(k).tri_count(), "chunk {k:?} mesh");
             assert_eq!(out.collider.is_some(), out.tris > 0);
         }
@@ -2840,6 +3001,133 @@ mod tests {
         drain_builds(&mut world);
         for &k in &keys {
             assert_eq!(sync.chunks[&k], world.data.chunks[&k], "chunk {k:?} after resync");
+        }
+    }
+
+    /// MONKEY (voxel): the canonical rebuild rule through the WHOLE world pipeline (server P1
+    /// finding): random smooth + flatten + dig/build edits, part live in order (incremental, with
+    /// builds of fresh chunks racing them), part bulk and out of order, then a region reset +
+    /// resync — every active chunk equals the full replay (density hash).
+    #[test]
+    fn world_layer_closure_rebuilds_equal_full_replay() {
+        let ground = |x: f32, y: f32| Some(20.0 + 0.05 * x - 0.03 * y + (x * 0.2).sin());
+        let mut s: u64 = 0x5eed;
+        let mut rnd = move || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            (s >> 11) as f32 / (1u64 << 53) as f32
+        };
+        let edits: Vec<VoxelEditOp> = (0..90)
+            .map(|i| {
+                let (x, y) = (rnd() * 56.0 - 4.0, rnd() * 56.0 - 4.0);
+                let mode = (rnd() * 4.0) as u8 % 4;
+                VoxelEditOp {
+                    map: 0,
+                    pos: [x, y, ground(x, y).unwrap() + (rnd() - 0.5) * 3.0],
+                    radius: 1.0 + rnd() * 6.0,
+                    mode,
+                    strength: 60 + (rnd() * 190.0) as u8,
+                    nonce: i as u16,
+                    seq: Some(i as u32 + 1),
+                    local: false,
+                    stroke: 0,
+                    param: ((rnd() - 0.5) * 400.0) as i16 as u16,
+                }
+            })
+            .collect();
+        let full = benilla_voxel::world::full_replay(&edits, ground);
+        let mut world = MonkeyVoxelWorld {
+            map: Some(0),
+            ..Default::default()
+        };
+        for x in -2..=5 {
+            for y in -2..=5 {
+                world
+                    .data
+                    .seeds
+                    .insert([x, y], Arc::new(ColumnSeed::from_fn([x, y], ground)));
+            }
+        }
+        let check = |world: &MonkeyVoxelWorld, what: &str| {
+            let mut bad = 0;
+            for (k, d) in &full.chunks {
+                assert!(world.data.is_active(*k), "{what}: chunk {k:?} never built");
+                if &world.data.chunks[k] != d {
+                    bad += 1;
+                }
+            }
+            assert_eq!(bad, 0, "{what}: {bad} chunk(s) differ from the full replay");
+        };
+        // Live, in order: the first 60, a build drain every 3 edits (fresh chunks race the
+        // incremental smooths).
+        for (i, e) in edits[..60].iter().enumerate() {
+            world.ingest(*e, true);
+            if i % 3 == 2 {
+                drain_builds(&mut world);
+            }
+        }
+        // The rest as a bulk SYNC reply, newest first (all out of order).
+        for e in edits[60..].iter().rev() {
+            world.ingest(*e, false);
+        }
+        drain_builds(&mut world);
+        check(&world, "live + out of order");
+        // A region reset (revert) then the resync of its edits.
+        let reg = edits[10].region();
+        world.reset_region(0, reg.0, reg.1, 5);
+        drain_builds(&mut world);
+        for e in edits.iter().filter(|e| e.region() == reg) {
+            world.ingest(*e, false);
+        }
+        drain_builds(&mut world);
+        check(&world, "after reset + resync");
+    }
+
+    /// MONKEY (voxel fix): an L of surface columns gets its missing diagonal activated — the
+    /// union then has no concave corner, so the carve never keeps an ADT notch inside a dig.
+    #[test]
+    fn concave_corner_activates_the_diagonal_column() {
+        let mut world = MonkeyVoxelWorld {
+            map: Some(0),
+            ..Default::default()
+        };
+        for x in -1..=3 {
+            for y in -1..=3 {
+                world
+                    .data
+                    .seeds
+                    .insert([x, y], Arc::new(ColumnSeed::from_fn([x, y], |_, _| Some(40.0))));
+            }
+        }
+        // Ground 40.15 → surface chunk kz 2 (32..48).
+        for c in [[0, 0], [1, 0], [0, 1]] {
+            world.want([c[0], c[1], 2]);
+        }
+        assert!(!world.surface_columns().contains(&[1, 1]));
+        assert_eq!(world.fill_concave_corners(), 1);
+        let cols = world.surface_columns();
+        assert!(cols.contains(&[1, 1]), "the L's inner diagonal joined");
+        assert_eq!(cols.len(), 4);
+        assert_eq!(world.fill_concave_corners(), 0, "a full square has no concave corner");
+        // A staircase fills to its fixpoint.
+        let mut w2 = MonkeyVoxelWorld {
+            map: Some(0),
+            ..Default::default()
+        };
+        w2.data.seeds = world.data.seeds.clone();
+        for c in [[0, 0], [1, 0], [2, 0], [0, 1], [0, 2]] {
+            w2.want([c[0], c[1], 2]);
+        }
+        assert!(w2.fill_concave_corners() >= 1);
+        let cols = w2.surface_columns();
+        for c in &cols {
+            for (dx, dy) in [(-1, -1), (-1, 1), (1, -1), (1, 1)] {
+                let concave = cols.contains(&[c[0] + dx, c[1]])
+                    && cols.contains(&[c[0], c[1] + dy])
+                    && !cols.contains(&[c[0] + dx, c[1] + dy]);
+                assert!(!concave, "concave corner left at {c:?} ({dx},{dy})");
+            }
         }
     }
 
@@ -2866,6 +3154,7 @@ mod tests {
                 nonce: 0,
                 seq: None,
                 local: true,
+                ..Default::default()
             },
         );
         assert_eq!(net.outbox.len(), 1);

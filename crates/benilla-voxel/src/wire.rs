@@ -7,15 +7,23 @@
 //! - Downlink (server → client): addon whisper `MONKEYVOXEL<TAB><hex>`, one or more fixed-size
 //!   records concatenated: `H` hello-ack (2), `E` edit (27), `D` region-done (14), `X`
 //!   region-reset (9), `R` reject (4).
+//! - MONKEY (voxel) v3 (CONTRACT §7, §9): HELLO offers version 3 (`10 03`); an ACK of 3 selects the
+//!   27-byte EDIT3 uplink (`02…`, + stroke + param) and the 35-byte `e` record (+ stroke, param,
+//!   actor guid); an ACK of 2 keeps the v2 wire. Reject reason 6 = stroke.
 
-use crate::world::{VoxelEditOp, EDIT_WIRE_LEN};
+use crate::world::{VoxelEditOp, EDIT3_WIRE_LEN, EDIT_WIRE_LEN};
 
 /// The addon prefix of the server's whispers.
 pub const SERVER_PREFIX: &str = "MONKEYVOXEL";
 /// The chat command of the uplink.
 pub const MVOX_COMMAND: &str = ".mvox";
-/// Our protocol version (HELLO byte 2) and the one we expect back in `H`.
+/// The v2 protocol version (HELLO byte 2 of a v2 client; an `H 2` = v2 server or v2 negotiation).
 pub const CLIENT_VERSION: u8 = 2;
+/// MONKEY (voxel): the version this client OFFERS in HELLO (CONTRACT §7); the server ACKs
+/// `min(offer, its max)`.
+pub const CLIENT_VERSION_V3: u8 = 3;
+/// MONKEY (voxel): bytes of the `e` record (CONTRACT §9.2).
+pub const EDIT3_RECORD_LEN: usize = 35;
 /// Max SYNC entries per command (CONTRACT §3).
 pub const SYNC_MAX_ENTRIES: usize = 12;
 
@@ -35,6 +43,9 @@ pub enum ServerRecord {
     Hello { version: u8 },
     /// `E`: an accepted edit with its global `seq` (`edit.seq = Some`, `edit.local = false`).
     Edit(VoxelEditOp),
+    /// MONKEY (voxel): `e` (v3): an accepted edit with `seq`, `stroke`, `param`, and the low GUID
+    /// of the character that made it.
+    Edit3 { edit: VoxelEditOp, actor: u32 },
     /// `D`: the region's sync point; `more` = ask again with `after_seq = last_seq`.
     Done {
         map: u16,
@@ -46,7 +57,7 @@ pub enum ServerRecord {
     },
     /// `X`: the region was reverted — drop its journal, adopt `epoch`, re-SYNC from 0.
     Reset { map: u16, rx: i16, ry: i16, epoch: u16 },
-    /// `R`: our EDIT `nonce` was refused (1 rank, 2 range, 3 rate, 4 invalid, 5 map).
+    /// `R`: our EDIT `nonce` was refused (1 rank, 2 range, 3 rate, 4 invalid, 5 map, 6 stroke).
     Reject { nonce: u16, reason: u8 },
 }
 
@@ -71,6 +82,7 @@ pub fn reject_reason(code: u8) -> &'static str {
         3 => "rate (too many edits)",
         4 => "invalid edit",
         5 => "map (not on that map)",
+        6 => "stroke (undone / reverted / closed stroke id)",
         _ => "unknown",
     }
 }
@@ -89,9 +101,19 @@ fn from_hex(s: &str) -> Result<Vec<u8>, WireError> {
         .collect()
 }
 
-/// `.mvox 1002` — HELLO.
+/// `.mvox 1002` — the v2 HELLO.
 pub fn hello_command() -> String {
-    format!("{MVOX_COMMAND} 10{CLIENT_VERSION:02x}")
+    hello_command_v(CLIENT_VERSION)
+}
+
+/// MONKEY (voxel): `.mvox 10<v>` — HELLO offering version `v` (a v3 client sends `.mvox 1003`).
+pub fn hello_command_v(v: u8) -> String {
+    format!("{MVOX_COMMAND} 10{v:02x}")
+}
+
+/// MONKEY (voxel): `.mvox 02…` — one v3 EDIT3 (the 27-byte body). Only after an ACK of 3.
+pub fn edit3_command(e: &VoxelEditOp) -> String {
+    format!("{MVOX_COMMAND} {}", e.to_hex3())
 }
 
 /// `.mvox 01…` — one EDIT (the 23-byte body).
@@ -148,6 +170,7 @@ pub fn decode_records(hex: &str) -> (Vec<ServerRecord>, Option<WireError>) {
             b'D' => 14,
             b'X' => 9,
             b'R' => 4,
+            b'e' => EDIT3_RECORD_LEN,
             other => return (out, Some(WireError::UnknownType(other))),
         };
         if o + len > b.len() {
@@ -166,6 +189,23 @@ pub fn decode_records(hex: &str) -> (Vec<ServerRecord>, Option<WireError>) {
                         e.seq = Some(u32_at(o + 1));
                         e.local = false;
                         ServerRecord::Edit(e)
+                    }
+                    None => return (out, Some(WireError::BadEdit)),
+                }
+            }
+            b'e' => {
+                // `t, seq u32` + the EDIT3 body minus its op byte + `actor u32`.
+                let mut body = [0u8; EDIT3_WIRE_LEN];
+                body[0] = crate::world::EDIT3_OP;
+                body[1..].copy_from_slice(&b[o + 5..o + 31]);
+                match VoxelEditOp::from_wire3(&body) {
+                    Some(mut e) => {
+                        e.seq = Some(u32_at(o + 1));
+                        e.local = false;
+                        ServerRecord::Edit3 {
+                            edit: e,
+                            actor: u32_at(o + 31),
+                        }
                     }
                     None => return (out, Some(WireError::BadEdit)),
                 }
@@ -204,6 +244,12 @@ pub fn encode_record(r: &ServerRecord) -> Vec<u8> {
             b.push(b'E');
             b.extend_from_slice(&e.seq.unwrap_or(0).to_le_bytes());
             b.extend_from_slice(&e.to_wire()[1..]);
+        }
+        ServerRecord::Edit3 { edit, actor } => {
+            b.push(b'e');
+            b.extend_from_slice(&edit.seq.unwrap_or(0).to_le_bytes());
+            b.extend_from_slice(&edit.to_wire3()[1..]);
+            b.extend_from_slice(&actor.to_le_bytes());
         }
         ServerRecord::Done {
             map,
@@ -258,6 +304,12 @@ pub fn is_echo_of(server: &VoxelEditOp, p: &VoxelEditOp) -> bool {
         && server.strength == p.strength
 }
 
+/// MONKEY (voxel): CONTRACT §9.2 confirm rule for a v3 `e`: the v2 body rule ([`is_echo_of`]) AND
+/// `stroke`, `param` equal AND `actor` is our own character's low GUID.
+pub fn is_echo_of3(server: &VoxelEditOp, actor: u32, my_low_guid: u32, p: &VoxelEditOp) -> bool {
+    actor == my_low_guid && server.stroke == p.stroke && server.param == p.param && is_echo_of(server, p)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -272,7 +324,84 @@ mod tests {
             nonce,
             seq,
             local: false,
+            ..Default::default()
         }
+    }
+
+    /// MONKEY (voxel): the CONTRACT §9.1 / §9.2 example vectors, byte for byte.
+    #[test]
+    fn edit3_and_e_record_match_the_contract_vectors() {
+        let e = VoxelEditOp {
+            map: 0,
+            pos: [100.0, -50.0, 20.0],
+            radius: 4.0,
+            mode: crate::world::MODE_FLATTEN,
+            strength: 255,
+            nonce: 7,
+            stroke: 3,
+            param: 150,
+            seq: None,
+            local: false,
+        };
+        // Copied verbatim from CONTRACT §9.1 (spaces are for reading only).
+        let up = "02 0700 0300 0000 0000c842 000048c2 0000a041 00008040 03 ff 9600".replace(' ', "");
+        assert_eq!(e.to_hex3(), up);
+        assert_eq!(up.len(), 54);
+        assert_eq!(VoxelEditOp::from_hex3(&up), Some(e));
+        assert_eq!(edit3_command(&e), format!(".mvox {up}"));
+        assert_eq!(hello_command_v(CLIENT_VERSION_V3), ".mvox 1003");
+        // 'e': seq 1000, actor 42.
+        // CONTRACT §9.2.
+        let down = "65 e8030000 0700 0300 0000 0000c842 000048c2 0000a041 00008040 03 ff 9600 2a000000"
+            .replace(' ', "");
+        assert_eq!(down.len(), 70);
+        let mut se = e;
+        se.seq = Some(1000);
+        let (r, err) = decode_records(&down);
+        assert_eq!(err, None);
+        assert_eq!(r, vec![ServerRecord::Edit3 { edit: se, actor: 42 }]);
+        assert_eq!(encode_records_hex(&r), down);
+        // Mixed with v2 records in one payload; a flatten param is an i16 (negative offsets).
+        let mut neg = se;
+        neg.param = (-250i16) as u16;
+        assert_eq!(neg.flatten_plane(), 17.5);
+        let recs = [
+            ServerRecord::Hello { version: 3 },
+            ServerRecord::Edit3 { edit: neg, actor: 7 },
+            ServerRecord::Reject { nonce: 7, reason: 6 },
+        ];
+        let (back, err) = decode_records(&encode_records_hex(&recs));
+        assert_eq!(err, None);
+        assert_eq!(back, recs.to_vec());
+        assert!(reject_reason(6).starts_with("stroke"));
+        // Bad bodies: wrong op, wrong length, unknown mode.
+        assert!(VoxelEditOp::from_hex3(&e.to_hex()).is_none());
+        let mut bad = e;
+        bad.mode = 6;
+        assert!(VoxelEditOp::from_hex3(&bad.to_hex3()).is_none());
+        let mut paint = e;
+        paint.mode = crate::world::MODE_ROUGHEN;
+        assert!(VoxelEditOp::from_hex3(&paint.to_hex3()).is_some(), "4/5 parse");
+    }
+
+    #[test]
+    fn confirm3_needs_stroke_param_and_our_actor() {
+        let mut p = edit(None, 42);
+        p.local = true;
+        p.stroke = 9;
+        p.mode = crate::world::MODE_FLATTEN;
+        p.param = 120;
+        let mut s = p;
+        s.local = false;
+        s.seq = Some(5);
+        assert!(is_echo_of3(&s, 77, 77, &p));
+        assert!(!is_echo_of3(&s, 78, 77, &p), "another character's edit");
+        let mut st = s;
+        st.stroke = 10;
+        assert!(!is_echo_of3(&st, 77, 77, &p));
+        let mut pa = s;
+        pa.param = 121;
+        assert!(!is_echo_of3(&pa, 77, 77, &p));
     }
 
     #[test]

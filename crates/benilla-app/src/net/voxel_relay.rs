@@ -2,14 +2,17 @@
 //! `disposable/voxel-v2/CONTRACT.md`).
 //!
 //! **SERVER mode** (the authority script `MonkeyVoxelServer.lua` answers): on entering the world
-//! and on every map change the client sends HELLO `.mvox 1002`; an `H` within 10 s selects it.
-//! - uplink: the brush's [`MonkeyVoxelNet`] `outbox` → `.mvox 01…` (23-byte EDIT, hex lowercase);
+//! and on every map change the client sends HELLO `.mvox 1003` (offering v3, CONTRACT §7); an `H`
+//! within 10 s selects it, its version byte is the NEGOTIATED version (3, or 2 from a v2 server).
+//! - uplink: the brush's [`MonkeyVoxelNet`] `outbox` → `.mvox 02…` (v3: 27-byte EDIT3 with stroke +
+//!   param) or `.mvox 01…` (v2: 23-byte EDIT; modes ≥ 3 cannot go there and are dropped locally);
 //!   the server consumes `.mvox` silently and nothing local echoes a sent chat command, so these
 //!   never show in the chat frame.
 //! - downlink: `MONKEYVOXEL<TAB><hex>` addon whispers (sender == receiver; several fixed-size
 //!   records per message), decoded by [`benilla_world::voxel::wire`]. Addon traffic never renders
-//!   in the chat frame (`ui_chat::net`'s `is_addon` branch). `E` → a confirm of OUR prediction
-//!   (nonce AND body equal) or a remote edit (deduped by seq in the journal); `D` → the region's
+//!   in the chat frame (`ui_chat::net`'s `is_addon` branch). `E` / v3 `e` → a confirm of OUR
+//!   prediction (nonce AND body equal; for `e` also stroke, param and actor = our low GUID) or a
+//!   remote edit (deduped by seq in the journal); `D` → the region's
 //!   sync point (`more` → ask again); `X` → reset the region + re-SYNC from 0; `R` → drop the
 //!   prediction (logged with the reason). All go into `MonkeyVoxelNet::events` in ARRIVAL order.
 //! - SYNC: the regions (64 yd) whose centre is within 200 yd of the player and not synced this
@@ -86,6 +89,8 @@ pub(crate) enum MonkeyVoxelMode {
 #[derive(Resource, Default)]
 pub(crate) struct MonkeyVoxelLink {
     pub(crate) mode: MonkeyVoxelMode,
+    /// MONKEY (voxel): the negotiated protocol version (the `H` byte; 0 = no ACK yet).
+    pub(crate) version: u8,
     /// `(self guid, map)` the session state belongs to.
     key: Option<(u64, u32)>,
     hello_at: f32,
@@ -173,6 +178,7 @@ fn regions_near(x: f32, y: f32, radius: f32) -> Vec<((i16, i16), f32)> {
 fn monkey_voxel_route(
     link: &mut MonkeyVoxelLink,
     map: u16,
+    me: u32,
     pending: &[MonkeyVoxelEdit],
     records: Vec<ServerRecord>,
     events: &mut Vec<MonkeyVoxelNetEvent>,
@@ -181,10 +187,25 @@ fn monkey_voxel_route(
     for r in records {
         match r {
             ServerRecord::Hello { .. } => {}
-            ServerRecord::Edit(e) => {
-                let own = pending
-                    .iter()
-                    .find(|p| !confirmed_now.contains(&p.nonce) && wire::is_echo_of(&e, p));
+            ServerRecord::Edit(_) | ServerRecord::Edit3 { .. } => {
+                // MONKEY (voxel): `E` (v2) confirms on the body; `e` (v3) also on stroke, param
+                // and the actor being this character.
+                let (e, own) = match r {
+                    ServerRecord::Edit3 { edit, actor } => (
+                        edit,
+                        pending.iter().find(|p| {
+                            !confirmed_now.contains(&p.nonce)
+                                && wire::is_echo_of3(&edit, actor, me, p)
+                        }),
+                    ),
+                    ServerRecord::Edit(edit) => (
+                        edit,
+                        pending.iter().find(|p| {
+                            !confirmed_now.contains(&p.nonce) && wire::is_echo_of(&edit, p)
+                        }),
+                    ),
+                    _ => unreachable!(),
+                };
                 let seq = e.seq.unwrap_or(0);
                 match own {
                     Some(p) => {
@@ -373,8 +394,8 @@ fn monkey_voxel_link_tick(
                 .collect(),
             ..Default::default()
         };
-        say(&commands, wire::hello_command());
-        info!("MONKEY (voxel): HELLO .mvox 1002 sent (map {map}) — waiting for the server's H");
+        say(&commands, wire::hello_command_v(wire::CLIENT_VERSION_V3));
+        info!("MONKEY (voxel): HELLO .mvox 1003 sent (map {map}) — waiting for the server's H");
     }
     let map16 = map as u16;
 
@@ -385,6 +406,7 @@ fn monkey_voxel_link_tick(
             .iter()
             .find(|r| matches!(r, ServerRecord::Hello { .. }))
         {
+            link.version = *version;
             if link.mode != MonkeyVoxelMode::Server {
                 info!(
                     "MONKEY (voxel): SERVER mode — HELLO-ACK v{version} after {:.1} s (map {map}); \
@@ -395,7 +417,8 @@ fn monkey_voxel_link_tick(
             }
         }
         let pending = world.pending_local(map16);
-        monkey_voxel_route(link, map16, &pending, records, &mut net.events);
+        // The low GUID (CONTRACT §9.2 `actor_guid` = the character's low 32 bits).
+        monkey_voxel_route(link, map16, guid as u32, &pending, records, &mut net.events);
     }
 
     match link.mode {
@@ -409,7 +432,7 @@ fn monkey_voxel_link_tick(
                 );
             } else if age >= HELLO_RETRY_S && link.hello_tries < 2 {
                 link.hello_tries += 1;
-                say(&commands, wire::hello_command());
+                say(&commands, wire::hello_command_v(wire::CLIENT_VERSION_V3));
             }
         }
         MonkeyVoxelMode::Server => {
@@ -511,19 +534,55 @@ fn monkey_voxel_drain_outbox(
         }
         MonkeyVoxelMode::Server => {
             for edit in net.outbox.drain(..).collect::<Vec<_>>() {
-                link.sent_nonces.insert(edit.nonce);
-                debug!("MONKEY (voxel): -> EDIT nonce {}", edit.nonce);
-                say(&commands, wire::edit_command(&edit));
+                match uplink_command(link.version, &edit) {
+                    Some(cmd) => {
+                        link.sent_nonces.insert(edit.nonce);
+                        debug!("MONKEY (voxel): -> EDIT nonce {} (v{})", edit.nonce, link.version);
+                        say(&commands, cmd);
+                    }
+                    None => {
+                        warn!(
+                            "MONKEY (voxel): edit mode {} needs a v3 server (negotiated v{}) — \
+                             dropping the local prediction nonce {}",
+                            edit.mode, link.version, edit.nonce
+                        );
+                        net.events.push(MonkeyVoxelNetEvent::DropLocal {
+                            map: edit.map,
+                            nonce: edit.nonce,
+                        });
+                    }
+                }
             }
         }
         MonkeyVoxelMode::Relay => {
             for edit in net.outbox.drain(..).collect::<Vec<_>>() {
+                if edit.mode > 2 {
+                    // The MV2 relay carries the v2 body only (no stroke / param).
+                    net.events.push(MonkeyVoxelNetEvent::DropLocal {
+                        map: edit.map,
+                        nonce: edit.nonce,
+                    });
+                    continue;
+                }
                 let _ = commands.0.send(ClientCommand::AddonMessage {
                     distribution: AddonDistribution::Guild,
                     text: format!("{MONKEY_VOXEL_PREFIX}{}", edit.to_hex()),
                 });
             }
         }
+    }
+}
+
+/// MONKEY (voxel): the uplink command for one local edit under the negotiated version: v3 → the
+/// EDIT3 body (any mode; stroke + param), v2 → the EDIT body for modes 0-2 only, else `None`
+/// (a v2 server cannot store it — CONTRACT §7.4).
+fn uplink_command(version: u8, edit: &MonkeyVoxelEdit) -> Option<String> {
+    if version >= wire::CLIENT_VERSION_V3 {
+        Some(wire::edit3_command(edit))
+    } else if edit.mode <= 2 {
+        Some(wire::edit_command(edit))
+    } else {
+        None
     }
 }
 
@@ -589,6 +648,7 @@ mod tests {
             nonce,
             seq,
             local,
+            ..Default::default()
         }
     }
 
@@ -602,7 +662,7 @@ mod tests {
             ServerRecord::Edit(op(7, 30.0, Some(42), false)), // another GM, same nonce
             ServerRecord::Reject { nonce: 9, reason: 1 },
         ];
-        monkey_voxel_route(&mut link, 0, &pending, recs, &mut ev);
+        monkey_voxel_route(&mut link, 0, 77, &pending, recs, &mut ev);
         assert_eq!(
             ev[0],
             MonkeyVoxelNetEvent::Confirm {
@@ -613,6 +673,49 @@ mod tests {
         );
         assert!(matches!(ev[1], MonkeyVoxelNetEvent::Edit(e) if e.seq == Some(42)));
         assert_eq!(ev[2], MonkeyVoxelNetEvent::DropLocal { map: 0, nonce: 9 });
+    }
+
+    /// MONKEY (voxel): v3 `e` records confirm only with our actor + stroke + param; the uplink
+    /// picks EDIT3 under v3 and refuses modes >= 3 under v2.
+    #[test]
+    fn route_v3_confirms_with_actor_and_uplink_follows_the_version() {
+        let mut link = MonkeyVoxelLink::default();
+        let mut mine = op(7, 10.0, None, true);
+        mine.stroke = 4;
+        mine.mode = 3;
+        mine.param = 150;
+        let echo = |seq: u32, actor: u32| {
+            let mut e = mine;
+            e.local = false;
+            e.seq = Some(seq);
+            ServerRecord::Edit3 { edit: e, actor }
+        };
+        let mut ev = Vec::new();
+        monkey_voxel_route(
+            &mut link,
+            0,
+            77,
+            &[mine],
+            vec![echo(50, 78), echo(51, 77)],
+            &mut ev,
+        );
+        assert!(
+            matches!(ev[0], MonkeyVoxelNetEvent::Edit(e) if e.seq == Some(50) && e.stroke == 4),
+            "the same body from another character = a remote edit"
+        );
+        assert_eq!(
+            ev[1],
+            MonkeyVoxelNetEvent::Confirm {
+                map: 0,
+                nonce: 7,
+                seq: 51
+            }
+        );
+        assert!(uplink_command(3, &mine).unwrap().starts_with(".mvox 02"));
+        assert_eq!(uplink_command(3, &mine).unwrap().len(), ".mvox ".len() + 54);
+        assert_eq!(uplink_command(2, &mine), None, "flatten cannot go to a v2 server");
+        let dig = op(8, 10.0, None, true);
+        assert!(uplink_command(2, &dig).unwrap().starts_with(".mvox 01"));
     }
 
     #[test]
@@ -639,7 +742,7 @@ mod tests {
         ];
         // A stale prediction from an earlier session (never sent this session) in that region.
         let pending = vec![op(99, 12.0, None, true)];
-        monkey_voxel_route(&mut link, 0, &pending, recs, &mut ev);
+        monkey_voxel_route(&mut link, 0, 77, &pending, recs, &mut ev);
         assert!(matches!(ev[0], MonkeyVoxelNetEvent::Reset { epoch: 3, .. }));
         assert!(matches!(ev[1], MonkeyVoxelNetEvent::Edit(_)));
         assert!(matches!(
@@ -658,6 +761,7 @@ mod tests {
         monkey_voxel_route(
             &mut link,
             0,
+            77,
             &[],
             vec![ServerRecord::Edit(op(2, 11.0, Some(8), false))],
             &mut ev,
@@ -675,6 +779,7 @@ mod tests {
         monkey_voxel_route(
             &mut link,
             0,
+            77,
             &[],
             vec![ServerRecord::Reset {
                 map: 0,
@@ -718,6 +823,7 @@ mod tests {
         monkey_voxel_route(
             &mut link,
             0,
+            77,
             &[],
             vec![ServerRecord::Done {
                 map: 0,

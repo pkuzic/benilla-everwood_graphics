@@ -16,7 +16,7 @@
 //! The journal's binary form (`monkey_voxel_world.bin`) and the v2 EDIT wire body live here too, so
 //! the server lane can reuse the exact encoders.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 use fast_surface_nets::ndshape::ConstShape;
@@ -42,6 +42,24 @@ pub const EDIT_OP: u8 = 0x01;
 /// Bytes of the v2 EDIT body (`op u8, nonce u16, map u16, x f32, y f32, z f32, radius f32, mode u8,
 /// strength u8`).
 pub const EDIT_WIRE_LEN: usize = 23;
+/// MONKEY (voxel): the v3 EDIT3 op byte (CONTRACT §9.1).
+pub const EDIT3_OP: u8 = 0x02;
+/// MONKEY (voxel): bytes of the v3 EDIT3 body (`op u8, nonce u16, stroke u16, map u16, x y z radius
+/// f32, mode u8, strength u8, param u16`, CONTRACT §9.1).
+pub const EDIT3_WIRE_LEN: usize = 27;
+
+/// MONKEY (voxel): edit modes (CONTRACT §1 + §9.3).
+pub const MODE_DIG: u8 = 0;
+pub const MODE_BUILD: u8 = 1;
+pub const MODE_SMOOTH: u8 = 2;
+/// Pull toward the plane `z + (param as i16) / 100`, blend `strength/255` ([`apply_edit_set`]).
+pub const MODE_FLATTEN: u8 = 3;
+/// Wire-defined (CONTRACT §9.3) but not applied by this client yet: journalled, no density change.
+pub const MODE_PAINT: u8 = 4;
+/// Wire-defined (CONTRACT §9.3) but not applied by this client yet: journalled, no density change.
+pub const MODE_ROUGHEN: u8 = 5;
+/// The highest mode the wire defines.
+pub const MODE_MAX: u8 = MODE_ROUGHEN;
 
 const C: i32 = CHUNK as i32;
 
@@ -85,20 +103,27 @@ pub fn owned_index(x: i32, y: i32, z: i32) -> usize {
     (x + C * (y + C * z)) as usize
 }
 
-/// One terrain edit (CONTRACT §1 ops, §3 EDIT body, + the server-assigned `seq` once confirmed).
-#[derive(Clone, Copy, Debug, PartialEq)]
+/// One terrain edit (CONTRACT §1 ops, §3 EDIT / §9.1 EDIT3 body, + the server-assigned `seq` once
+/// confirmed).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct VoxelEditOp {
     pub map: u16,
     /// Brush centre, WoW yards (x north, y west, z up).
     pub pos: [f32; 3],
     /// Brush radius, yards.
     pub radius: f32,
-    /// 0 dig (Subtract), 1 build (Add), 2 smooth.
+    /// 0 dig (Subtract), 1 build (Add), 2 smooth, 3 flatten; 4 paint / 5 roughen are wire-defined
+    /// but not applied yet (`MODE_*`).
     pub mode: u8,
-    /// Smooth strength /255 (dig/build ignore it; sent as 255).
+    /// Smooth / flatten blend /255 (dig/build ignore it; sent as 255).
     pub strength: u8,
     /// Per-sender nonce (matches the server echo to the local prediction).
     pub nonce: u16,
+    /// MONKEY (voxel): v3 stroke id (CONTRACT §9.4); 0 = no stroke (every v2 edit).
+    pub stroke: u16,
+    /// MONKEY (voxel): v3 mode parameter (CONTRACT §9.3): flatten = plane offset in cm as an
+    /// **i16** two's complement; paint = material; roughen = seed; else 0.
+    pub param: u16,
     /// Server sequence once confirmed; `None` = local prediction / guild relay (no server).
     pub seq: Option<u32>,
     /// MONKEY (voxel): THIS client made the edit (brush / AUTOEDIT). Only local edits are uplink
@@ -128,7 +153,25 @@ impl VoxelEditOp {
             && self.radius.is_finite()
             && self.radius > 0.0
             && self.radius <= 16.0
-            && self.mode <= 2
+            && self.mode <= MODE_MAX
+    }
+
+    /// MONKEY (voxel): whether this mode changes density on this client (4 paint / 5 roughen are
+    /// parsed + journalled but not applied yet).
+    pub fn is_applied(&self) -> bool {
+        self.mode <= MODE_FLATTEN
+    }
+
+    /// MONKEY (voxel): whether applying this edit READS samples it does not write (smooth's
+    /// neighbour average) — such an edit links every chunk it touches for a canonical rebuild
+    /// ([`MapJournal::read_closure`]). Dig / build / flatten are per-sample.
+    pub fn reads_neighbours(&self) -> bool {
+        self.mode == MODE_SMOOTH
+    }
+
+    /// MONKEY (voxel): the flatten plane height in WoW yards (`z + (param as i16) / 100`).
+    pub fn flatten_plane(&self) -> f32 {
+        self.pos[2] + (self.param as i16) as f32 / 100.0
     }
 
     /// The inclusive lattice box every sample this edit can change lies in: centre ± radius ± 1
@@ -203,8 +246,64 @@ impl VoxelEditOp {
             strength: b[22],
             seq: None,
             local: false,
+            stroke: 0,
+            param: 0,
         };
         e.is_valid().then_some(e)
+    }
+
+    /// MONKEY (voxel): the 27-byte v3 EDIT3 body (CONTRACT §9.1, little-endian).
+    pub fn to_wire3(&self) -> [u8; EDIT3_WIRE_LEN] {
+        let mut b = [0u8; EDIT3_WIRE_LEN];
+        b[0] = EDIT3_OP;
+        b[1..3].copy_from_slice(&self.nonce.to_le_bytes());
+        b[3..5].copy_from_slice(&self.stroke.to_le_bytes());
+        b[5..7].copy_from_slice(&self.map.to_le_bytes());
+        b[7..11].copy_from_slice(&self.pos[0].to_le_bytes());
+        b[11..15].copy_from_slice(&self.pos[1].to_le_bytes());
+        b[15..19].copy_from_slice(&self.pos[2].to_le_bytes());
+        b[19..23].copy_from_slice(&self.radius.to_le_bytes());
+        b[23] = self.mode;
+        b[24] = self.strength;
+        b[25..27].copy_from_slice(&self.param.to_le_bytes());
+        b
+    }
+
+    /// MONKEY (voxel): decode a v3 EDIT3 body (`seq` = `None`); `None` if malformed / invalid.
+    pub fn from_wire3(b: &[u8]) -> Option<Self> {
+        if b.len() != EDIT3_WIRE_LEN || b[0] != EDIT3_OP {
+            return None;
+        }
+        let f = |o: usize| f32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
+        let e = Self {
+            nonce: u16::from_le_bytes([b[1], b[2]]),
+            stroke: u16::from_le_bytes([b[3], b[4]]),
+            map: u16::from_le_bytes([b[5], b[6]]),
+            pos: [f(7), f(11), f(15)],
+            radius: f(19),
+            mode: b[23],
+            strength: b[24],
+            param: u16::from_le_bytes([b[25], b[26]]),
+            seq: None,
+            local: false,
+        };
+        e.is_valid().then_some(e)
+    }
+
+    /// MONKEY (voxel): lowercase hex of [`Self::to_wire3`] (54 chars).
+    pub fn to_hex3(&self) -> String {
+        self.to_wire3().iter().map(|x| format!("{x:02x}")).collect()
+    }
+
+    /// MONKEY (voxel): decode [`Self::to_hex3`].
+    pub fn from_hex3(s: &str) -> Option<Self> {
+        if s.len() != EDIT3_WIRE_LEN * 2 || !s.is_ascii() {
+            return None;
+        }
+        let b: Vec<u8> = (0..EDIT3_WIRE_LEN)
+            .map(|i| u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).ok())
+            .collect::<Option<Vec<u8>>>()?;
+        Self::from_wire3(&b)
     }
 
     /// Lowercase hex of [`Self::to_wire`] (46 chars).
@@ -429,7 +528,54 @@ pub fn apply_edit_set(
                 }
             }
         }
-        _ => {
+        MODE_FLATTEN => {
+            // MONKEY (voxel): per-sample (reads only the sample it writes), so it never links
+            // chunks. Exact op order (the server's C++ replica must match it bit for bit, IEEE f32,
+            // no FMA): plane `zp = (z + (param as i16) as f32 / 100) / VOXEL_SIZE` (lattice);
+            // `d = sqrt(dx*dx + dy*dy + dz*dz)`; weight `f = min((r - d) / band, 1)` with
+            // `band = max(r * 0.25, 1)` (skip `f <= 0`, i.e. outside the sphere); target
+            // `t = q((z - zp) * DENSITY_SCALE)`; `new = q(old + (t - old) * (s * f))`, `s` =
+            // strength / 255, `q` = round-half-away + clamp to i8.
+            let zp = edit.flatten_plane() / VOXEL_SIZE;
+            let s = edit.strength as f32 / 255.0;
+            let band = (r * 0.25).max(1.0);
+            for k in chunks_of_box(lo, hi) {
+                let Some(d) = set.get_mut(&k) else {
+                    continue;
+                };
+                let base = [k[0] * C, k[1] * C, k[2] * C];
+                let mut any = false;
+                for z in lo[2].max(base[2])..=hi[2].min(base[2] + C - 1) {
+                    let t = ((z as f32 - zp) * DENSITY_SCALE)
+                        .round()
+                        .clamp(i8::MIN as f32, i8::MAX as f32);
+                    for y in lo[1].max(base[1])..=hi[1].min(base[1] + C - 1) {
+                        for x in lo[0].max(base[0])..=hi[0].min(base[0] + C - 1) {
+                            let (dx, dy, dz) = (x as f32 - c[0], y as f32 - c[1], z as f32 - c[2]);
+                            let dist = (dx * dx + dy * dy + dz * dz).sqrt();
+                            let f = ((r - dist) / band).min(1.0);
+                            if f <= 0.0 {
+                                continue;
+                            }
+                            let idx = owned_index(x - base[0], y - base[1], z - base[2]);
+                            let old = d[idx] as f32;
+                            let q = (old + (t - old) * (s * f))
+                                .round()
+                                .clamp(i8::MIN as f32, i8::MAX as f32)
+                                as i8;
+                            if q != d[idx] {
+                                d[idx] = q;
+                                any = true;
+                            }
+                        }
+                    }
+                }
+                if any {
+                    changed.push(k);
+                }
+            }
+        }
+        MODE_SMOOTH => {
             let strength = edit.strength as f32 / 255.0;
             // Gather the pre-edit field over the brush box + the read ring.
             let (glo, ghi) = (
@@ -495,6 +641,9 @@ pub fn apply_edit_set(
             }
             changed.extend(touched);
         }
+        // MONKEY (voxel): 4 paint / 5 roughen — wire-defined, not applied by this client yet
+        // (the world layer logs that once); anything else is invalid and never reaches here.
+        _ => {}
     }
     changed
 }
@@ -558,7 +707,7 @@ impl VoxelWorldData {
         let set: HashSet<ChunkKey> = keys.iter().copied().collect();
         let mut outside: HashMap<ChunkKey, Box<[i8]>> = HashMap::new();
         for e in &edits {
-            if e.mode < 2 || !keys.iter().any(|&k| e.touches(k)) {
+            if !e.reads_neighbours() || !keys.iter().any(|&k| e.touches(k)) {
                 continue;
             }
             let (lo, hi) = e.lattice_bbox();
@@ -685,6 +834,29 @@ impl VoxelWorldData {
             }
         }
         w
+    }
+
+    /// MONKEY (voxel): the SEEDED surface height (WoW z, lift included; `-inf` = no ground) of
+    /// every lattice column of chunk `k`'s 34×34 mesh-window footprint (x fastest), read through
+    /// the owner column's seed, else `k`'s own seed window, else `-inf`. The mesh job compares the
+    /// voxel surface against it ([`edited_weights`]): dug / built faces read as earth.
+    pub fn window_seed_heights(&self, k: ChunkKey) -> Vec<f32> {
+        let s = SAMPLES as i32;
+        let base = [k[0] * C - 1, k[1] * C - 1];
+        let own = self.seeds.get(&[k[0], k[1]]);
+        let mut out = Vec::with_capacity((s * s) as usize);
+        for ly in 0..s {
+            for lx in 0..s {
+                let (ix, iy) = (base[0] + lx, base[1] + ly);
+                let h = [self.seeds.get(&[chunk_of(ix), chunk_of(iy)]), own]
+                    .into_iter()
+                    .flatten()
+                    .find(|sd| sd.covers(ix, iy))
+                    .map_or(f32::NEG_INFINITY, |sd| sd.height_lat(ix, iy));
+                out.push(h);
+            }
+        }
+        out
     }
 
     /// Mesh chunk `k` from its [`Self::window`]. Positions are WoW-axis yards relative to the
@@ -840,6 +1012,87 @@ pub fn mesh_window(win: &[i8]) -> VoxelMesh {
     }
 }
 
+/// MONKEY (voxel): FNV-1a-64 over the chunks in key order (`kx, ky, kz` as i32 LE, then the 32³
+/// density bytes) — the "density hash" two replays are compared by (tests, golden vectors).
+pub fn chunks_hash(chunks: &HashMap<ChunkKey, Box<[i8]>>) -> u64 {
+    let mut keys: Vec<&ChunkKey> = chunks.keys().collect();
+    keys.sort();
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut eat = |b: u8| {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0100_0000_01b3);
+    };
+    for k in keys {
+        for a in k {
+            a.to_le_bytes().into_iter().for_each(&mut eat);
+        }
+        chunks[k].iter().for_each(|&v| eat(v as u8));
+    }
+    h
+}
+
+/// MONKEY (voxel): the CANONICAL reference: every chunk any valid edit touches is seeded from
+/// `height` and the whole edit list is applied to the whole set in order (CONTRACT §1 "rebuild
+/// chunk"). What every partial / incremental / async path must reproduce.
+pub fn full_replay(
+    edits: &[VoxelEditOp],
+    mut height: impl FnMut(f32, f32) -> Option<f32>,
+) -> VoxelWorldData {
+    let mut keys: BTreeSet<ChunkKey> = BTreeSet::new();
+    for e in edits.iter().filter(|e| e.is_valid() && e.is_applied()) {
+        keys.extend(e.touched_chunks());
+    }
+    let mut w = VoxelWorldData::default();
+    for k in &keys {
+        w.seeds
+            .entry([k[0], k[1]])
+            .or_insert_with(|| Arc::new(ColumnSeed::from_fn([k[0], k[1]], &mut height)));
+    }
+    let keys: Vec<ChunkKey> = keys.into_iter().collect();
+    w.build(&keys, edits.iter().filter(|e| e.is_valid()));
+    w
+}
+
+/// MONKEY (voxel): how far (yd) a voxel surface may sit off the seeded ground and still count as
+/// untouched ground (the seed is ADT + [`SEED_LIFT`]; surface nets moves a vertex ≤ ~0.25 yd).
+pub const EDITED_FROM: f32 = 0.3;
+/// … and over how many yards beyond that the "edited" weight ramps to 1.
+pub const EDITED_RAMP: f32 = 0.5;
+
+/// MONKEY (voxel): per vertex of a [`mesh_window`] mesh (positions relative to the window origin,
+/// whose WoW z is `origin_z`), how EDITED the surface is there: 0 = on the seeded (real) ground,
+/// 1 = ≥ [`EDITED_FROM`] + [`EDITED_RAMP`] yd off it (a pit wall / floor, a mound, an overhang).
+/// `seed_h` = [`VoxelWorldData::window_seed_heights`] (bilinear between lattice columns; a missing
+/// column counts as edited; any other length = all 0). The shader keeps natural slopes on the
+/// ground's own top mapping (a seeded hillside matches the real ground beside it) but sends
+/// steep EDITED faces to the earth / rock wall layer.
+pub fn edited_weights(m: &VoxelMesh, seed_h: &[f32], origin_z: f32) -> Vec<f32> {
+    let s = SAMPLES as usize;
+    if seed_h.len() != s * s {
+        return vec![0.0; m.positions.len()];
+    }
+    let at = |x: usize, y: usize| seed_h[x.min(s - 1) + y.min(s - 1) * s];
+    m.positions
+        .iter()
+        .map(|p| {
+            let (fx, fy) = (p[0] / VOXEL_SIZE, p[1] / VOXEL_SIZE);
+            let (ix, iy) = (fx.floor().max(0.0) as usize, fy.floor().max(0.0) as usize);
+            let (tx, ty) = (
+                (fx - ix as f32).clamp(0.0, 1.0),
+                (fy - iy as f32).clamp(0.0, 1.0),
+            );
+            let hs = [at(ix, iy), at(ix + 1, iy), at(ix, iy + 1), at(ix + 1, iy + 1)];
+            if hs.iter().any(|h| !h.is_finite()) {
+                return 1.0;
+            }
+            let h = (hs[0] * (1.0 - tx) + hs[1] * tx) * (1.0 - ty)
+                + (hs[2] * (1.0 - tx) + hs[3] * tx) * ty;
+            let dz = (p[2] + origin_z - h).abs();
+            ((dz - EDITED_FROM) / EDITED_RAMP).clamp(0.0, 1.0)
+        })
+        .collect()
+}
+
 /// MONKEY (voxel): `n` deterministic synthetic edits (the bench / `WOW_VOXEL_SYNTH_EDITS` hook)
 /// spread over a `span`-yard square centred on `centre`, sitting on `ground(x, y)` (`None` →
 /// `centre_z`): ~60 % digs, ~30 % builds, ~10 % smooths, radius 1.5–4 yd, all confirmed with
@@ -881,6 +1134,8 @@ pub fn synth_edits(
                 nonce: i as u16,
                 seq: Some(i as u32 + 1),
                 local: false,
+                stroke: 0,
+                param: 0,
             }
         })
         .collect()
@@ -1161,9 +1416,9 @@ impl MapJournal {
     }
 
     /// MONKEY (voxel): file `e` under every chunk it touches (invalid edits — e.g. a corrupt file's
-    /// absurd radius — are never applied, so never indexed).
+    /// absurd radius — and the not-yet-applied modes 4 / 5 change nothing, so are never indexed).
     fn index_add(&mut self, key: EditOrder, e: &VoxelEditOp) {
-        if !e.is_valid() {
+        if !e.is_valid() || !e.is_applied() {
             return;
         }
         for k in e.touched_chunks() {
@@ -1172,7 +1427,7 @@ impl MapJournal {
     }
 
     fn index_remove(&mut self, key: EditOrder, e: &VoxelEditOp) {
-        if !e.is_valid() {
+        if !e.is_valid() || !e.is_applied() {
             return;
         }
         for k in e.touched_chunks() {
@@ -1201,6 +1456,31 @@ impl MapJournal {
             }
         }
         m.into_values().collect()
+    }
+
+    /// MONKEY (voxel): the CANONICAL REBUILD SET of `keys` — the server's P1 finding
+    /// (`voxel-core/NAV-P1.md` §8): a smooth reads every chunk of its bbox at the moment it is
+    /// applied, so rebuilding a chunk alone (its smooth partners read at their CURRENT density)
+    /// differs from the full replay. The set is grown to the transitive closure of chunks linked
+    /// by neighbour-reading edits ([`VoxelEditOp::reads_neighbours`]): every such edit touching a
+    /// member brings all chunks it touches. Rebuilding the closure in lockstep equals the full
+    /// replay for every member. Sorted; includes `keys`.
+    pub fn read_closure(&self, keys: &[ChunkKey]) -> BTreeSet<ChunkKey> {
+        let mut set: BTreeSet<ChunkKey> = keys.iter().copied().collect();
+        let mut queue: Vec<ChunkKey> = set.iter().copied().collect();
+        while let Some(k) = queue.pop() {
+            let Some(ix) = self.index.get(&k) else {
+                continue;
+            };
+            for e in ix.values().filter(|e| e.reads_neighbours()) {
+                for t in e.touched_chunks() {
+                    if set.insert(t) {
+                        queue.push(t);
+                    }
+                }
+            }
+        }
+        set
     }
 
     /// MONKEY (voxel): the chunks any (valid) edit touches — what entering the map activates.
@@ -1358,7 +1638,7 @@ pub struct VoxelJournal {
 /// Why a journal file could not be read.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum JournalError {
-    /// Not a v2 journal (wrong magic) — e.g. a v1 file.
+    /// Not a v2/v3 journal (wrong magic) — e.g. a v1 file.
     BadMagic,
     /// A journal of another format version.
     Version(u16),
@@ -1367,12 +1647,14 @@ pub enum JournalError {
 }
 
 const JOURNAL_MAGIC: &[u8; 4] = b"MVXW";
-const JOURNAL_VERSION: u16 = 2;
+/// MONKEY (voxel): v3 adds `stroke u16, param u16` per edit; v2 files still load (both 0).
+const JOURNAL_VERSION: u16 = 3;
 
 impl VoxelJournal {
-    /// Serialise (little-endian): `"MVXW", u16 version, u16 maps`, then per map `u16 map,
+    /// Serialise (little-endian): `"MVXW", u16 version (= 3), u16 maps`, then per map `u16 map,
     /// u32 regions × (i16 rx, i16 ry, u16 epoch, u32 last_seq), u32 edits × (f32 x, f32 y, f32 z,
-    /// f32 radius, u8 mode, u8 strength, u16 nonce, u8 flags (bit0 has_seq, bit1 local), u32 seq)`.
+    /// f32 radius, u8 mode, u8 strength, u16 nonce, u8 flags (bit0 has_seq, bit1 local), u32 seq,
+    /// u16 stroke, u16 param)`. A v2 file is the same without the last two fields.
     pub fn encode(&self) -> Vec<u8> {
         let mut b = Vec::new();
         b.extend_from_slice(JOURNAL_MAGIC);
@@ -1398,6 +1680,8 @@ impl VoxelJournal {
                 // Flags: bit 0 = has seq, bit 1 = local.
                 b.push(e.seq.is_some() as u8 | (e.local as u8) << 1);
                 b.extend_from_slice(&e.seq.unwrap_or(0).to_le_bytes());
+                b.extend_from_slice(&e.stroke.to_le_bytes());
+                b.extend_from_slice(&e.param.to_le_bytes());
             }
         }
         b
@@ -1432,7 +1716,7 @@ impl VoxelJournal {
         }
         let mut r = R(b, 4);
         let v = r.u16()?;
-        if v != JOURNAL_VERSION {
+        if v != 2 && v != JOURNAL_VERSION {
             return Err(JournalError::Version(v));
         }
         let mut out = Self::default();
@@ -1457,6 +1741,7 @@ impl VoxelJournal {
                 let flags = r.u8()?;
                 let has = flags & 1 != 0;
                 let seq = r.u32()?;
+                let (stroke, param) = if v >= 3 { (r.u16()?, r.u16()?) } else { (0, 0) };
                 edits.push(VoxelEditOp {
                     map,
                     pos,
@@ -1466,6 +1751,8 @@ impl VoxelJournal {
                     nonce,
                     seq: has.then_some(seq),
                     local: flags & 2 != 0,
+                    stroke,
+                    param,
                 });
             }
             // Re-establish the canonical order whatever the file held.
@@ -1514,6 +1801,7 @@ mod tests {
             nonce: 0,
             seq: None,
             local: true,
+            ..Default::default()
         }
     }
 
@@ -1534,7 +1822,7 @@ mod tests {
     fn brute(j: &MapJournal, keys: &[ChunkKey]) -> Vec<VoxelEditOp> {
         j.edits()
             .iter()
-            .filter(|e| e.is_valid() && keys.iter().any(|&k| e.touches(k)))
+            .filter(|e| e.is_valid() && e.is_applied() && keys.iter().any(|&k| e.touches(k)))
             .copied()
             .collect()
     }
@@ -1551,7 +1839,7 @@ mod tests {
         let all: HashSet<ChunkKey> = j
             .edits()
             .iter()
-            .filter(|e| e.is_valid())
+            .filter(|e| e.is_valid() && e.is_applied())
             .flat_map(|e| e.touched_chunks())
             .collect();
         let idx: HashSet<ChunkKey> = j.indexed_chunks().collect();
@@ -1875,6 +2163,7 @@ mod tests {
             nonce: 0xbeef,
             seq: None,
             local: false,
+            ..Default::default()
         };
         let h = e.to_hex();
         assert_eq!(h.len(), 46);
@@ -1970,6 +2259,264 @@ mod tests {
         assert_eq!(dropped.len(), 1);
         assert_eq!(m.edits().len(), 1);
         assert_eq!(m.regions[&(0, 0)], RegionSync { epoch: 4, last_seq: 0 });
+    }
+
+    /// MONKEY (voxel): the per-vertex "edited" weight is 0 on the untouched seeded ground and 1
+    /// down in a pit.
+    #[test]
+    fn edited_weights_mark_the_pit_not_the_ground() {
+        let k = [0, 0, 1];
+        let w = world_with(&[k], &[edit([8.0, 8.0, 20.0], 4.0, MODE_DIG)]);
+        let m = w.mesh(k);
+        let o = window_origin(k);
+        let e = edited_weights(&m, &w.window_seed_heights(k), o[2]);
+        assert_eq!(e.len(), m.positions.len());
+        let (mut ground, mut pit) = (0, 0);
+        for (p, &v) in m.positions.iter().zip(&e) {
+            let (x, y, z) = (p[0] + o[0], p[1] + o[1], p[2] + o[2]);
+            let g = ground_h(x, y) + SEED_LIFT;
+            if ((x - 8.0).powi(2) + (y - 8.0).powi(2)).sqrt() > 6.0 {
+                assert!(v < 0.05, "untouched ground at ({x},{y}) weight {v}");
+                ground += 1;
+            } else if z < g - 1.5 {
+                assert!(v > 0.99, "pit at ({x},{y},{z}) weight {v}");
+                pit += 1;
+            }
+        }
+        assert!(ground > 50 && pit > 20, "{ground} ground / {pit} pit vertices");
+        assert!(edited_weights(&m, &[], 0.0).iter().all(|&v| v == 0.0));
+    }
+
+    fn ground_h(x: f32, y: f32) -> f32 {
+        ground(x, y).unwrap()
+    }
+
+    /// MONKEY (voxel): v3 journal round trip (stroke + param survive), and a v2 file still loads.
+    #[test]
+    fn journal_v3_round_trips_and_v2_files_still_load() {
+        let mut j = VoxelJournal::default();
+        let m = j.maps.entry(0).or_default();
+        let mut f = edit([10.0, 20.0, 30.0], 2.0, MODE_FLATTEN);
+        f.stroke = 812;
+        f.param = (-37i16) as u16;
+        f.seq = Some(4);
+        m.insert(f);
+        let mut p = edit([11.0, 20.0, 30.0], 2.0, MODE_SMOOTH);
+        p.stroke = 813;
+        p.nonce = 5;
+        m.insert(p);
+        m.regions.insert((0, 0), RegionSync { epoch: 1, last_seq: 4 });
+        let bytes = j.encode();
+        assert_eq!(u16::from_le_bytes([bytes[4], bytes[5]]), 3, "written as v3");
+        let back = VoxelJournal::decode(&bytes).expect("decode v3");
+        assert_eq!(back, j);
+        assert_eq!(back.maps[&0].edits()[0].param as i16, -37);
+        assert_eq!(back.maps[&0].edits()[1].stroke, 813);
+        // The same journal as a v2 file (no stroke / param): loads with both 0.
+        let mut v2 = Vec::new();
+        v2.extend_from_slice(b"MVXW");
+        v2.extend_from_slice(&2u16.to_le_bytes());
+        v2.extend_from_slice(&1u16.to_le_bytes());
+        v2.extend_from_slice(&0u16.to_le_bytes());
+        v2.extend_from_slice(&0u32.to_le_bytes());
+        v2.extend_from_slice(&2u32.to_le_bytes());
+        for e in j.maps[&0].edits() {
+            for v in [e.pos[0], e.pos[1], e.pos[2], e.radius] {
+                v2.extend_from_slice(&v.to_le_bytes());
+            }
+            v2.push(e.mode);
+            v2.push(e.strength);
+            v2.extend_from_slice(&e.nonce.to_le_bytes());
+            v2.push(e.seq.is_some() as u8 | (e.local as u8) << 1);
+            v2.extend_from_slice(&e.seq.unwrap_or(0).to_le_bytes());
+        }
+        let old = VoxelJournal::decode(&v2).expect("a v2 file loads");
+        let es = old.maps[&0].edits();
+        assert_eq!(es.len(), 2);
+        assert!(es.iter().all(|e| e.stroke == 0 && e.param == 0));
+        assert_eq!(es[0].pos, f.pos);
+        assert_eq!(es[0].seq, Some(4));
+        let mut v4 = bytes.clone();
+        v4[4] = 4;
+        assert_eq!(VoxelJournal::decode(&v4), Err(JournalError::Version(4)));
+    }
+
+    /// MONKEY (voxel): flatten pulls the ground onto its plane (offset by `param` cm), blends by
+    /// strength, and is a no-op outside its sphere; paint / roughen change nothing.
+    #[test]
+    fn flatten_levels_to_the_plane_and_modes_4_5_are_noops() {
+        let bumpy = |x: f32, y: f32| Some(20.0 + (x * 0.4).sin() * 1.2 + (y * 0.3).cos() * 0.9);
+        let keys: Vec<ChunkKey> = vec![[0, 0, 1], [1, 0, 1], [0, 1, 1], [1, 1, 1], [0, 0, 0], [1, 1, 0]];
+        let world = |es: &[VoxelEditOp]| {
+            let mut w = VoxelWorldData::default();
+            for k in &keys {
+                w.seeds
+                    .entry([k[0], k[1]])
+                    .or_insert_with(|| Arc::new(ColumnSeed::from_fn([k[0], k[1]], bumpy)));
+            }
+            w.build(&keys, es.iter());
+            w
+        };
+        let mut fl = edit([16.0, 16.0, 20.0], 6.0, MODE_FLATTEN);
+        fl.param = 50; // plane 20.5
+        let w = world(&[fl]);
+        for (x, y) in [(16.0, 16.0), (14.0, 17.5), (18.2, 15.1)] {
+            let (z, n) = w.top_near(x, y, 20.0, 8.0, 0.5).expect("a top");
+            assert!((z - 20.5).abs() < 0.05, "({x},{y}) levelled to the plane: {z}");
+            assert!(n[2] > 0.99, "flat: {n:?}");
+        }
+        // Outside the sphere the ground is untouched (seed = ADT + lift).
+        let (z, _) = w.top_near(30.0, 30.0, 20.0, 8.0, 0.0).unwrap();
+        assert!((z - (bumpy(30.0, 30.0).unwrap() + SEED_LIFT)).abs() < 0.05);
+        // Half strength lands between the ground and the plane at the centre.
+        let mut half = fl;
+        half.strength = 128;
+        half.param = (-200i16) as u16; // plane 18.0
+        let g = bumpy(16.0, 16.0).unwrap() + SEED_LIFT;
+        let (z, _) = world(&[half]).top_near(16.0, 16.0, 20.0, 8.0, 0.0).unwrap();
+        assert!(z < g - 0.3 && z > 18.0 + 0.3, "half-way: ground {g} plane 18 got {z}");
+        // Deterministic: the same op twice = the same bytes; paint / roughen = the seed.
+        assert_eq!(world(&[fl]).chunks, w.chunks);
+        let base = world(&[]);
+        for m in [MODE_PAINT, MODE_ROUGHEN] {
+            let mut e = fl;
+            e.mode = m;
+            assert!(e.is_valid() && !e.is_applied());
+            assert_eq!(world(&[e]).chunks, base.chunks, "mode {m} is a no-op");
+        }
+    }
+
+    fn rand_edits(rng: &mut Lcg, n: usize, ground: impl Fn(f32, f32) -> Option<f32>) -> Vec<VoxelEditOp> {
+        (0..n)
+            .map(|i| {
+                let x = rng.f() * 56.0 - 12.0;
+                let y = rng.f() * 56.0 - 12.0;
+                let z = ground(x, y).unwrap_or(20.0) + (rng.f() - 0.5) * 3.0;
+                let mode = match rng.n(10) {
+                    0..=2 => MODE_DIG,
+                    3..=4 => MODE_BUILD,
+                    5..=7 => MODE_SMOOTH,
+                    8 => MODE_FLATTEN,
+                    _ => MODE_PAINT,
+                };
+                VoxelEditOp {
+                    map: 0,
+                    pos: [x, y, z],
+                    radius: 0.5 + rng.f() * 7.5,
+                    mode,
+                    strength: 40 + rng.n(216) as u8,
+                    nonce: i as u16,
+                    seq: Some(i as u32 + 1),
+                    local: false,
+                    stroke: 1 + (i / 4) as u16,
+                    param: ((rng.f() - 0.5) * 300.0) as i16 as u16,
+                }
+            })
+            .collect()
+    }
+
+    /// MONKEY (voxel): the CANONICAL rebuild rule (server P1 finding): random edit lists with
+    /// smooth + flatten — a partial rebuild of the read-closure, an incremental in-order apply,
+    /// out-of-order arrival with closure rebuilds, and the off-thread job all equal the full
+    /// replay (density hash equal). A partial rebuild WITHOUT the closure must differ somewhere
+    /// (the test has teeth).
+    #[test]
+    fn closure_rebuilds_equal_full_replay() {
+        let ground = |x: f32, y: f32| Some(20.0 + 0.04 * x - 0.03 * y + (x * 0.25).sin() * 0.7);
+        let mut rng = Lcg(7);
+        let mut teeth = 0;
+        for round in 0..6 {
+            let edits = rand_edits(&mut rng, 40, ground);
+            let full = full_replay(&edits, ground);
+            let keys: Vec<ChunkKey> = {
+                let mut k: Vec<ChunkKey> = full.chunks.keys().copied().collect();
+                k.sort();
+                k
+            };
+            let h_full = chunks_hash(&full.chunks);
+            let mut j = MapJournal::default();
+            for e in &edits {
+                j.insert(*e);
+            }
+            // Partial rebuilds: random subsets, grown to the closure, on top of a scrambled copy.
+            for _ in 0..8 {
+                let pick: Vec<ChunkKey> = keys.iter().copied().filter(|_| rng.n(5) == 0).collect();
+                let set: Vec<ChunkKey> = j.read_closure(&pick).into_iter().collect();
+                let mut w = VoxelWorldData {
+                    chunks: full.chunks.clone(),
+                    seeds: full.seeds.clone(),
+                };
+                for k in &set {
+                    w.chunks.get_mut(k).unwrap().fill(-77); // garbage: the rebuild must not read it
+                }
+                w.build(&set, j.edits_for(&set).iter());
+                assert_eq!(chunks_hash(&w.chunks), h_full, "round {round}: closure partial");
+                // Without the closure (the old rule): the picked chunks alone, neighbours read at
+                // their CURRENT (final) density.
+                let mut w = VoxelWorldData {
+                    chunks: full.chunks.clone(),
+                    seeds: full.seeds.clone(),
+                };
+                w.build(&pick, j.edits_for(&pick).iter());
+                if chunks_hash(&w.chunks) != h_full {
+                    teeth += 1;
+                }
+            }
+            // Incremental, in order, every chunk active from the start.
+            let mut inc = VoxelWorldData {
+                chunks: HashMap::new(),
+                seeds: full.seeds.clone(),
+            };
+            inc.build(&keys, std::iter::empty());
+            for e in &edits {
+                inc.apply_incremental(e);
+            }
+            assert_eq!(chunks_hash(&inc.chunks), h_full, "round {round}: incremental");
+            // Out of order: shuffled arrival; in-order ones incremental, out-of-order ones rebuild
+            // the closure of what they touch (chunks activate as they are first touched).
+            let mut order: Vec<usize> = (0..edits.len()).collect();
+            for i in (1..order.len()).rev() {
+                order.swap(i, rng.n(i as u32 + 1) as usize);
+            }
+            let mut j2 = MapJournal::default();
+            let mut ooo = VoxelWorldData {
+                chunks: HashMap::new(),
+                seeds: full.seeds.clone(),
+            };
+            for &i in &order {
+                let e = edits[i];
+                let how = j2.insert(e);
+                let fresh: Vec<ChunkKey> = e
+                    .touched_chunks()
+                    .into_iter()
+                    .filter(|k| !ooo.is_active(*k))
+                    .collect();
+                if how == JournalInsert::Appended && fresh.is_empty() {
+                    ooo.apply_incremental(&e);
+                } else {
+                    let set: Vec<ChunkKey> = j2.read_closure(&e.touched_chunks()).into_iter().collect();
+                    ooo.build(&set, j2.edits_for(&set).iter());
+                }
+            }
+            assert_eq!(chunks_hash(&ooo.chunks), h_full, "round {round}: out of order");
+            // Off-thread: the closure groups as jobs on another thread.
+            let mut asy = VoxelWorldData {
+                chunks: HashMap::new(),
+                seeds: full.seeds.clone(),
+            };
+            let mut left: BTreeSet<ChunkKey> = keys.iter().copied().collect();
+            while let Some(&k) = left.iter().next() {
+                let set: Vec<ChunkKey> = j.read_closure(&[k]).into_iter().collect();
+                for s in &set {
+                    left.remove(s);
+                }
+                let job = asy.build_job(&set, j.edits_for(&set));
+                let out = std::thread::spawn(move || job.run()).join().unwrap();
+                asy.insert_built(out);
+            }
+            assert_eq!(chunks_hash(&asy.chunks), h_full, "round {round}: async closure jobs");
+        }
+        assert!(teeth > 0, "a non-closure partial rebuild never differed: the test has no teeth");
     }
 
     #[test]
