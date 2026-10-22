@@ -21,9 +21,11 @@ use std::time::Instant;
 
 use avian3d::prelude::{Collider, RigidBody, SpatialQuery, SpatialQueryFilter};
 use bevy::asset::RenderAssetUsages;
-use bevy::camera::primitives::MeshAabb;
+use bevy::camera::primitives::{Aabb, MeshAabb};
 use bevy::mesh::{Indices, PrimitiveTopology};
 use bevy::prelude::*;
+use bevy::tasks::futures_lite::future;
+use bevy::tasks::{block_on, AsyncComputeTaskPool, Task};
 
 mod material;
 pub use material::MonkeyVoxelMaterial;
@@ -49,13 +51,23 @@ pub type MonkeyVoxelEdit = VoxelEditOp;
 
 /// Hard cap on active chunks (32 KB of density each → 128 MB at the cap).
 pub const MONKEY_VOXEL_MAX_CHUNKS: usize = 4096;
-/// Wall-clock per frame for BULK meshing (journal replay, stream-in); the brush's own chunks are
-/// always meshed the same frame.
-const MESH_BUDGET_MS: f32 = 4.0;
+/// MONKEY (voxel): main-thread wall clock per frame for snapshotting build / mesh inputs (the work
+/// itself runs on the async compute pool); hot (live-edit) work is always dispatched.
+const DISPATCH_MS: f32 = 2.0;
+/// MONKEY (voxel): main-thread wall clock per frame for attaching finished meshes (≥ 1 per frame).
+const ATTACH_MS: f32 = 2.0;
+/// MONKEY (voxel): chunks per off-thread build group (built in lockstep, like the sync build).
+const BUILD_GROUP: usize = 4;
+/// MONKEY (voxel): bulk build groups / bulk meshes in flight at most, so a live edit's hot task
+/// never queues behind a whole replay on the pool.
+const MAX_BUILD_TASKS: usize = 4;
+const MAX_MESH_TASKS: usize = 8;
+/// MONKEY (voxel): remote edits per frame still applied LIVE (incrementally); more = a burst →
+/// the bulk (off-thread rebuild) path. Also bounded by [`LIVE_APPLY_MS`] of inline applying.
+const LIVE_EDITS_PER_FRAME: usize = 8;
+const LIVE_APPLY_MS: f32 = 2.0;
 /// Column seeds sampled per frame at most (each = 36² raw height queries).
 const SEEDS_PER_FRAME: usize = 16;
-/// Chunks (re)built per frame at most.
-const BUILDS_PER_FRAME: usize = 16;
 
 /// Marks one world voxel chunk's entity.
 #[derive(Component)]
@@ -155,6 +167,29 @@ pub struct MonkeyVoxelWorld {
     perf: Vec<(f32, f32)>,
     /// MONKEY (voxel): the drain of a live edit's hot chunks over frames: (frames, max stream ms).
     perf_drain: Option<(u32, f32)>,
+    /// MONKEY (voxel): wanted chunks with a seed but no density yet, as of the last stream pass.
+    unbuilt: usize,
+    /// MONKEY (voxel): per-chunk build-input generation ([`Self::bump_edit_gen`]).
+    edit_gen: HashMap<ChunkKey, u64>,
+    /// MONKEY (voxel): a live edit's not-yet-active chunks (built ahead of the bulk queue).
+    hot_build: HashSet<ChunkKey>,
+    /// MONKEY (voxel): builds on the pool, and the chunks they cover.
+    builds: Vec<MonkeyBuildTask>,
+    building: HashSet<ChunkKey>,
+    /// MONKEY (voxel): meshes on the pool, how many per chunk, finished ones awaiting attach,
+    /// the generation each chunk shows, the dispatch counter (= generations).
+    meshing: Vec<MonkeyMeshTask>,
+    mesh_in_flight: HashMap<ChunkKey, u32>,
+    mesh_ready: HashMap<ChunkKey, MonkeyMeshReady>,
+    shown_gen: HashMap<ChunkKey, u64>,
+    mesh_seq: u64,
+    /// MONKEY (voxel): hot chunks dispatched whose new mesh is not shown yet (the perf drain).
+    hot_wait: HashSet<ChunkKey>,
+    /// MONKEY (voxel): counters for the logs / tests.
+    stale_builds: usize,
+    stale_meshes: usize,
+    built_total: usize,
+    meshed_total: usize,
 }
 
 impl Default for MonkeyVoxelWorld {
@@ -184,6 +219,21 @@ impl Default for MonkeyVoxelWorld {
             timing_logs: 40,
             perf: Vec::new(),
             perf_drain: None,
+            unbuilt: 0,
+            edit_gen: HashMap::new(),
+            hot_build: HashSet::new(),
+            builds: Vec::new(),
+            building: HashSet::new(),
+            meshing: Vec::new(),
+            mesh_in_flight: HashMap::new(),
+            mesh_ready: HashMap::new(),
+            shown_gen: HashMap::new(),
+            mesh_seq: 0,
+            hot_wait: HashSet::new(),
+            stale_builds: 0,
+            stale_meshes: 0,
+            built_total: 0,
+            meshed_total: 0,
         }
     }
 }
@@ -220,6 +270,262 @@ impl MonkeyVoxelWorld {
     pub fn active_chunks(&self) -> usize {
         self.data.chunks.len()
     }
+
+    /// MONKEY (voxel): nothing queued or in flight — every wanted chunk built and meshed.
+    pub fn settled(&self) -> bool {
+        self.need_seed.is_empty()
+            && self.rebuild.is_empty()
+            && self.dirty.is_empty()
+            && self.hot.is_empty()
+            && self.hot_wait.is_empty()
+            && self.bulk_idle()
+    }
+
+    /// MONKEY (voxel): the inputs of `keys`' canonical builds changed (an edit touching them was
+    /// filed, reordered or dropped): any build of them in flight is now stale.
+    fn bump_edit_gen(&mut self, keys: &[ChunkKey]) {
+        for k in keys {
+            *self.edit_gen.entry(*k).or_default() += 1;
+        }
+    }
+
+    /// MONKEY (voxel): nothing building, meshing or queued for the bulk path (the carve waits for
+    /// this during a replay so the terrain is re-clipped once).
+    fn bulk_idle(&self) -> bool {
+        self.dirty.is_empty()
+            && self.rebuild.is_empty()
+            && self.unbuilt == 0
+            && self.hot_build.is_empty()
+            && self.builds.is_empty()
+            && self.meshing.is_empty()
+            && self.mesh_ready.is_empty()
+    }
+
+    /// MONKEY (voxel): pick this frame's canonical builds and snapshot them into `Send` jobs (the
+    /// caller runs them on the pool, or inline in tests). Hot groups (a live edit's fresh chunks)
+    /// always go; bulk ones (rebuilds first, then never-built wanted chunks) while fewer than
+    /// [`MAX_BUILD_TASKS`] bulk groups are in flight and before `deadline`. A chunk already in
+    /// flight waits for its result. Also refreshes [`Self::unbuilt`].
+    fn take_build_jobs(&mut self, deadline: Instant) -> Vec<MonkeyBuildDispatch> {
+        let mut out = Vec::new();
+        let Some(map) = self.current_map_u16() else {
+            return out;
+        };
+        let seeded = |s: &Self, k: &ChunkKey| s.data.seeds.contains_key(&[k[0], k[1]]);
+        // Hot: a live edit's not-yet-active chunks.
+        let mut hot: Vec<ChunkKey> = self
+            .hot_build
+            .iter()
+            .copied()
+            .filter(|k| !self.building.contains(k) && seeded(self, k))
+            .collect();
+        hot.retain(|k| !self.data.is_active(*k));
+        hot.sort();
+        for k in &hot {
+            self.hot_build.remove(k);
+        }
+        let active_hot: Vec<ChunkKey> = self
+            .hot_build
+            .iter()
+            .copied()
+            .filter(|k| self.data.is_active(*k))
+            .collect();
+        for k in active_hot {
+            self.hot_build.remove(&k);
+        }
+        // Bulk: out-of-order / reset rebuilds, then the wanted chunks never built.
+        let mut bulk: Vec<ChunkKey> = self
+            .rebuild
+            .iter()
+            .copied()
+            .filter(|k| !self.building.contains(k))
+            .collect();
+        bulk.retain(|k| self.data.is_active(*k));
+        let stale: Vec<ChunkKey> = self
+            .rebuild
+            .iter()
+            .copied()
+            .filter(|k| !self.data.is_active(*k) && !self.building.contains(k))
+            .collect();
+        for k in stale {
+            self.rebuild.remove(&k); // never built: the unbuilt scan below builds it canonically
+        }
+        bulk.sort();
+        let mut fresh: Vec<ChunkKey> = Vec::new();
+        for (col, kzs) in &self.wanted {
+            if !self.data.seeds.contains_key(col) {
+                continue;
+            }
+            for &kz in kzs {
+                let k = [col[0], col[1], kz];
+                if !self.data.is_active(k) && !self.building.contains(&k) && !hot.contains(&k) {
+                    fresh.push(k);
+                }
+            }
+        }
+        fresh.sort();
+        let mut groups: Vec<(Vec<ChunkKey>, bool)> = hot
+            .chunks(BUILD_GROUP)
+            .map(|g| (g.to_vec(), true))
+            .collect();
+        groups.extend(bulk.chunks(BUILD_GROUP).map(|g| (g.to_vec(), false)));
+        groups.extend(fresh.chunks(BUILD_GROUP).map(|g| (g.to_vec(), false)));
+        let mut bulk_in_flight = self.builds.iter().filter(|t| !t.hot).count();
+        let mut unbuilt = fresh.len();
+        for (keys, is_hot) in groups {
+            if !is_hot && (bulk_in_flight >= MAX_BUILD_TASKS || Instant::now() >= deadline) {
+                break;
+            }
+            if !is_hot {
+                bulk_in_flight += 1;
+            }
+            let edits = self
+                .journal
+                .maps
+                .get(&map)
+                .map_or_else(Vec::new, |j| j.edits_for(&keys));
+            let gens: Vec<u64> = keys
+                .iter()
+                .map(|k| self.edit_gen.get(k).copied().unwrap_or(0))
+                .collect();
+            for k in &keys {
+                self.building.insert(*k);
+                self.rebuild.remove(k);
+                if !self.data.is_active(*k) && !is_hot {
+                    unbuilt -= 1;
+                }
+            }
+            let job = self.data.build_job(&keys, edits);
+            out.push(MonkeyBuildDispatch {
+                keys,
+                gens,
+                hot: is_hot,
+                job,
+            });
+        }
+        self.unbuilt = unbuilt;
+        out
+    }
+
+    /// MONKEY (voxel): a build came back. Adopted only if none of its chunks' inputs changed since
+    /// dispatch (per-chunk [`Self::edit_gen`]); a stale result is DISCARDED and its chunks requeued
+    /// (active → rebuild; inactive → the unbuilt scan / hot set), so it can never overwrite newer
+    /// data. Returns whether it was adopted.
+    fn finish_build(
+        &mut self,
+        keys: &[ChunkKey],
+        gens: &[u64],
+        hot: bool,
+        out: Vec<(ChunkKey, Box<[i8]>)>,
+    ) -> bool {
+        for k in keys {
+            self.building.remove(k);
+        }
+        let stale = keys
+            .iter()
+            .zip(gens)
+            .any(|(k, g)| self.edit_gen.get(k).copied().unwrap_or(0) != *g);
+        if stale {
+            self.stale_builds += 1;
+            for &k in keys {
+                if self.data.is_active(k) {
+                    self.rebuild.insert(k);
+                } else if hot {
+                    self.hot_build.insert(k);
+                }
+            }
+            return false;
+        }
+        let built = self.data.insert_built(out);
+        self.dirty_around(&built, hot);
+        self.carve_dirty = true;
+        self.built_total += built.len();
+        true
+    }
+
+    /// MONKEY (voxel): pick this frame's remeshes and snapshot their windows: every hot chunk (at
+    /// most 2 in flight per chunk), then dirty ones while fewer than [`MAX_MESH_TASKS`] bulk meshes
+    /// are in flight and before `deadline`. Each gets a fresh, monotonically increasing generation.
+    fn take_mesh_jobs(&mut self, deadline: Instant) -> Vec<MonkeyMeshDispatch> {
+        let mut out = Vec::new();
+        let hot: Vec<ChunkKey> = self.hot.iter().copied().collect();
+        for k in hot {
+            if !self.data.is_active(k) {
+                self.hot.remove(&k);
+                continue;
+            }
+            if self.mesh_in_flight.get(&k).copied().unwrap_or(0) >= 2 {
+                continue; // stays hot: dispatched when one returns
+            }
+            self.hot.remove(&k);
+            self.dirty.remove(&k);
+            self.hot_wait.insert(k);
+            out.push(self.mesh_dispatch(k, true));
+        }
+        let mut bulk_in_flight = self.meshing.iter().filter(|t| !t.hot).count();
+        if bulk_in_flight >= MAX_MESH_TASKS || self.dirty.is_empty() {
+            return out;
+        }
+        let mut cand: Vec<ChunkKey> = self
+            .dirty
+            .iter()
+            .copied()
+            .filter(|k| self.mesh_in_flight.get(k).copied().unwrap_or(0) == 0)
+            .collect();
+        cand.sort();
+        for k in cand {
+            if bulk_in_flight >= MAX_MESH_TASKS || Instant::now() >= deadline {
+                break;
+            }
+            self.dirty.remove(&k);
+            if !self.data.is_active(k) {
+                continue;
+            }
+            bulk_in_flight += 1;
+            out.push(self.mesh_dispatch(k, false));
+        }
+        out
+    }
+
+    fn mesh_dispatch(&mut self, k: ChunkKey, hot: bool) -> MonkeyMeshDispatch {
+        self.mesh_seq += 1;
+        *self.mesh_in_flight.entry(k).or_default() += 1;
+        MonkeyMeshDispatch {
+            key: k,
+            gen: self.mesh_seq,
+            hot,
+            window: self.data.window_i8(k),
+        }
+    }
+
+    /// MONKEY (voxel): a mesh came back (task done). Keeps only the newest pending result per
+    /// chunk; the attach decides against what is shown.
+    fn mesh_returned(&mut self, r: MonkeyMeshReady) {
+        if let Some(n) = self.mesh_in_flight.get_mut(&r.key) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                self.mesh_in_flight.remove(&r.key);
+            }
+        }
+        match self.mesh_ready.get(&r.key) {
+            Some(old) if old.gen > r.gen => {
+                self.stale_meshes += 1;
+            }
+            _ => {
+                if self.mesh_ready.insert(r.key, r).is_some() {
+                    self.stale_meshes += 1;
+                }
+            }
+        }
+    }
+
+    /// MONKEY (voxel): whether a finished mesh of generation `gen` may replace what chunk `k`
+    /// shows: the chunk is still active and nothing NEWER was attached (results can finish out of
+    /// order; an older snapshot must never overwrite a newer one).
+    fn mesh_is_fresh(&self, k: ChunkKey, gen: u64) -> bool {
+        self.data.is_active(k) && self.shown_gen.get(&k).is_none_or(|&s| gen > s)
+    }
+
 
     fn current_map_u16(&self) -> Option<u16> {
         self.map.map(|m| m as u16)
@@ -288,19 +594,29 @@ impl MonkeyVoxelWorld {
     }
 
     /// Put one edit through the canonical path: journal (canonical order), activation, and the
-    /// incremental apply when it is in order (else a rebuild of the chunks it touches). `hot` =
-    /// remesh this frame (a live local / remote edit).
-    fn ingest(&mut self, e: VoxelEditOp, hot: bool) -> JournalInsert {
+    /// incremental apply when it is in order (else a rebuild of the chunks it touches).
+    ///
+    /// MONKEY (voxel): `live` = a live local / remote edit: applied incrementally on this thread
+    /// (sub-ms) and remeshed hot, its fresh chunks built hot. Not live = BULK (a SYNC reply, a
+    /// burst): never applied here — its active chunks are queued for an off-thread canonical
+    /// rebuild instead, so a 500-edit resync costs the frame nothing. Either way every chunk it
+    /// touches gets a new edit generation (an in-flight build of it is now stale).
+    fn ingest(&mut self, e: VoxelEditOp, live: bool) -> JournalInsert {
         let how = self.journal.maps.entry(e.map).or_default().insert(e);
         self.journal_dirty |= how != JournalInsert::Duplicate;
         if self.current_map_u16() != Some(e.map) || how == JournalInsert::Duplicate {
             return how; // another map's edit: journalled for when we go there
         }
-        for k in e.touched_chunks() {
+        let touched = e.touched_chunks();
+        self.bump_edit_gen(&touched);
+        for &k in &touched {
             self.want(k);
+            if live && !self.data.is_active(k) {
+                self.hot_build.insert(k);
+            }
         }
         match how {
-            JournalInsert::Appended => {
+            JournalInsert::Appended if live => {
                 self.data.apply_incremental(&e);
                 // The meshes seeing the bbox (+ apron) — only chunks already active.
                 let remesh: Vec<ChunkKey> = e
@@ -309,15 +625,11 @@ impl MonkeyVoxelWorld {
                     .filter(|k| self.data.is_active(*k))
                     .collect();
                 for k in remesh {
-                    if hot {
-                        self.hot.insert(k);
-                    } else {
-                        self.dirty.insert(k);
-                    }
+                    self.hot.insert(k);
                 }
             }
-            JournalInsert::OutOfOrder => {
-                for k in e.touched_chunks() {
+            JournalInsert::Appended | JournalInsert::OutOfOrder => {
+                for &k in &touched {
                     if self.data.is_active(k) {
                         self.rebuild.insert(k);
                     }
@@ -326,6 +638,16 @@ impl MonkeyVoxelWorld {
             JournalInsert::Duplicate => {}
         }
         how
+    }
+
+    /// MONKEY (voxel): `keys` changed their canonical inputs: new generation + rebuild the active.
+    fn requeue(&mut self, keys: &[ChunkKey]) {
+        self.bump_edit_gen(keys);
+        for &k in keys {
+            if self.data.is_active(k) {
+                self.rebuild.insert(k);
+            }
+        }
     }
 
     /// A LOCAL edit (brush / AUTOEDIT): stamps map + nonce, ingests it, queues it for the uplink.
@@ -358,11 +680,7 @@ impl MonkeyVoxelWorld {
         if let Some((e, how)) = j.confirm(nonce, seq) {
             self.journal_dirty = true;
             if how == JournalInsert::OutOfOrder && self.current_map_u16() == Some(map) {
-                for k in e.touched_chunks() {
-                    if self.data.is_active(k) {
-                        self.rebuild.insert(k);
-                    }
-                }
+                self.requeue(&e.touched_chunks());
             }
         }
     }
@@ -377,13 +695,8 @@ impl MonkeyVoxelWorld {
             .reset_region(rx, ry, epoch);
         self.journal_dirty = true;
         if self.current_map_u16() == Some(map) {
-            for e in &dropped {
-                for k in e.touched_chunks() {
-                    if self.data.is_active(k) {
-                        self.rebuild.insert(k);
-                    }
-                }
-            }
+            let keys: HashSet<ChunkKey> = dropped.iter().flat_map(|e| e.touched_chunks()).collect();
+            self.requeue(&keys.into_iter().collect::<Vec<_>>());
         }
     }
 
@@ -392,11 +705,7 @@ impl MonkeyVoxelWorld {
         let e = self.journal.maps.get_mut(&map)?.remove_pending(nonce)?;
         self.journal_dirty = true;
         if self.current_map_u16() == Some(map) {
-            for k in e.touched_chunks() {
-                if self.data.is_active(k) {
-                    self.rebuild.insert(k);
-                }
-            }
+            self.requeue(&e.touched_chunks());
         }
         Some(e)
     }
@@ -427,6 +736,17 @@ impl MonkeyVoxelWorld {
         self.carve = None;
         self.carve_dirty = false;
         self.cap_warned = false;
+        // MONKEY (voxel): dropping a Task cancels it; nothing of the old map can land.
+        self.unbuilt = 0;
+        self.edit_gen.clear();
+        self.hot_build.clear();
+        self.builds.clear();
+        self.building.clear();
+        self.meshing.clear();
+        self.mesh_in_flight.clear();
+        self.mesh_ready.clear();
+        self.shown_gen.clear();
+        self.hot_wait.clear();
     }
 }
 
@@ -703,12 +1023,15 @@ impl Plugin for MonkeyVoxelPlugin {
         app.init_resource::<MonkeyVoxelHideState>();
         app.init_resource::<MonkeyVoxelWorld>();
         app.init_resource::<MonkeyVoxelTileMaterials>();
+        app.init_resource::<MonkeyVoxelPerf>();
         app.add_systems(
             Update,
             (
+                monkey_voxel_clock_start,
                 monkey_voxel_map_watch,
                 monkey_voxel_brush_edit,
                 monkey_voxel_autoedit,
+                monkey_voxel_synth,
                 monkey_voxel_apply_inbox,
                 monkey_voxel_stream,
                 monkey_voxel_tile_materials,
@@ -716,6 +1039,7 @@ impl Plugin for MonkeyVoxelPlugin {
                 monkey_voxel_hide_terrain,
                 monkey_voxel_probe_rays,
                 monkey_voxel_journal_autosave,
+                monkey_voxel_clock_end,
             )
                 .chain()
                 .run_if(crate::schedule::world_is_live),
@@ -747,21 +1071,20 @@ fn monkey_voxel_map_watch(
     }
     world.clear_map_state();
     world.map = Some(map.0);
-    let edits: Vec<VoxelEditOp> = world
+    // MONKEY (voxel): the journal index already knows every chunk an edit touches.
+    let (n, keys): (usize, Vec<ChunkKey>) = world
         .journal
         .maps
         .get(&(map.0 as u16))
-        .map(|j| j.edits().to_vec())
+        .map(|j| (j.edits().len(), j.indexed_chunks().collect()))
         .unwrap_or_default();
-    for e in &edits {
-        for k in e.touched_chunks() {
-            world.want(k);
-        }
+    for k in keys {
+        world.want(k);
     }
     info!(
         "MONKEY (voxel): world layer on map {} — {} journalled edit(s), {} chunk(s) to activate.",
         map.0,
-        edits.len(),
+        n,
         world.wanted_count
     );
 }
@@ -998,7 +1321,7 @@ fn monkey_voxel_autoedit_stroke(
     if !stroke.armed {
         return;
     }
-    let settled = world.dirty.is_empty() && world.hot.is_empty() && world.need_seed.is_empty() && world.rebuild.is_empty();
+    let settled = world.settled();
     if stroke.step == 0 && stroke.quiet < 3.0 {
         stroke.quiet = if settled { stroke.quiet + time.delta_secs() } else { 0.0 };
         return;
@@ -1037,17 +1360,33 @@ fn monkey_voxel_autoedit_stroke(
     );
 }
 
-/// Drain the network inboxes into the canonical path (remote edits are remeshed this frame).
+/// Drain the network inboxes into the canonical path.
+///
+/// MONKEY (voxel): a trickle of remote edits (≤ [`LIVE_EDITS_PER_FRAME`], within
+/// [`LIVE_APPLY_MS`]) is applied LIVE (incremental + hot remesh, like our own brush); a burst (a
+/// SYNC reply, a resync after `X`) goes BULK — journalled and its chunks rebuilt off-thread — so the
+/// frame never replays hundreds of edits inline.
 fn monkey_voxel_apply_inbox(mut net: ResMut<MonkeyVoxelNet>, mut world: ResMut<MonkeyVoxelWorld>) {
     if world.map.is_none() {
         return; // keep buffering until the first world entry
     }
+    let n_edits = net.inbox.len()
+        + net
+            .events
+            .iter()
+            .filter(|e| matches!(e, MonkeyVoxelNetEvent::Edit(_)))
+            .count();
+    let t0 = Instant::now();
+    let live_for = |t0: &Instant| {
+        n_edits <= LIVE_EDITS_PER_FRAME && t0.elapsed().as_secs_f32() * 1000.0 < LIVE_APPLY_MS
+    };
     let edits: Vec<VoxelEditOp> = net.inbox.drain(..).collect();
     let n = edits.len();
     for mut e in edits {
         e.local = false; // MONKEY (voxel): a remote record is never our own prediction
         if e.is_valid() {
-            world.ingest(e, true);
+            let live = live_for(&t0);
+            world.ingest(e, live);
         }
     }
     if n > 0 {
@@ -1070,6 +1409,7 @@ fn monkey_voxel_apply_inbox(mut net: ResMut<MonkeyVoxelNet>, mut world: ResMut<M
         return;
     }
     let (mut applied, mut dup, mut confirmed) = (Vec::new(), 0usize, Vec::new());
+    let mut bulk = 0usize;
     for ev in events {
         match ev {
             MonkeyVoxelNetEvent::Edit(mut e) => {
@@ -1077,7 +1417,9 @@ fn monkey_voxel_apply_inbox(mut net: ResMut<MonkeyVoxelNet>, mut world: ResMut<M
                 if !e.is_valid() {
                     continue;
                 }
-                match world.ingest(e, true) {
+                let live = live_for(&t0);
+                bulk += !live as usize;
+                match world.ingest(e, live) {
                     JournalInsert::Duplicate => dup += 1,
                     _ => applied.push(e.seq.unwrap_or(0)),
                 }
@@ -1112,21 +1454,104 @@ fn monkey_voxel_apply_inbox(mut net: ResMut<MonkeyVoxelNet>, mut world: ResMut<M
         }
     }
     if !applied.is_empty() || dup > 0 {
-        info!(
-            "MONKEY (voxel): server edits APPLIED seq {:?} ({} duplicate(s) skipped)",
-            applied, dup
-        );
+        if applied.len() > 16 {
+            info!(
+                "MONKEY (voxel): server edits APPLIED: {} (seq {}..={}, {bulk} via the bulk \
+                 rebuild path; {} duplicate(s) skipped) in {:.2} ms",
+                applied.len(),
+                applied.iter().min().unwrap_or(&0),
+                applied.iter().max().unwrap_or(&0),
+                dup,
+                t0.elapsed().as_secs_f32() * 1000.0
+            );
+        } else {
+            info!(
+                "MONKEY (voxel): server edits APPLIED seq {:?} ({} duplicate(s) skipped)",
+                applied, dup
+            );
+        }
     }
     if !confirmed.is_empty() {
         info!("MONKEY (voxel): own edits CONFIRMED by seq {confirmed:?} (not re-applied)");
     }
 }
 
+/// MONKEY (voxel): a canonical build picked by [`MonkeyVoxelWorld::take_build_jobs`].
+struct MonkeyBuildDispatch {
+    keys: Vec<ChunkKey>,
+    gens: Vec<u64>,
+    hot: bool,
+    job: benilla_voxel::world::VoxelBuildJob,
+}
+
+/// MONKEY (voxel): a build running on the async compute pool → (densities, run ms).
+struct MonkeyBuildTask {
+    keys: Vec<ChunkKey>,
+    gens: Vec<u64>,
+    hot: bool,
+    task: Task<(Vec<(ChunkKey, Box<[i8]>)>, f32)>,
+}
+
+/// MONKEY (voxel): a remesh picked by [`MonkeyVoxelWorld::take_mesh_jobs`] (its window snapshot).
+struct MonkeyMeshDispatch {
+    key: ChunkKey,
+    gen: u64,
+    hot: bool,
+    window: Vec<i8>,
+}
+
+/// MONKEY (voxel): what a mesh task hands back: the Bevy mesh + its AABB + the trimesh collider
+/// (all built off-thread), or nothing for an empty surface.
+struct MonkeyMeshOut {
+    mesh: Option<(Mesh, Option<Aabb>)>,
+    collider: Option<Collider>,
+    tris: usize,
+}
+
+struct MonkeyMeshTask {
+    key: ChunkKey,
+    gen: u64,
+    hot: bool,
+    task: Task<MonkeyMeshOut>,
+}
+
+/// MONKEY (voxel): a finished mesh waiting for the attach budget.
+struct MonkeyMeshReady {
+    key: ChunkKey,
+    gen: u64,
+    hot: bool,
+    out: MonkeyMeshOut,
+}
+
+/// MONKEY (voxel): the off-thread half of a remesh: surface nets over the snapshot, the Bevy mesh,
+/// its AABB and the parry trimesh collider (the expensive BVH build).
+fn monkey_voxel_mesh_job(window: &[i8]) -> MonkeyMeshOut {
+    let vm = benilla_voxel::world::mesh_window(window);
+    if vm.indices.len() < 3 {
+        return MonkeyMeshOut {
+            mesh: None,
+            collider: None,
+            tris: 0,
+        };
+    }
+    let mesh = monkey_voxel_mesh_to_bevy(&vm);
+    let aabb = mesh.compute_aabb();
+    MonkeyMeshOut {
+        collider: monkey_voxel_collider(&vm),
+        tris: vm.tri_count(),
+        mesh: Some((mesh, aabb)),
+    }
+}
+
 /// The stream: load column seeds once their tiles are resident (→ surface-column activation),
 /// build wanted chunks (seed + their journal edits in canonical order), rebuild out-of-order ones,
-/// mesh the hot chunks now and the dirty ones within [`MESH_BUDGET_MS`], spawn / update the chunk
-/// entities (mesh + per-tile material + collider), and republish the carve when the set of
-/// fully-meshed surface columns changes.
+/// remesh hot then dirty chunks, spawn / update the chunk entities (mesh + per-tile material +
+/// collider), and republish the carve when the set of fully-meshed surface columns changes.
+///
+/// MONKEY (voxel): builds (seed + indexed journal replay) and remeshes (surface nets + Bevy mesh +
+/// trimesh collider) run on the ASYNC COMPUTE POOL; the main thread only snapshots inputs
+/// ([`DISPATCH_MS`]), adopts finished builds (generation-checked) and attaches finished meshes
+/// ([`ATTACH_MS`], newest generation wins).
 #[allow(clippy::too_many_arguments)]
 fn monkey_voxel_stream(
     mut commands: Commands,
@@ -1138,6 +1563,7 @@ fn monkey_voxel_stream(
     template: Res<MonkeyVoxelMaterialHandle>,
     mut tile_mats: ResMut<MonkeyVoxelTileMaterials>,
     handles: Query<&Mesh3d, With<MonkeyVoxelChunk>>,
+    epoch: Option<ResMut<crate::collision::ColliderEpoch>>,
 ) {
     let world = &mut *world;
     let t_stream = Instant::now();
@@ -1181,101 +1607,103 @@ fn monkey_voxel_stream(
         }
     }
 
-    // 2. Build wanted chunks that have a seed but no density yet (canonical: seed + journal), and
-    //    rebuild the out-of-order ones.
-    let map = world.current_map_u16();
-    let mut to_build: Vec<ChunkKey> = Vec::new();
-    'outer: for (col, kzs) in &world.wanted {
-        if !world.data.seeds.contains_key(col) {
+    // 2. Finished builds: adopt the fresh ones (→ remesh around them), requeue the stale ones.
+    let mut i = 0;
+    while i < world.builds.len() {
+        let done = block_on(future::poll_once(&mut world.builds[i].task));
+        let Some((out, run_ms)) = done else {
+            i += 1;
             continue;
+        };
+        let t = world.builds.swap_remove(i);
+        let n = out.len();
+        let adopted = world.finish_build(&t.keys, &t.gens, t.hot, out);
+        if world.timing_logs > 0 {
+            world.timing_logs -= 1;
+            info!(
+                "MONKEY (voxel): build of {n} chunk(s) {} — {run_ms:.2} ms off-thread{}",
+                if adopted { "adopted" } else { "DISCARDED (stale: newer edits)" },
+                if t.hot { " (hot)" } else { "" }
+            );
         }
-        for &kz in kzs {
-            let k = [col[0], col[1], kz];
-            if !world.data.is_active(k) {
-                to_build.push(k);
-                if to_build.len() >= BUILDS_PER_FRAME {
-                    break 'outer;
-                }
-            }
-        }
-    }
-    let mut rebuilt: Vec<ChunkKey> = world.rebuild.drain().collect();
-    rebuilt.retain(|k| world.data.is_active(*k));
-    for set in [to_build, rebuilt] {
-        if set.is_empty() {
-            continue;
-        }
-        let t0 = Instant::now();
-        let edits: Vec<VoxelEditOp> = map
-            .and_then(|m| world.journal.maps.get(&m))
-            .map(|j| j.edits().to_vec())
-            .unwrap_or_default();
-        let built = world.data.build(&set, edits.iter());
-        // A handful (a live brush stroke activating fresh ground) is meshed this frame; a bulk
-        // journal replay goes through the frame budget.
-        let hot = built.len() <= 8;
-        world.dirty_around(&built, hot);
-        info!(
-            "MONKEY (voxel): built {} chunk(s) (seed + {} journal edit(s) scanned) in {:.2} ms",
-            built.len(),
-            edits.len(),
-            t0.elapsed().as_secs_f32() * 1000.0
-        );
-        world.carve_dirty = true;
     }
 
-    // 3. Mesh within the frame budget: hot chunks (live edits) FIRST, then dirty ones.
-    //    MONKEY (voxel): a held 8-yd brush touches ~8 chunks per edit (~15 ms of mesh + trimesh
-    //    collider in one frame); the hot set is now also spread over frames by the
-    //    [`MESH_BUDGET_MS`] budget (≥ 1 chunk per frame), nearest-to-the-edit order irrelevant:
-    //    a chunk meshes the CURRENT density when its turn comes, so the latest density always wins,
-    //    and a chunk touched again while queued is meshed once.
-    let t0 = Instant::now();
-    let mut queue: Vec<ChunkKey> = Vec::new();
-    let hot_n = world.hot.len();
-    let (mut meshed_n, mut tris_n, mut i) = (0usize, 0usize, 0usize);
-    loop {
-        if i >= queue.len() {
-            if i > 0 && t0.elapsed().as_secs_f32() * 1000.0 >= MESH_BUDGET_MS {
-                break;
-            }
-            let next = match world.hot.iter().next().copied() {
-                Some(k) => {
-                    world.hot.remove(&k);
-                    world.dirty.remove(&k);
-                    k
-                }
-                None => {
-                    let Some(&k) = world.dirty.iter().next() else {
-                        break;
-                    };
-                    world.dirty.remove(&k);
-                    k
-                }
-            };
-            queue.push(next);
+    // 3. Dispatch builds (hot first; bulk under the in-flight cap + dispatch budget).
+    let dispatch_deadline = t_stream + std::time::Duration::from_secs_f32(DISPATCH_MS / 1000.0);
+    let pool = AsyncComputeTaskPool::get();
+    for d in world.take_build_jobs(dispatch_deadline) {
+        let job = d.job;
+        let task = pool.spawn(async move {
+            let t = Instant::now();
+            let out = job.run();
+            (out, t.elapsed().as_secs_f32() * 1000.0)
+        });
+        world.builds.push(MonkeyBuildTask {
+            keys: d.keys,
+            gens: d.gens,
+            hot: d.hot,
+            task,
+        });
+    }
+
+    // 4. Finished meshes → the ready map (newest per chunk).
+    let mut i = 0;
+    while i < world.meshing.len() {
+        let Some(out) = block_on(future::poll_once(&mut world.meshing[i].task)) else {
+            i += 1;
+            continue;
+        };
+        let t = world.meshing.swap_remove(i);
+        world.mesh_returned(MonkeyMeshReady {
+            key: t.key,
+            gen: t.gen,
+            hot: t.hot,
+            out,
+        });
+    }
+
+    // 5. Attach under the budget: hot results first; a result older than what the chunk shows is
+    //    dropped (supersession).
+    let t_attach = Instant::now();
+    let mut order: Vec<(bool, ChunkKey)> = world
+        .mesh_ready
+        .values()
+        .map(|r| (!r.hot, r.key))
+        .collect();
+    order.sort();
+    let (mut attached, mut hot_attached, mut tris_n) = (0usize, 0usize, 0usize);
+    let mut colliders = false;
+    for (_, k) in order {
+        if attached > 0 && t_attach.elapsed().as_secs_f32() * 1000.0 >= ATTACH_MS {
+            break;
         }
-        let k = queue[i];
-        i += 1;
-        if !world.data.is_active(k) {
+        let Some(r) = world.mesh_ready.remove(&k) else {
+            continue;
+        };
+        if !world.mesh_is_fresh(k, r.gen) {
+            world.stale_meshes += 1;
+            if !world.mesh_in_flight.contains_key(&k) && !world.hot.contains(&k) {
+                world.hot_wait.remove(&k);
+            }
             continue;
         }
-        let vm = world.data.mesh(k);
-        meshed_n += 1;
-        tris_n += vm.tri_count();
+        world.shown_gen.insert(k, r.gen);
         world.meshed.insert(k);
         world.carve_dirty = true;
+        world.hot_wait.remove(&k);
+        world.meshed_total += 1;
+        attached += 1;
+        hot_attached += r.hot as usize;
+        tris_n += r.out.tris;
         let existing = world.entities.get(&k).copied();
-        if vm.indices.len() < 3 {
+        let Some((mesh, aabb)) = r.out.mesh else {
             if let Some(e) = existing {
                 commands.entity(e).despawn();
                 world.entities.remove(&k);
             }
             continue;
-        }
-        let mesh = monkey_voxel_mesh_to_bevy(&vm);
-        let aabb = mesh.compute_aabb();
-        let collider = monkey_voxel_collider(&vm);
+        };
+        colliders |= r.out.collider.is_some();
         match existing.and_then(|e| handles.get(e).ok().map(|h| (e, h.0.clone()))) {
             Some((e, handle)) => {
                 let _ = meshes.insert(&handle, mesh);
@@ -1283,7 +1711,7 @@ fn monkey_voxel_stream(
                 if let Some(a) = aabb {
                     ec.insert(a);
                 }
-                match collider {
+                match r.out.collider {
                     Some(c) => {
                         ec.insert(c);
                     }
@@ -1310,60 +1738,82 @@ fn monkey_voxel_stream(
                 if let Some(a) = aabb {
                     ec.insert(a);
                 }
-                if let Some(c) = collider {
+                if let Some(c) = r.out.collider {
                     ec.insert(c);
                 }
                 world.entities.insert(k, ec.id());
             }
         }
     }
-    if meshed_n > 0 {
-        let ms = t0.elapsed().as_secs_f32() * 1000.0;
+    // A collider inserted outside the streamer's attach queue must bump the epoch (cached
+    // collision answers hold only at the stamp they were computed at).
+    if colliders {
+        if let Some(mut epoch) = epoch {
+            epoch.bump();
+        }
+    }
+    let attach_ms = t_attach.elapsed().as_secs_f32() * 1000.0;
+
+    // 6. Dispatch remeshes (hot first; bulk under the in-flight cap + dispatch budget).
+    let mut dispatched = 0usize;
+    for d in world.take_mesh_jobs(dispatch_deadline) {
+        let window = d.window;
+        let task = pool.spawn(async move { monkey_voxel_mesh_job(&window) });
+        world.meshing.push(MonkeyMeshTask {
+            key: d.key,
+            gen: d.gen,
+            hot: d.hot,
+            task,
+        });
+        dispatched += 1;
+    }
+    if attached > 0 {
         if world.timing_logs > 0 {
             world.timing_logs -= 1;
             info!(
-                "MONKEY (voxel): remeshed {meshed_n} chunk(s) ({hot_n} hot, {tris_n} tris) + \
-                 colliders in {ms:.2} ms; {} active, {} still queued",
+                "MONKEY (voxel): attached {attached} chunk mesh(es) ({hot_attached} hot, {tris_n} \
+                 tris) in {attach_ms:.2} ms; {dispatched} remesh(es) dispatched; {} active, {} \
+                 queued, {} meshing, {} building",
                 world.data.chunks.len(),
-                world.dirty.len() + world.hot.len()
+                world.dirty.len() + world.hot.len(),
+                world.meshing.len(),
+                world.builds.len()
             );
         } else {
-            debug!("MONKEY (voxel): remeshed {meshed_n} chunk(s) in {ms:.2} ms");
+            debug!("MONKEY (voxel): attached {attached} chunk mesh(es) in {attach_ms:.2} ms");
         }
     }
 
-    // MONKEY (voxel): one perf line per live local edit (ingest + this frame's build / mesh /
-    // collider work), the 2-yd / 8-yd numbers the brush has to stay under.
-    // MONKEY (voxel): + the hot-queue drain — how many frames the budget spread a live edit's
-    // remesh over, and the worst stream frame meanwhile (the held-brush hitch number).
+    // MONKEY (voxel): one perf line per live local edit (ingest + this frame's dispatch work),
+    // and the hot drain — how many frames until a live edit's chunks show their new meshes, and
+    // the worst stream frame meanwhile (the held-brush number).
     let frame_ms_now = t_stream.elapsed().as_secs_f32() * 1000.0;
     if !world.perf.is_empty() || world.perf_drain.is_some() {
         let (frames, worst) = world.perf_drain.unwrap_or((0, 0.0));
         world.perf_drain = Some((frames + 1, worst.max(frame_ms_now)));
-        if world.hot.is_empty() {
+        if world.hot.is_empty() && world.hot_wait.is_empty() && world.hot_build.is_empty() {
             let (frames, worst) = world.perf_drain.take().unwrap_or_default();
-            if world.timing_logs > 0 || frames > 1 {
-                info!(
-                    "MONKEY (voxel): perf drain — live remesh spread over {frames} frame(s), \
-                     worst stream frame {worst:.2} ms (budget {MESH_BUDGET_MS} ms)"
-                );
-            }
+            info!(
+                "MONKEY (voxel): perf drain — live edit shown after {frames} frame(s), worst \
+                 stream frame {worst:.2} ms"
+            );
         }
     }
     if !world.perf.is_empty() {
-        let frame_ms = frame_ms_now;
         for (r, ingest_ms) in std::mem::take(&mut world.perf) {
             info!(
-                "MONKEY (voxel): perf edit r={r:.1} yd: ingest {ingest_ms:.2} ms + build/mesh/collider {frame_ms:.2} ms ({meshed_n} chunk(s) meshed this frame, {} active)",
+                "MONKEY (voxel): perf edit r={r:.1} yd: ingest {ingest_ms:.2} ms + stream \
+                 {frame_ms_now:.2} ms ({dispatched} remesh(es) dispatched, {attached} attached, {} \
+                 active)",
                 world.data.chunks.len()
             );
         }
     }
 
-    // 4. Carve = the surface columns whose surface chunks are all meshed. During a bulk replay
-    //    (meshes still queued, no live edit this frame) it waits for the queue to drain, so the
-    //    tile collider / render cells are re-clipped once, not once per finished column.
-    if world.carve_dirty && (world.dirty.is_empty() || hot_n > 0) {
+    // 7. Carve = the surface columns whose surface chunks are all meshed. During a bulk replay it
+    //    waits for the queues to drain, so the tile collider / render cells are re-clipped once,
+    //    not once per finished column.
+    if world.carve_dirty && (world.bulk_idle() || hot_attached > 0) {
         world.carve_dirty = false;
         let cols: BTreeSet<ColumnKey> = world
             .wanted
@@ -1455,6 +1905,213 @@ fn monkey_voxel_probe_rays(
     );
 }
 
+//// MONKEY (voxel): the voxel layer's own per-frame clock (its whole system chain, start → end) and
+/// the busy-period tracker behind the `perf settle` line: from the first frame with work queued /
+/// in flight to the frame the layer is [`MonkeyVoxelWorld::settled`] again — frames, wall time,
+/// worst voxel-attributable frame, worst whole frame (`Time::delta`).
+#[derive(Resource, Default)]
+pub struct MonkeyVoxelPerf {
+    frame_t0: Option<Instant>,
+    busy: Option<MonkeyVoxelBusy>,
+    hitch_logs: u32,
+}
+
+struct MonkeyVoxelBusy {
+    since: Instant,
+    frames: u32,
+    worst_ms: f32,
+    sum_ms: f32,
+    worst_dt_ms: f32,
+    over8: u32,
+    over16: u32,
+}
+
+fn monkey_voxel_clock_start(mut perf: ResMut<MonkeyVoxelPerf>) {
+    perf.frame_t0 = Some(Instant::now());
+}
+
+fn monkey_voxel_clock_end(
+    time: Res<Time>,
+    world: Res<MonkeyVoxelWorld>,
+    mut perf: ResMut<MonkeyVoxelPerf>,
+) {
+    let Some(t0) = perf.frame_t0.take() else {
+        return;
+    };
+    let ms = t0.elapsed().as_secs_f32() * 1000.0;
+    let dt = time.delta_secs() * 1000.0;
+    let busy = !world.settled();
+    if ms > 8.0 && perf.hitch_logs < 30 {
+        perf.hitch_logs += 1;
+        info!(
+            "MONKEY (voxel): perf hitch — voxel frame {ms:.2} ms (whole frame {dt:.1} ms), {} active",
+            world.data.chunks.len()
+        );
+    }
+    if busy && perf.busy.is_none() {
+        perf.busy = Some(MonkeyVoxelBusy {
+            since: t0,
+            frames: 0,
+            worst_ms: 0.0,
+            sum_ms: 0.0,
+            worst_dt_ms: 0.0,
+            over8: 0,
+            over16: 0,
+        });
+    }
+    let Some(b) = perf.busy.as_mut() else {
+        return;
+    };
+    b.frames += 1;
+    b.worst_ms = b.worst_ms.max(ms);
+    b.sum_ms += ms;
+    b.worst_dt_ms = b.worst_dt_ms.max(dt);
+    b.over8 += (ms > 8.0) as u32;
+    b.over16 += (ms > 16.0) as u32;
+    if !busy {
+        let b = perf.busy.take().unwrap();
+        info!(
+            "MONKEY (voxel): perf settle — {} frame(s), {:.0} ms to settle; voxel frame worst \
+             {:.2} ms / mean {:.2} ms ({} > 8 ms, {} > 16 ms); worst whole frame {:.1} ms; {} \
+             active chunk(s)",
+            b.frames,
+            b.since.elapsed().as_secs_f32() * 1000.0,
+            b.worst_ms,
+            b.sum_ms / b.frames.max(1) as f32,
+            b.over8,
+            b.over16,
+            b.worst_dt_ms,
+            world.data.chunks.len()
+        );
+    }
+}
+
+/// MONKEY (voxel): bench hook `WOW_VOXEL_SYNTH_EDITS=<n>[,<span yd>]` — ~6 s into the world, once
+/// the ground under the anchor (`WOW_VOXEL_SYNTH_AT=x,y`, else the ground under the camera's view
+/// ray) and the square's corners is resident, file `n` deterministic confirmed edits
+/// ([`benilla_voxel::world::synth_edits`], default span 100 yd) into the journal and activate their
+/// chunks exactly like entering an edited area (the bulk replay path). With
+/// `WOW_VOXEL_SYNTH_RESYNC=1`, ~4 s after that settles, every region of the square is RESET and its
+/// edits re-arrive as server `E` events through the inbox (the resync path).
+#[allow(clippy::too_many_arguments)]
+fn monkey_voxel_synth(
+    time: Res<Time>,
+    mut state: Local<(f32, u8, Vec<VoxelEditOp>)>,
+    camera: Query<&GlobalTransform, With<WorldCamera>>,
+    mut world: ResMut<MonkeyVoxelWorld>,
+    streamer: Res<TerrainStreamer>,
+    adts: Res<Assets<AdtTile>>,
+    mut net: ResMut<MonkeyVoxelNet>,
+) {
+    // state.1: 0 = waiting, 1 = filed (resync pending), 2 = done.
+    if state.1 == 2 {
+        return;
+    }
+    let Ok(spec) = std::env::var("WOW_VOXEL_SYNTH_EDITS") else {
+        state.1 = 2;
+        return;
+    };
+    state.0 += time.delta_secs();
+    let Some(map) = world.current_map_u16() else {
+        return;
+    };
+    if state.1 == 1 {
+        if !std::env::var("WOW_VOXEL_SYNTH_RESYNC").is_ok_and(|v| v == "1") {
+            state.1 = 2;
+            return;
+        }
+        if !world.settled() {
+            state.0 = 0.0;
+            return;
+        }
+        if state.0 < 4.0 {
+            return;
+        }
+        state.1 = 2;
+        let edits = std::mem::take(&mut state.2);
+        let regions: BTreeSet<(i16, i16)> = edits.iter().map(|e| e.region()).collect();
+        for &(rx, ry) in &regions {
+            net.events.push(MonkeyVoxelNetEvent::Reset {
+                map,
+                rx,
+                ry,
+                epoch: 2,
+            });
+        }
+        for e in &edits {
+            net.events.push(MonkeyVoxelNetEvent::Edit(*e));
+        }
+        info!(
+            "MONKEY (voxel): SYNTH resync — {} region(s) reset, {} edit(s) re-arriving as server E",
+            regions.len(),
+            edits.len()
+        );
+        return;
+    }
+    if state.0 < 6.0 {
+        return;
+    }
+    let v: Vec<f32> = spec.split(',').filter_map(|s| s.trim().parse().ok()).collect();
+    let n = v.first().copied().unwrap_or(0.0) as usize;
+    let span = v.get(1).copied().unwrap_or(100.0);
+    let ground = |x: f32, y: f32| {
+        crate::terrain_stream::terrain_height_under_raw(&streamer, &adts, wow_to_bevy([x, y, 0.0]))
+    };
+    let at: Vec<f32> = std::env::var("WOW_VOXEL_SYNTH_AT")
+        .unwrap_or_default()
+        .split(',')
+        .filter_map(|s| s.trim().parse().ok())
+        .collect();
+    let anchor = if at.len() == 2 {
+        [at[0], at[1]]
+    } else {
+        let Ok(cam) = camera.single() else {
+            return;
+        };
+        let o = bevy_to_wow(cam.translation());
+        let d = bevy_to_wow(*cam.forward());
+        match raymarch(o, d, 250.0, 0.25, |p| {
+            monkey_voxel_aim_density(&world, &streamer, &adts, p)
+        }) {
+            Some(h) => [h[0], h[1]],
+            None => [o[0], o[1]],
+        }
+    };
+    let h = span * 0.5;
+    let mut zc = None;
+    for (dx, dy) in [(0.0, 0.0), (-h, -h), (h, -h), (-h, h), (h, h)] {
+        match ground(anchor[0] + dx, anchor[1] + dy) {
+            Some(z) => {
+                zc.get_or_insert(z);
+            }
+            None => return, // not resident yet: retry next frame
+        }
+    }
+    let edits = benilla_voxel::world::synth_edits(n, map, anchor, zc.unwrap_or(0.0), span, ground);
+    let t0 = Instant::now();
+    let j = world.journal.maps.entry(map).or_default();
+    for e in &edits {
+        j.insert(*e);
+    }
+    let keys: BTreeSet<ChunkKey> = edits.iter().flat_map(|e| e.touched_chunks()).collect();
+    for &k in &keys {
+        world.want(k);
+    }
+    info!(
+        "MONKEY (voxel): SYNTH {} edit(s) over {span} yd at WoW ({:.1}, {:.1}) — {} chunk(s) \
+         touched, {} wanted; filed in {:.2} ms",
+        edits.len(),
+        anchor[0],
+        anchor[1],
+        keys.len(),
+        world.wanted_count,
+        t0.elapsed().as_secs_f32() * 1000.0
+    );
+    state.0 = 0.0;
+    state.1 = 1;
+    state.2 = edits;
+}
+
 /// Persist the journal at most every 2 s while it has unsaved changes.
 fn monkey_voxel_journal_autosave(
     time: Res<Time>,
@@ -1503,6 +2160,185 @@ mod tests {
         // Up normal in WoW (+z) is +Y in Bevy.
         let n = wow_vec_to_bevy(vm.normals[vm.normals.len() / 2]);
         assert!(n[1] > 0.0, "normal {n:?}");
+    }
+
+    fn far() -> Instant {
+        Instant::now() + std::time::Duration::from_secs(3600)
+    }
+
+    fn dig(pos: [f32; 3], radius: f32) -> VoxelEditOp {
+        VoxelEditOp {
+            map: 0,
+            pos,
+            radius,
+            mode: 0,
+            strength: 255,
+            nonce: 0,
+            seq: None,
+            local: true,
+        }
+    }
+
+    /// MONKEY (voxel): run every queued build (on another thread) until none is left.
+    fn drain_builds(world: &mut MonkeyVoxelWorld) {
+        for _ in 0..1000 {
+            let jobs = world.take_build_jobs(far());
+            if jobs.is_empty() && world.building.is_empty() {
+                return;
+            }
+            for d in jobs {
+                let job = d.job;
+                let out = std::thread::spawn(move || job.run()).join().unwrap();
+                world.finish_build(&d.keys, &d.gens, d.hot, out);
+            }
+        }
+        panic!("builds never drained");
+    }
+
+    #[test]
+    fn stale_build_result_is_discarded_and_requeued() {
+        let mut world = MonkeyVoxelWorld {
+            map: Some(0),
+            ..Default::default()
+        };
+        let mut net = MonkeyVoxelNet::default();
+        world.data.seeds.insert(
+            [2, 3],
+            Arc::new(ColumnSeed::from_fn([2, 3], |_, _| Some(40.0))),
+        );
+        world.local_edit(&mut net, dig([40.0, 56.0, 40.0], 2.0));
+        let k = [2, 3, 2];
+        assert!(world.hot_build.contains(&k), "a live edit's fresh chunk builds hot");
+        let first = world.take_build_jobs(far());
+        assert!(first.iter().any(|d| d.hot && d.keys.contains(&k)));
+        assert!(world.building.contains(&k));
+        // A newer edit to the chunk while its build is in flight.
+        world.local_edit(&mut net, dig([41.0, 56.0, 39.0], 2.0));
+        for d in first {
+            let out = d.job.run();
+            let had = d.keys.contains(&k);
+            let adopted = world.finish_build(&d.keys, &d.gens, d.hot, out);
+            if had {
+                assert!(!adopted, "the stale result must be discarded");
+            }
+        }
+        assert!(!world.data.is_active(k), "nothing stale landed");
+        assert!(world.hot_build.contains(&k), "requeued, still hot");
+        assert!(world.stale_builds >= 1);
+        drain_builds(&mut world);
+        assert!(world.data.is_active(k));
+        // == the canonical sync build of the whole journal.
+        let mut sync = VoxelWorldData::default();
+        sync.seeds = world.data.seeds.clone();
+        sync.build(&[k], world.journal.maps[&0].edits().iter());
+        assert_eq!(sync.chunks[&k], world.data.chunks[&k]);
+        // A rebuild in flight on an ACTIVE chunk + a new live edit → discarded, back in rebuild.
+        world.rebuild.insert(k);
+        let jobs = world.take_build_jobs(far());
+        assert!(!jobs.is_empty());
+        world.local_edit(&mut net, dig([42.0, 57.0, 39.0], 1.5));
+        for d in jobs {
+            let out = d.job.run();
+            assert!(!world.finish_build(&d.keys, &d.gens, d.hot, out));
+        }
+        assert!(world.rebuild.contains(&k), "an active chunk's stale rebuild is requeued");
+    }
+
+    #[test]
+    fn older_mesh_never_overwrites_newer() {
+        let mut world = MonkeyVoxelWorld {
+            map: Some(0),
+            ..Default::default()
+        };
+        world.data.seeds.insert(
+            [0, 0],
+            Arc::new(ColumnSeed::from_fn([0, 0], |_, _| Some(8.0))),
+        );
+        let k = [0, 0, 0];
+        world.data.build(&[k], std::iter::empty());
+        world.hot.insert(k);
+        let a = world.take_mesh_jobs(far());
+        world.hot.insert(k);
+        let b = world.take_mesh_jobs(far());
+        assert_eq!((a.len(), b.len()), (1, 1), "two hot snapshots in flight");
+        world.hot.insert(k);
+        assert!(world.take_mesh_jobs(far()).is_empty(), "at most 2 in flight per chunk");
+        let (ga, gb) = (a[0].gen, b[0].gen);
+        assert!(gb > ga, "generations increase with each dispatch");
+        let ready = |d: &MonkeyMeshDispatch| MonkeyMeshReady {
+            key: d.key,
+            gen: d.gen,
+            hot: true,
+            out: monkey_voxel_mesh_job(&d.window),
+        };
+        // The newer finishes first and is shown …
+        world.mesh_returned(ready(&b[0]));
+        assert!(world.mesh_is_fresh(k, gb));
+        world.shown_gen.insert(k, gb);
+        // … then the older one lands: it must be dropped, both in the ready map and at attach.
+        world.mesh_returned(ready(&a[0]));
+        assert_eq!(world.mesh_ready[&k].gen, gb, "the ready map keeps the newest");
+        assert!(!world.mesh_is_fresh(k, ga), "an older snapshot never overwrites a newer one");
+        assert!(world.mesh_in_flight.is_empty());
+        // A chunk no longer active (map change, …) takes nothing.
+        world.data.chunks.clear();
+        assert!(!world.mesh_is_fresh(k, gb + 1));
+    }
+
+    #[test]
+    fn async_pipeline_equals_sync_replay() {
+        let ground = |x: f32, y: f32| Some(20.0 + 0.05 * x - 0.03 * y + (x * 0.2).sin());
+        let mut world = MonkeyVoxelWorld {
+            map: Some(0),
+            ..Default::default()
+        };
+        // Dig / build only: those are per-sample, so the grouping of the off-thread builds cannot
+        // matter and the result must equal a per-chunk replay of the whole journal.
+        let edits: Vec<VoxelEditOp> =
+            benilla_voxel::world::synth_edits(300, 0, [24.0, 24.0], 20.0, 48.0, ground)
+                .into_iter()
+                .filter(|e| e.mode < 2)
+                .collect();
+        for x in -2..=5 {
+            for y in -2..=5 {
+                world
+                    .data
+                    .seeds
+                    .insert([x, y], Arc::new(ColumnSeed::from_fn([x, y], ground)));
+            }
+        }
+        for e in &edits {
+            world.ingest(*e, false);
+        }
+        drain_builds(&mut world);
+        assert!(world.data.chunks.len() > 10);
+        let mut sync = VoxelWorldData::default();
+        sync.seeds = world.data.seeds.clone();
+        let all = world.journal.maps[&0].edits().to_vec();
+        let keys: Vec<ChunkKey> = world.data.chunks.keys().copied().collect();
+        for &k in &keys {
+            sync.build(&[k], all.iter());
+        }
+        for &k in &keys {
+            assert_eq!(sync.chunks[&k], world.data.chunks[&k], "chunk {k:?}");
+            // The off-thread mesh job == the sync mesh.
+            let out = monkey_voxel_mesh_job(&world.data.window_i8(k));
+            assert_eq!(out.tris, sync.mesh(k).tri_count(), "chunk {k:?} mesh");
+            assert_eq!(out.collider.is_some(), out.tris > 0);
+        }
+        // A bulk resync: reset every region, re-file the edits as bulk → same densities again.
+        let regions: BTreeSet<(i16, i16)> = edits.iter().map(|e| e.region()).collect();
+        for (rx, ry) in regions {
+            world.reset_region(0, rx, ry, 9);
+        }
+        for e in &edits {
+            world.ingest(*e, false);
+        }
+        assert!(!world.rebuild.is_empty(), "bulk edits are rebuilt, not applied inline");
+        drain_builds(&mut world);
+        for &k in &keys {
+            assert_eq!(sync.chunks[&k], world.data.chunks[&k], "chunk {k:?} after resync");
+        }
     }
 
     #[test]

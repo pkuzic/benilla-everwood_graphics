@@ -523,38 +523,87 @@ impl VoxelWorldData {
     /// in canonical order) touching any of them is applied to the whole set in lockstep, reading
     /// other active chunks / seeds outside the set. Every key's column seed must be loaded (keys
     /// without one are skipped). The results replace the chunks' densities.
+    ///
+    /// MONKEY (voxel): = [`Self::build_job`] + [`VoxelBuildJob::run`] + [`Self::insert_built`]
+    /// on the calling thread; the world layer runs the job on the async pool instead.
     pub fn build<'a>(
         &mut self,
         keys: &[ChunkKey],
         edits: impl IntoIterator<Item = &'a VoxelEditOp>,
     ) -> Vec<ChunkKey> {
-        let mut set: HashMap<ChunkKey, Box<[i8]>> = HashMap::new();
-        for &k in keys {
-            if let Some(seed) = self.seeds.get(&[k[0], k[1]]) {
-                set.insert(k, seed_chunk(k, seed));
+        let job = self.build_job(keys, edits.into_iter().copied().collect());
+        let out = job.run();
+        self.insert_built(out)
+    }
+
+    /// MONKEY (voxel): snapshot everything a canonical build of `keys` reads into a
+    /// self-contained, `Send` [`VoxelBuildJob`]: the set's column seeds, the edits (canonical
+    /// order; ones not touching the set are skipped by the job), and — for smooth edits only, the
+    /// one brush that reads past the samples it writes — the seeds + active densities of the
+    /// chunks outside the set its read ring reaches. Running the job anywhere gives exactly what
+    /// [`Self::build`] gives now.
+    pub fn build_job(&self, keys: &[ChunkKey], edits: Vec<VoxelEditOp>) -> VoxelBuildJob {
+        let keys: Vec<ChunkKey> = keys
+            .iter()
+            .copied()
+            .filter(|k| self.seeds.contains_key(&[k[0], k[1]]))
+            .collect();
+        let mut seeds: HashMap<ColumnKey, Arc<ColumnSeed>> = HashMap::new();
+        for k in &keys {
+            let col = [k[0], k[1]];
+            if let Some(s) = self.seeds.get(&col) {
+                seeds.entry(col).or_insert_with(|| s.clone());
             }
         }
-        if set.is_empty() {
-            return Vec::new();
-        }
-        let built: Vec<ChunkKey> = set.keys().copied().collect();
-        {
-            let (chunks, seeds) = (&self.chunks, &self.seeds);
-            let outside = |i: [i32; 3]| sample_in(chunks, seeds, None, i);
-            for e in edits {
-                if built.iter().any(|&k| e.touches(k)) {
-                    apply_edit_set(e, &mut set, &outside);
+        let set: HashSet<ChunkKey> = keys.iter().copied().collect();
+        let mut outside: HashMap<ChunkKey, Box<[i8]>> = HashMap::new();
+        for e in &edits {
+            if e.mode < 2 || !keys.iter().any(|&k| e.touches(k)) {
+                continue;
+            }
+            let (lo, hi) = e.lattice_bbox();
+            for n in chunks_of_box([lo[0] - 1, lo[1] - 1, lo[2] - 1], [hi[0] + 1, hi[1] + 1, hi[2] + 1])
+            {
+                if set.contains(&n) {
+                    continue;
+                }
+                let col = [n[0], n[1]];
+                if let Some(s) = self.seeds.get(&col) {
+                    seeds.entry(col).or_insert_with(|| s.clone());
+                }
+                if let Some(d) = self.chunks.get(&n) {
+                    outside.entry(n).or_insert_with(|| d.clone());
                 }
             }
         }
-        self.chunks.extend(set);
-        built
+        VoxelBuildJob {
+            keys,
+            seeds,
+            outside,
+            edits,
+        }
+    }
+
+    /// MONKEY (voxel): adopt a finished build's densities; returns their keys.
+    pub fn insert_built(&mut self, out: Vec<(ChunkKey, Box<[i8]>)>) -> Vec<ChunkKey> {
+        let keys = out.iter().map(|(k, _)| *k).collect();
+        self.chunks.extend(out);
+        keys
     }
 
     /// The 34³ f32 SDF window of chunk `k` (lattice `32k-1 ..= 32k+32`, x fastest): the chunk's
     /// own samples + the apron from the owning neighbours (active density, else seed — through the
     /// owner column's seed if loaded, else this column's seed window).
     pub fn window(&self, k: ChunkKey) -> Vec<f32> {
+        self.window_i8(k)
+            .iter()
+            .map(|&v| v as f32 / DENSITY_SCALE)
+            .collect()
+    }
+
+    /// MONKEY (voxel): [`Self::window`] in fixed point — the `Send` snapshot a mesh task takes
+    /// (39 KB). The chunk's own 32³ is row-copied; only the 6.5 K apron samples are looked up.
+    pub fn window_i8(&self, k: ChunkKey) -> Vec<i8> {
         let own_seed = self.seeds.get(&[k[0], k[1]]).map(|s| &**s);
         // The 27 neighbour densities, indexed (dx+1) + 3(dy+1) + 9(dz+1).
         let mut nb: [Option<&[i8]>; 27] = [None; 27];
@@ -576,7 +625,6 @@ impl VoxelWorldData {
                     .or(own_seed);
             }
         }
-        let mut sdf = vec![0f32; ChunkShape::USIZE];
         let base = [k[0] * C - 1, k[1] * C - 1, k[2] * C - 1];
         let split = |l: i32| -> (i32, i32) {
             // window-local 0..=33 → (neighbour offset, owned local)
@@ -588,44 +636,61 @@ impl VoxelWorldData {
                 (0, l - 1)
             }
         };
-        for lz in 0..SAMPLES as i32 {
-            let (dz, oz) = split(lz);
-            for ly in 0..SAMPLES as i32 {
-                let (dy, oy) = split(ly);
-                for lx in 0..SAMPLES as i32 {
-                    let (dx, ox) = split(lx);
-                    let v = match nb[((dx + 1) + 3 * (dy + 1) + 9 * (dz + 1)) as usize] {
-                        Some(d) => d[owned_index(ox, oy, oz)],
-                        None => match nseed[((dx + 1) + 3 * (dy + 1)) as usize] {
-                            Some(s) if s.covers(base[0] + lx, base[1] + ly) => {
-                                s.value(base[0] + lx, base[1] + ly, base[2] + lz)
+        let sample = |lx: i32, ly: i32, lz: i32| -> i8 {
+            let ((dx, ox), (dy, oy), (dz, oz)) = (split(lx), split(ly), split(lz));
+            match nb[((dx + 1) + 3 * (dy + 1) + 9 * (dz + 1)) as usize] {
+                Some(d) => d[owned_index(ox, oy, oz)],
+                None => match nseed[((dx + 1) + 3 * (dy + 1)) as usize] {
+                    Some(s) if s.covers(base[0] + lx, base[1] + ly) => {
+                        s.value(base[0] + lx, base[1] + ly, base[2] + lz)
+                    }
+                    _ => AIR,
+                },
+            }
+        };
+        let s = SAMPLES as i32;
+        let lin = |x: i32, y: i32, z: i32| ChunkShape::linearize([x as u32, y as u32, z as u32]) as usize;
+        let mut w = vec![AIR; ChunkShape::USIZE];
+        match nb[13] {
+            Some(own) => {
+                // The owned interior: 32-sample rows, contiguous on both sides (x fastest).
+                for lz in 1..=C {
+                    for ly in 1..=C {
+                        let dst = lin(1, ly, lz);
+                        let src = owned_index(0, ly - 1, lz - 1);
+                        w[dst..dst + C as usize].copy_from_slice(&own[src..src + C as usize]);
+                    }
+                }
+                for lz in 0..s {
+                    for ly in 0..s {
+                        if lz == 0 || lz == s - 1 || ly == 0 || ly == s - 1 {
+                            for lx in 0..s {
+                                w[lin(lx, ly, lz)] = sample(lx, ly, lz);
                             }
-                            _ => AIR,
-                        },
-                    };
-                    let li = ChunkShape::linearize([lx as u32, ly as u32, lz as u32]) as usize;
-                    sdf[li] = v as f32 / DENSITY_SCALE;
+                        } else {
+                            w[lin(0, ly, lz)] = sample(0, ly, lz);
+                            w[lin(s - 1, ly, lz)] = sample(s - 1, ly, lz);
+                        }
+                    }
+                }
+            }
+            None => {
+                for lz in 0..s {
+                    for ly in 0..s {
+                        for lx in 0..s {
+                            w[lin(lx, ly, lz)] = sample(lx, ly, lz);
+                        }
+                    }
                 }
             }
         }
-        sdf
+        w
     }
 
     /// Mesh chunk `k` from its [`Self::window`]. Positions are WoW-axis yards relative to the
     /// window origin [`window_origin`]; normals are the surface-nets gradients (WoW axes).
     pub fn mesh(&self, k: ChunkKey) -> VoxelMesh {
-        let sdf = self.window(k);
-        let mut buffer = SurfaceNetsBuffer::default();
-        surface_nets(&sdf, &ChunkShape {}, [0; 3], [SAMPLES - 1; 3], &mut buffer);
-        VoxelMesh {
-            positions: buffer
-                .positions
-                .iter()
-                .map(|p| [p[0] * VOXEL_SIZE, p[1] * VOXEL_SIZE, p[2] * VOXEL_SIZE])
-                .collect(),
-            normals: buffer.normals,
-            indices: buffer.indices,
-        }
+        mesh_window(&self.window_i8(k))
     }
 
     /// The interpolated SDF (voxel units, negative = solid) at a WoW point, through active chunks
@@ -651,6 +716,114 @@ impl VoxelWorldData {
         }
         acc / DENSITY_SCALE
     }
+}
+
+/// MONKEY (voxel): a self-contained canonical chunk build ([`VoxelWorldData::build_job`]) — `Send`,
+/// so the world layer runs it on the async compute pool while the frame goes on.
+pub struct VoxelBuildJob {
+    keys: Vec<ChunkKey>,
+    seeds: HashMap<ColumnKey, Arc<ColumnSeed>>,
+    outside: HashMap<ChunkKey, Box<[i8]>>,
+    edits: Vec<VoxelEditOp>,
+}
+
+impl VoxelBuildJob {
+    /// The chunks this job builds (the requested keys whose seed is loaded).
+    pub fn keys(&self) -> &[ChunkKey] {
+        &self.keys
+    }
+
+    /// How many edits the job replays (before the touch filter).
+    pub fn edit_count(&self) -> usize {
+        self.edits.len()
+    }
+
+    /// Seed + replay: the built chunks' owned densities.
+    pub fn run(self) -> Vec<(ChunkKey, Box<[i8]>)> {
+        let mut set: HashMap<ChunkKey, Box<[i8]>> = HashMap::new();
+        for &k in &self.keys {
+            if let Some(seed) = self.seeds.get(&[k[0], k[1]]) {
+                set.insert(k, seed_chunk(k, seed));
+            }
+        }
+        if set.is_empty() {
+            return Vec::new();
+        }
+        let (chunks, seeds) = (&self.outside, &self.seeds);
+        let outside = |i: [i32; 3]| sample_in(chunks, seeds, None, i);
+        for e in &self.edits {
+            if self.keys.iter().any(|&k| e.touches(k)) {
+                apply_edit_set(e, &mut set, &outside);
+            }
+        }
+        let mut out: Vec<(ChunkKey, Box<[i8]>)> = set.into_iter().collect();
+        out.sort_by_key(|(k, _)| *k);
+        out
+    }
+}
+
+/// MONKEY (voxel): surface-nets mesh of a [`VoxelWorldData::window_i8`] snapshot — pure, so it
+/// runs on any thread and gives the same mesh as [`VoxelWorldData::mesh`].
+pub fn mesh_window(win: &[i8]) -> VoxelMesh {
+    debug_assert_eq!(win.len(), ChunkShape::USIZE);
+    let sdf: Vec<f32> = win.iter().map(|&v| v as f32 / DENSITY_SCALE).collect();
+    let mut buffer = SurfaceNetsBuffer::default();
+    surface_nets(&sdf, &ChunkShape {}, [0; 3], [SAMPLES - 1; 3], &mut buffer);
+    VoxelMesh {
+        positions: buffer
+            .positions
+            .iter()
+            .map(|p| [p[0] * VOXEL_SIZE, p[1] * VOXEL_SIZE, p[2] * VOXEL_SIZE])
+            .collect(),
+        normals: buffer.normals,
+        indices: buffer.indices,
+    }
+}
+
+/// MONKEY (voxel): `n` deterministic synthetic edits (the bench / `WOW_VOXEL_SYNTH_EDITS` hook)
+/// spread over a `span`-yard square centred on `centre`, sitting on `ground(x, y)` (`None` →
+/// `centre_z`): ~60 % digs, ~30 % builds, ~10 % smooths, radius 1.5–4 yd, all confirmed with
+/// seq 1..=n (a synced journal).
+pub fn synth_edits(
+    n: usize,
+    map: u16,
+    centre: [f32; 2],
+    centre_z: f32,
+    span: f32,
+    mut ground: impl FnMut(f32, f32) -> Option<f32>,
+) -> Vec<VoxelEditOp> {
+    let mut s: u64 = 0x9E37_79B9_7F4A_7C15;
+    let mut rnd = move || {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        (s >> 11) as f32 / (1u64 << 53) as f32
+    };
+    (0..n)
+        .map(|i| {
+            let x = centre[0] + (rnd() - 0.5) * span;
+            let y = centre[1] + (rnd() - 0.5) * span;
+            let z = ground(x, y).unwrap_or(centre_z) + (rnd() - 0.5) * 2.0;
+            let m = rnd();
+            let mode = if m < 0.6 {
+                0
+            } else if m < 0.9 {
+                1
+            } else {
+                2
+            };
+            VoxelEditOp {
+                map,
+                pos: [x, y, z],
+                radius: 1.5 + rnd() * 2.5,
+                mode,
+                strength: if mode == 2 { 128 } else { 255 },
+                nonce: i as u16,
+                seq: Some(i as u32 + 1),
+                local: false,
+            }
+        })
+        .collect()
 }
 
 /// WoW position of a chunk's mesh-window origin (lattice `32k-1` per axis).
@@ -712,14 +885,36 @@ pub struct RegionSync {
     pub last_seq: u32,
 }
 
+/// MONKEY (voxel): the canonical-order key of a journal entry — confirmed `(0, seq)`, a pending
+/// one `(1, arrival stamp)`. Sorting by it IS the canonical order (confirmed by seq, then pending
+/// in arrival order), and it is stable while other entries are inserted / removed around it.
+pub type EditOrder = (u8, u64);
+
 /// One map's edits in canonical order (confirmed by `seq` ascending, then unconfirmed in arrival
 /// order) + per-region sync state.
-#[derive(Clone, Debug, Default, PartialEq)]
+///
+/// MONKEY (voxel): + a per-chunk INDEX: every valid edit is filed under each chunk its bbox
+/// touches ([`VoxelEditOp::touched_chunks`]), keyed by its [`EditOrder`], so building one chunk
+/// reads only its own edits ([`Self::edits_for`]) instead of scanning the whole journal. Kept in
+/// step by every mutation (insert / confirm / remove_pending / reset_region / decode).
+#[derive(Clone, Debug, Default)]
 pub struct MapJournal {
     edits: Vec<VoxelEditOp>,
+    /// MONKEY (voxel): arrival stamp of each entry (parallel to `edits`; the pending entries' key).
+    arrival: Vec<u64>,
+    next_arrival: u64,
     /// How many leading entries of `edits` are confirmed (`seq: Some`).
     confirmed: usize,
     pub regions: BTreeMap<(i16, i16), RegionSync>,
+    /// MONKEY (voxel): chunk → the edits touching it, in canonical order.
+    index: HashMap<ChunkKey, BTreeMap<EditOrder, VoxelEditOp>>,
+}
+
+/// The journal's content (edits, order, sync points); the index + stamps are derived state.
+impl PartialEq for MapJournal {
+    fn eq(&self, o: &Self) -> bool {
+        self.edits == o.edits && self.confirmed == o.confirmed && self.regions == o.regions
+    }
 }
 
 /// Where [`MapJournal::insert`] put an edit.
@@ -737,6 +932,68 @@ impl MapJournal {
     /// The edits in canonical order.
     pub fn edits(&self) -> &[VoxelEditOp] {
         &self.edits
+    }
+
+    /// MONKEY (voxel): the canonical key of entry `i`.
+    fn order_key(&self, i: usize) -> EditOrder {
+        if i < self.confirmed {
+            (0, self.edits[i].seq.unwrap_or(0) as u64)
+        } else {
+            (1, self.arrival[i])
+        }
+    }
+
+    /// MONKEY (voxel): file `e` under every chunk it touches (invalid edits — e.g. a corrupt file's
+    /// absurd radius — are never applied, so never indexed).
+    fn index_add(&mut self, key: EditOrder, e: &VoxelEditOp) {
+        if !e.is_valid() {
+            return;
+        }
+        for k in e.touched_chunks() {
+            self.index.entry(k).or_default().insert(key, *e);
+        }
+    }
+
+    fn index_remove(&mut self, key: EditOrder, e: &VoxelEditOp) {
+        if !e.is_valid() {
+            return;
+        }
+        for k in e.touched_chunks() {
+            if let Some(m) = self.index.get_mut(&k) {
+                m.remove(&key);
+                if m.is_empty() {
+                    self.index.remove(&k);
+                }
+            }
+        }
+    }
+
+    /// MONKEY (voxel): every edit touching any of `keys`, in canonical order, each once — exactly
+    /// the edits [`VoxelWorldData::build`] would pick out of the full journal for that set.
+    pub fn edits_for(&self, keys: &[ChunkKey]) -> Vec<VoxelEditOp> {
+        if let [k] = keys {
+            return self
+                .index
+                .get(k)
+                .map_or_else(Vec::new, |m| m.values().copied().collect());
+        }
+        let mut m: BTreeMap<EditOrder, VoxelEditOp> = BTreeMap::new();
+        for k in keys {
+            if let Some(ix) = self.index.get(k) {
+                m.extend(ix.iter().map(|(o, e)| (*o, *e)));
+            }
+        }
+        m.into_values().collect()
+    }
+
+    /// MONKEY (voxel): the chunks any (valid) edit touches — what entering the map activates.
+    pub fn indexed_chunks(&self) -> impl Iterator<Item = ChunkKey> + '_ {
+        self.index.keys().copied()
+    }
+
+    /// MONKEY (voxel): how many edits touch chunk `k`.
+    pub fn chunk_edit_count(&self, k: ChunkKey) -> usize {
+        self.index.get(&k).map_or(0, |m| m.len())
     }
 
     /// The local predictions still waiting for a server seq (arrival order).
@@ -759,7 +1016,11 @@ impl MapJournal {
     pub fn insert(&mut self, e: VoxelEditOp) -> JournalInsert {
         match e.seq {
             None => {
+                let a = self.next_arrival;
+                self.next_arrival += 1;
                 self.edits.push(e);
+                self.arrival.push(a);
+                self.index_add((1, a), &e);
                 JournalInsert::Appended
             }
             Some(seq) => {
@@ -772,7 +1033,9 @@ impl MapJournal {
                         // (the net layer decides), else a live edit heard from 300 yd would skip
                         // the older edits of a region never synced.
                         self.edits.insert(pos, e);
+                        self.arrival.insert(pos, 0);
                         self.confirmed += 1;
+                        self.index_add((0, seq as u64), &e);
                         if pos + 1 == self.edits.len() {
                             JournalInsert::Appended
                         } else {
@@ -784,6 +1047,18 @@ impl MapJournal {
         }
     }
 
+    /// MONKEY (voxel): remove entry `i` (and its index entries).
+    fn remove_at(&mut self, i: usize) -> VoxelEditOp {
+        let key = self.order_key(i);
+        let e = self.edits.remove(i);
+        self.arrival.remove(i);
+        if i < self.confirmed {
+            self.confirmed -= 1;
+        }
+        self.index_remove(key, &e);
+        e
+    }
+
     /// The server confirmed our prediction `nonce` as `seq`: move it into the confirmed prefix.
     /// Returns the edit if found (`None` = no such pending nonce). The density is unchanged
     /// unless the move reorders it past other edits — the caller rebuilds then (`OutOfOrder`).
@@ -792,7 +1067,7 @@ impl MapJournal {
             .iter()
             .position(|e| e.local && e.nonce == nonce)?
             + self.confirmed;
-        let mut e = self.edits.remove(i);
+        let mut e = self.remove_at(i);
         e.seq = Some(seq);
         let was_first_pending = i == self.confirmed;
         let r = self.insert(e);
@@ -818,7 +1093,7 @@ impl MapJournal {
             .iter()
             .position(|e| e.local && e.nonce == nonce)?
             + self.confirmed;
-        Some(self.edits.remove(i))
+        Some(self.remove_at(i))
     }
 
     /// REGION-RESET: drop every edit (confirmed or not) whose centre lies in `(rx, ry)`, adopt the
@@ -826,18 +1101,25 @@ impl MapJournal {
     pub fn reset_region(&mut self, rx: i16, ry: i16, epoch: u16) -> Vec<VoxelEditOp> {
         let mut dropped = Vec::new();
         let mut kept = Vec::with_capacity(self.edits.len());
+        let mut kept_arrival = Vec::with_capacity(self.edits.len());
         let mut confirmed = 0;
-        for (i, e) in self.edits.drain(..).enumerate() {
+        let keys: Vec<EditOrder> = (0..self.edits.len()).map(|i| self.order_key(i)).collect();
+        let edits = std::mem::take(&mut self.edits);
+        let arrival = std::mem::take(&mut self.arrival);
+        for (i, (e, a)) in edits.into_iter().zip(arrival).enumerate() {
             if e.region() == (rx, ry) {
+                self.index_remove(keys[i], &e);
                 dropped.push(e);
             } else {
                 if i < self.confirmed {
                     confirmed += 1;
                 }
                 kept.push(e);
+                kept_arrival.push(a);
             }
         }
         self.edits = kept;
+        self.arrival = kept_arrival;
         self.confirmed = confirmed;
         self.regions.insert(
             (rx, ry),
@@ -850,7 +1132,7 @@ impl MapJournal {
     }
 }
 
-/// The whole local journal (every map).
+// The whole local journal (every map).
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct VoxelJournal {
     pub maps: BTreeMap<u16, MapJournal>,
@@ -1015,6 +1297,226 @@ mod tests {
             nonce: 0,
             seq: None,
             local: true,
+        }
+    }
+
+    /// MONKEY (voxel): a tiny deterministic PRNG for the randomized tests.
+    struct Lcg(u64);
+    impl Lcg {
+        fn f(&mut self) -> f32 {
+            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (self.0 >> 40) as f32 / (1u64 << 24) as f32
+        }
+        fn n(&mut self, k: u32) -> u32 {
+            (self.f() * k as f32) as u32 % k.max(1)
+        }
+    }
+
+    /// The brute-force answer the index must give: every valid journal edit touching any key, in
+    /// canonical (journal) order.
+    fn brute(j: &MapJournal, keys: &[ChunkKey]) -> Vec<VoxelEditOp> {
+        j.edits()
+            .iter()
+            .filter(|e| e.is_valid() && keys.iter().any(|&k| e.touches(k)))
+            .copied()
+            .collect()
+    }
+
+    fn check_index(j: &MapJournal, probe: &[ChunkKey]) {
+        for k in probe {
+            assert_eq!(j.edits_for(&[*k]), brute(j, &[*k]), "chunk {k:?}");
+            assert_eq!(j.chunk_edit_count(*k), brute(j, &[*k]).len());
+        }
+        for w in probe.windows(3) {
+            assert_eq!(j.edits_for(w), brute(j, w), "set {w:?}");
+        }
+        // Every indexed chunk is touched by something, and nothing touching is missing.
+        let all: HashSet<ChunkKey> = j
+            .edits()
+            .iter()
+            .filter(|e| e.is_valid())
+            .flat_map(|e| e.touched_chunks())
+            .collect();
+        let idx: HashSet<ChunkKey> = j.indexed_chunks().collect();
+        assert_eq!(all, idx);
+    }
+
+    #[test]
+    fn journal_index_matches_brute_force_replay() {
+        let mut rng = Lcg(42);
+        let mut j = MapJournal::default();
+        let mut nonce: u16 = 0;
+        let probe: Vec<ChunkKey> = (0..40)
+            .map(|i| [(i % 5) - 1, (i / 5 % 4) - 1, (i / 20)])
+            .collect();
+        for step in 0..600 {
+            match rng.n(10) {
+                // A local prediction (pending, arrival order).
+                0..=3 => {
+                    let mut e = edit(
+                        [rng.f() * 64.0 - 16.0, rng.f() * 48.0 - 16.0, rng.f() * 30.0],
+                        0.5 + rng.f() * 6.0,
+                        rng.n(3) as u8,
+                    );
+                    nonce = nonce.wrapping_add(1);
+                    e.nonce = nonce;
+                    e.local = rng.n(4) != 0;
+                    j.insert(e);
+                }
+                // A server edit with a random seq (in or out of order, maybe a duplicate).
+                4..=6 => {
+                    let mut e = edit(
+                        [rng.f() * 64.0 - 16.0, rng.f() * 48.0 - 16.0, rng.f() * 30.0],
+                        0.5 + rng.f() * 6.0,
+                        rng.n(3) as u8,
+                    );
+                    e.local = false;
+                    e.seq = Some(rng.n(400));
+                    j.insert(e);
+                }
+                // Confirm a random pending local prediction (maybe with a taken seq).
+                7 => {
+                    let p = j.pending_local();
+                    if !p.is_empty() {
+                        let n = p[rng.n(p.len() as u32) as usize].nonce;
+                        j.confirm(n, rng.n(400));
+                    }
+                }
+                // Drop one.
+                8 => {
+                    let p = j.pending_local();
+                    if !p.is_empty() {
+                        let n = p[rng.n(p.len() as u32) as usize].nonce;
+                        assert!(j.remove_pending(n).is_some());
+                    }
+                }
+                // Reset a region (64-yd regions over the -16..48 area).
+                _ => {
+                    let r = (rng.n(2) as i16 - 1, rng.n(2) as i16 - 1);
+                    j.reset_region(r.0, r.1, step as u16);
+                }
+            }
+            check_index(&j, &probe);
+        }
+        assert!(j.edits().len() > 50, "the walk kept a real journal ({})", j.edits().len());
+        // The index survives the file round trip.
+        let mut file = VoxelJournal::default();
+        file.maps.insert(0, j.clone());
+        let back = VoxelJournal::decode(&file.encode()).expect("decode");
+        check_index(&back.maps[&0], &probe);
+        // An invalid edit (corrupt radius) is journalled but never indexed.
+        let mut bad = edit([1.0, 1.0, 1.0], 1.0, 0);
+        bad.radius = 1e9;
+        let mut j2 = MapJournal::default();
+        j2.insert(bad);
+        assert_eq!(j2.indexed_chunks().count(), 0);
+    }
+
+    /// The window snapshot's fast path (row copies + apron) equals a per-sample read through the
+    /// owners, and a mesh / build run on ANOTHER thread from the snapshots equals the sync one.
+    #[test]
+    fn async_build_and_mesh_equal_sync() {
+        let keys: Vec<ChunkKey> = (0..8).map(|i| [i & 1, (i >> 1) & 1, (i >> 2) & 1]).collect();
+        let edits = [
+            edit([16.0, 16.0, 16.5], 6.0, 0),
+            edit([16.0, 16.0, 24.0], 3.0, 1),
+            edit([16.3, 15.6, 17.0], 4.0, 2),
+            edit([31.5, 8.0, 19.0], 3.0, 2), // smooth reading past the set (x = 32 → kx 2)
+        ];
+        let mut w = world_with(&keys, &edits);
+        // Every column's seed (so a per-sample read through the owners is the window's rule).
+        for x in -1..=3 {
+            for y in -1..=3 {
+                w.seeds
+                    .entry([x, y])
+                    .or_insert_with(|| Arc::new(ColumnSeed::from_fn([x, y], ground)));
+            }
+        }
+        // An active neighbour OUTSIDE the next build set: the smooth's read ring reaches it.
+        w.build(&[[2, 0, 1]], edits.iter());
+        for &k in &keys {
+            let win = w.window_i8(k);
+            let base = [k[0] * 32 - 1, k[1] * 32 - 1, k[2] * 32 - 1];
+            for lz in 0..34u32 {
+                for ly in 0..34u32 {
+                    for lx in 0..34u32 {
+                        let li = ChunkShape::linearize([lx, ly, lz]) as usize;
+                        let i = [base[0] + lx as i32, base[1] + ly as i32, base[2] + lz as i32];
+                        assert_eq!(win[li], w.sample(i), "chunk {k:?} sample {i:?}");
+                    }
+                }
+            }
+            let sync = w.mesh(k);
+            let thread = std::thread::spawn(move || mesh_window(&win)).join().unwrap();
+            assert_eq!(sync.positions, thread.positions);
+            assert_eq!(sync.indices, thread.indices);
+        }
+        // Rebuild the 8 off-thread from a snapshot == the sync rebuild.
+        let job = w.build_job(&keys, edits.to_vec());
+        assert_eq!(job.keys().len(), 8);
+        let off = std::thread::spawn(move || job.run()).join().unwrap();
+        let mut sync = world_with(&keys, &[]);
+        sync.seeds = w.seeds.clone();
+        sync.chunks.insert([2, 0, 1], w.chunks[&[2, 0, 1]].clone());
+        sync.build(&keys, edits.iter());
+        for (k, d) in &off {
+            assert_eq!(&sync.chunks[k], d, "chunk {k:?}");
+        }
+    }
+
+    /// MONKEY (voxel): the replay bench (`cargo test -p benilla-voxel --release -- --ignored
+    /// --nocapture bench_`): n synthetic edits over 100×100 yd; per-chunk build time through the
+    /// old full-journal scan vs the index, and the mesh time.
+    #[test]
+    #[ignore]
+    fn bench_chunk_build_replay() {
+        for n in [50usize, 500, 2000] {
+            let edits = synth_edits(n, 0, [0.0, 0.0], 20.0, 100.0, ground);
+            let mut j = MapJournal::default();
+            for e in &edits {
+                j.insert(*e);
+            }
+            let mut keys: Vec<ChunkKey> = j.indexed_chunks().collect();
+            keys.sort();
+            let mut w = VoxelWorldData::default();
+            for k in &keys {
+                w.seeds
+                    .entry([k[0], k[1]])
+                    .or_insert_with(|| Arc::new(ColumnSeed::from_fn([k[0], k[1]], ground)));
+            }
+            let t = std::time::Instant::now();
+            let mut worst_scan = 0f32;
+            for k in &keys {
+                let t1 = std::time::Instant::now();
+                w.build(&[*k], j.edits().iter());
+                worst_scan = worst_scan.max(t1.elapsed().as_secs_f32() * 1000.0);
+            }
+            let scan_ms = t.elapsed().as_secs_f32() * 1000.0;
+            let t = std::time::Instant::now();
+            let mut worst_idx = 0f32;
+            for k in &keys {
+                let t1 = std::time::Instant::now();
+                let es = j.edits_for(&[*k]);
+                w.build(&[*k], es.iter());
+                worst_idx = worst_idx.max(t1.elapsed().as_secs_f32() * 1000.0);
+            }
+            let idx_ms = t.elapsed().as_secs_f32() * 1000.0;
+            let t = std::time::Instant::now();
+            let (mut worst_mesh, mut worst_win) = (0f32, 0f32);
+            for k in &keys {
+                let t1 = std::time::Instant::now();
+                let win = w.window_i8(*k);
+                worst_win = worst_win.max(t1.elapsed().as_secs_f32() * 1000.0);
+                let _ = mesh_window(&win);
+                worst_mesh = worst_mesh.max(t1.elapsed().as_secs_f32() * 1000.0);
+            }
+            let mesh_ms = t.elapsed().as_secs_f32() * 1000.0;
+            println!(
+                "bench n={n}: {} chunks; build full-scan {scan_ms:.1} ms (worst chunk {worst_scan:.2}) \
+                 | indexed {idx_ms:.1} ms (worst {worst_idx:.2}) | mesh {mesh_ms:.1} ms (worst \
+                 {worst_mesh:.2}, window snapshot worst {worst_win:.3})",
+                keys.len()
+            );
         }
     }
 
