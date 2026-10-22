@@ -1177,6 +1177,14 @@ mod tests {
         assert_eq!(c.seq, Some(9));
         assert_eq!(how, JournalInsert::Appended, "first pending → confirmed tail: no reorder");
         assert!(m.pending_local().is_empty());
+        // A guild-relay edit from someone else (no seq, not local) is neither an uplink candidate
+        // nor confirmable by our nonce.
+        let mut relayed = edit([12.0, 20.0, 30.0], 1.0, 1);
+        relayed.local = false;
+        relayed.nonce = 8;
+        m.insert(relayed);
+        assert!(m.pending_local().is_empty());
+        assert!(m.confirm(8, 10).is_none());
         m.regions.insert((1, -2), RegionSync { epoch: 3, last_seq: 9 });
         let mut other = edit([1.0, 2.0, 3.0], 1.0, 2);
         other.map = 1;
@@ -1185,6 +1193,8 @@ mod tests {
         let bytes = j.encode();
         let back = VoxelJournal::decode(&bytes).expect("decode");
         assert_eq!(back, j);
+        let flags: Vec<bool> = back.maps[&0].edits().iter().map(|e| e.local).collect();
+        assert_eq!(flags, vec![true, true, true, false], "the local flag survives the file");
         assert_eq!(VoxelJournal::decode(b"\x01\x02\x03"), Err(JournalError::BadMagic));
         let mut v1 = bytes.clone();
         v1[4] = 1;

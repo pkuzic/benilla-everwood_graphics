@@ -60,7 +60,7 @@ pub fn append_terrain_torch_triangles(
             if box_sphere_d2(lo, hi, c) > r2 {
                 continue;
             }
-            // MONKEY (voxel): under a build site the ground is clipped out of the footprint (the
+            // MONKEY (voxel): under the voxel layer's carve the ground is clipped out (the
             // voxel is the caster there), exactly as the drawn cells and the collider are.
             #[cfg(feature = "voxel")]
             let clipped = streamer.voxel_carve().and_then(|c| c.clip_chunk(chunk));
@@ -105,7 +105,7 @@ pub fn terrain_torch_generation(streamer: &TerrainStreamer, adt_tiles: &Assets<A
         adt_tiles.contains(&ts.handle).hash(&mut h);
         sum = sum.wrapping_add(h.finish());
     }
-    // MONKEY (voxel): a moved / removed build-site carve re-gathers the clipped ground.
+    // MONKEY (voxel): a changed voxel carve re-gathers the clipped ground.
     #[cfg(feature = "voxel")]
     {
         sum = sum.wrapping_add(streamer.voxel_carve().map_or(0, |c| c.sig()));

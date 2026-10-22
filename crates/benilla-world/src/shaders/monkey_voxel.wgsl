@@ -1,4 +1,4 @@
-// MONKEY (voxel): the build-site surface. It wears the REAL ADT tileset of the ground it replaces and
+// MONKEY (voxel): the world voxel layer surface. It wears the REAL ADT tileset of the ground it replaces and
 // is lit by the SAME shared global light as `terrain.wgsl`, so a voxel top pixel-matches the real
 // ground beside it at any time of day:
 //   · TOPS (slope up to ~45°) use the terrain's own planar mapping: layer UV = chunk UV × 8 (u east,

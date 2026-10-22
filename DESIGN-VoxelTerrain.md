@@ -326,3 +326,19 @@ Replaces the single Ctrl+P "site" with the CONTRACT §1–2 world voxel layer (`
   (`monkey_voxel_journal.bin`, ignored with one log line), the capture follow/demo hooks, `WOW_VOXEL_TEST_MOVE_AT`.
 - Dev hooks: `WOW_VOXEL_AUTOEDIT=1|x,y` (scripted craters / chunk-corner dig / mound + overhang / 8-yd + 2-yd
   digs), `WOW_VOXEL_PROBE_RAY=1` (physics ray under the first dig), `WOW_VOXEL_NO_HIDE=1`.
+  After the script, a held-brush perf stroke (16 × 2-yd digs at 8/s across a chunk border + one live 8-yd dig),
+  each logged as `perf edit r=… ingest … + build/mesh/collider … ms`.
+- **Local flag**: every journal edit carries `local` (journal flag bit 1, not on the wire); only LOCAL unconfirmed
+  edits are `pending_local()` uplink candidates and nonce-confirmable, so guild-relay edits from others never
+  get re-sent as ours. Carve `contains_strict` is inclusive on internal column edges (a point exactly on a
+  shared edge is carved — no zero-width height slit). During a bulk replay the carve republishes once the mesh
+  queue drains (one tile-collider rebuild instead of one per finished column).
+- **Status (2026-10-22)**: builds; offline captures in Elwynn + Westfall — craters, chunk-corner dig, mound with
+  overhang, brush trench all seamless on the real tileset, no sky slits; probe PASS (voxel hit below the old
+  ground, height query `None`). Perf (this box, debug-opt build): 2-yd live edit 2–4 ms (1–2 chunks remeshed
+  + trimesh colliders), 8-yd live edit ~15 ms (8 chunks); journal replay of 16 chunks ~14 ms in one frame
+  (`BUILDS_PER_FRAME` 16).
+- **Server-lane hooks** (`benilla_world::voxel`): push into `MonkeyVoxelNet` — `inbox` (E records, `seq: Some`),
+  `confirms` `(nonce, seq)`, `resets` `(map, rx, ry, epoch)`, `region_done` `(map, rx, ry, epoch, last_seq)`;
+  drain `outbox` for uplink; read `MonkeyVoxelWorld::pending_local(map)` (resend) and `region_sync(map, rx, ry)`
+  (SYNC entries). Encoders: `VoxelEditOp::{to_wire, from_wire, to_hex, from_hex}`, `region_of`.

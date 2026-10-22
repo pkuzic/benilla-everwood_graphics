@@ -134,7 +134,7 @@ pub fn terrain_height_under_cached<'a>(
     cache: &mut Option<((i32, i32), &'a AdtTile)>,
 ) -> Option<f32> {
     let (wow, _key, adt) = resolve_tile(streamer, adt_tiles, bevy_pos, cache)?;
-    // MONKEY (voxel): a build site's carve is a hole for the standing / snapping height (the voxel
+    // MONKEY (voxel): the voxel layer's carve is a hole for the standing / snapping height (the voxel
     // collider is the ground there); area id, ground effect and MCSH shade keep the un-holed data.
     #[cfg(feature = "voxel")]
     {

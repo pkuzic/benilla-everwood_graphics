@@ -36,7 +36,7 @@ mod weld;
 pub(crate) mod window;
 // MONKEY (daylight: terrain torch casters): resident MCNK chunks as torch cube-map casters.
 mod torch_terrain;
-// MONKEY (voxel): exact footprint clipping of the real ground under a voxel build site.
+// MONKEY (voxel): exact clipping of the real ground under the voxel world layer.
 #[cfg(feature = "voxel")]
 pub(crate) mod voxel_clip;
 pub use torch_terrain::{
@@ -119,7 +119,7 @@ impl TerrainStreamer {
         (spawned, self.tiles.len())
     }
 
-    /// MONKEY (voxel): the loaded [`AdtTile`] handle for a tile key, so the voxel build site can
+    /// MONKEY (voxel): the loaded [`AdtTile`] handle for a tile key, so the voxel world layer can
     /// read the REAL tileset of the ground it sits on and texture its sculpted surface to match.
     /// `None` until that tile is resident (the caller keeps the procedural fallback meanwhile). The
     /// cloned handle keeps the asset alive for as long as the voxel material holds it, so the

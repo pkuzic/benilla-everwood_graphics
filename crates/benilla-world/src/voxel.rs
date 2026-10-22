@@ -54,7 +54,7 @@ const MESH_BUDGET_MS: f32 = 4.0;
 /// Column seeds sampled per frame at most (each = 36² raw height queries).
 const SEEDS_PER_FRAME: usize = 16;
 /// Chunks (re)built per frame at most.
-const BUILDS_PER_FRAME: usize = 64;
+const BUILDS_PER_FRAME: usize = 16;
 
 /// Marks one world voxel chunk's entity.
 #[derive(Component)]
@@ -129,6 +129,9 @@ pub struct MonkeyVoxelWorld {
     last_dig: Option<[f32; 3]>,
     /// Remaining verbose per-edit timing lines.
     timing_logs: u32,
+    /// MONKEY (voxel): the live local edits of this frame awaiting their perf line —
+    /// `(radius, ingest ms)`; the stream adds its build + mesh + collider time.
+    perf: Vec<(f32, f32)>,
 }
 
 impl Default for MonkeyVoxelWorld {
@@ -156,6 +159,7 @@ impl Default for MonkeyVoxelWorld {
             cap_warned: false,
             last_dig: None,
             timing_logs: 40,
+            perf: Vec::new(),
         }
     }
 }
@@ -316,7 +320,9 @@ impl MonkeyVoxelWorld {
         if e.mode == 0 {
             self.last_dig = Some(e.pos);
         }
+        let t0 = Instant::now();
         self.ingest(e, true);
+        self.perf.push((e.radius, t0.elapsed().as_secs_f32() * 1000.0));
         net.outbox.push(e);
     }
 
@@ -819,11 +825,14 @@ fn monkey_voxel_brush_edit(
 /// scripted spot's ground is resident, run a scripted sequence through the SAME path as the brush
 /// (journal + uplink): a 2-step crater at the anchor, a second crater 30 yd north, a dig on a
 /// 16-yd chunk CORNER (spanning 2×2×2 chunks), a build mound with an overhanging lip, an 8-yd and
-/// a 2-yd dig (the perf references). Bypasses the GM gate.
+/// a 2-yd dig (the perf references). ~3 s after the layer has settled it then plays a HELD-BRUSH
+/// stroke — 16 × 2-yd digs at the brush's 8/s cadence, 1 yd apart, crossing a chunk border — and
+/// one live 8-yd dig, each logged as a `perf edit` line. Bypasses the GM gate.
 #[allow(clippy::too_many_arguments)]
 fn monkey_voxel_autoedit(
     time: Res<Time>,
     mut state: Local<(f32, bool)>,
+    mut stroke: Local<MonkeyAutoStroke>,
     camera: Query<&GlobalTransform, With<WorldCamera>>,
     mut world: ResMut<MonkeyVoxelWorld>,
     streamer: Res<TerrainStreamer>,
@@ -831,6 +840,7 @@ fn monkey_voxel_autoedit(
     mut net: ResMut<MonkeyVoxelNet>,
 ) {
     if state.1 {
+        monkey_voxel_autoedit_stroke(&time, &mut stroke, &mut world, &streamer, &adts, &mut net);
         return;
     }
     let Ok(spec) = std::env::var("WOW_VOXEL_AUTOEDIT") else {
@@ -919,6 +929,74 @@ fn monkey_voxel_autoedit(
     }
     // The probe aims under the first crater.
     world.last_dig = Some([spots[0][0], spots[0][1], zs[0]]);
+    // The perf stroke: along +y from 8 yd south of the anchor, then the live 8-yd dig.
+    stroke.armed = true;
+    stroke.start = [spots[0][0] - 8.0, spots[0][1] - 6.0];
+    stroke.big = [spots[4][0] + 4.0, spots[4][1], zs[4] - 1.0];
+}
+
+/// MONKEY (voxel): the AUTOEDIT perf stroke's progress.
+#[derive(Default)]
+struct MonkeyAutoStroke {
+    armed: bool,
+    quiet: f32,
+    tick: f32,
+    step: u32,
+    start: [f32; 2],
+    big: [f32; 3],
+}
+
+/// The AUTOEDIT held-brush stroke (see [`monkey_voxel_autoedit`]): waits for the layer to settle,
+/// then emits one 2-yd dig per 125 ms (the brush cadence), 1 yd apart, and finally an 8-yd dig over
+/// the already-active 8-yd crater.
+fn monkey_voxel_autoedit_stroke(
+    time: &Time,
+    stroke: &mut MonkeyAutoStroke,
+    world: &mut MonkeyVoxelWorld,
+    streamer: &TerrainStreamer,
+    adts: &Assets<AdtTile>,
+    net: &mut MonkeyVoxelNet,
+) {
+    if !stroke.armed {
+        return;
+    }
+    let settled = world.dirty.is_empty() && world.need_seed.is_empty() && world.rebuild.is_empty();
+    if stroke.step == 0 && stroke.quiet < 3.0 {
+        stroke.quiet = if settled { stroke.quiet + time.delta_secs() } else { 0.0 };
+        return;
+    }
+    stroke.tick += time.delta_secs();
+    if stroke.tick < 0.125 {
+        return;
+    }
+    stroke.tick = 0.0;
+    let (pos, radius) = if stroke.step < 16 {
+        let (x, y) = (stroke.start[0], stroke.start[1] + stroke.step as f32);
+        let Some(h) =
+            crate::terrain_stream::terrain_height_under_raw(streamer, adts, wow_to_bevy([x, y, 0.0]))
+        else {
+            stroke.armed = false;
+            return;
+        };
+        ([x, y, h], 2.0)
+    } else {
+        stroke.armed = false;
+        (stroke.big, 8.0)
+    };
+    stroke.step += 1;
+    world.local_edit(
+        net,
+        VoxelEditOp {
+            map: 0,
+            pos,
+            radius,
+            mode: 0,
+            strength: 255,
+            nonce: 0,
+            seq: None,
+            local: true,
+        },
+    );
 }
 
 /// Drain the network inboxes into the canonical path (remote edits are remeshed this frame).
@@ -968,6 +1046,7 @@ fn monkey_voxel_stream(
     handles: Query<&Mesh3d, With<MonkeyVoxelChunk>>,
 ) {
     let world = &mut *world;
+    let t_stream = Instant::now();
     // 1. Column seeds (raw ADT heights) for columns whose tiles are now resident.
     if !world.need_seed.is_empty() {
         let resident = |x: f32, y: f32| {
@@ -1147,8 +1226,22 @@ fn monkey_voxel_stream(
         }
     }
 
-    // 4. Carve = the surface columns whose surface chunks are all meshed.
-    if world.carve_dirty {
+    // MONKEY (voxel): one perf line per live local edit (ingest + this frame's build / mesh /
+    // collider work), the 2-yd / 8-yd numbers the brush has to stay under.
+    if !world.perf.is_empty() {
+        let frame_ms = t_stream.elapsed().as_secs_f32() * 1000.0;
+        for (r, ingest_ms) in std::mem::take(&mut world.perf) {
+            info!(
+                "MONKEY (voxel): perf edit r={r:.1} yd: ingest {ingest_ms:.2} ms + build/mesh/collider {frame_ms:.2} ms ({meshed_n} chunk(s) meshed this frame, {} active)",
+                world.data.chunks.len()
+            );
+        }
+    }
+
+    // 4. Carve = the surface columns whose surface chunks are all meshed. During a bulk replay
+    //    (meshes still queued, no live edit this frame) it waits for the queue to drain, so the
+    //    tile collider / render cells are re-clipped once, not once per finished column.
+    if world.carve_dirty && (world.dirty.is_empty() || hot_n > 0) {
         world.carve_dirty = false;
         let cols: BTreeSet<ColumnKey> = world
             .wanted

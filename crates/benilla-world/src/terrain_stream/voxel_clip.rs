@@ -1,6 +1,6 @@
-//! MONKEY (voxel): exact footprint clipping of MCNK chunks under a voxel build site.
+//! MONKEY (voxel): exact clipping of MCNK chunks under the voxel world layer's carve.
 //!
-//! A build site REPLACES the real ground under its footprint. MCNK holes are 2×2-cell blocks
+//! The voxel layer REPLACES the real ground under its carve. MCNK holes are 2×2-cell blocks
 //! (8.33 yd), far coarser than the 32-yd site, so a block-hole carve leaves an un-carved rim inside
 //! the footprint where a dig is covered by the real ground drawn over it. Instead every chunk the
 //! footprint overlaps is CLIPPED: all triangle area strictly inside the carve rectangle is dropped
@@ -20,7 +20,7 @@
 use benilla_formats::ChunkMesh;
 
 /// A WoW-yard rectangle `[x0, x1] × [y0, y1]` (raw WoW X north, Y west) whose interior the real
-/// ground is carved out of: the build site's footprint inset by its edge overlap.
+/// ground is carved out of: one carved column, inset by the edge overlap on outer sides.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct VoxelCarveRect {
     pub x0: f32,
@@ -138,15 +138,25 @@ impl VoxelCarve {
     }
 
     /// Whether the column `(x, y)` lies strictly inside the union (an inset rectangle never
-    /// leaves its own column, so the column under the point decides).
+    /// leaves its own column, so the column under the point decides). MONKEY (voxel): strict only
+    /// on the union's OUTER boundary — a side shared with another carved column (no inset, so it
+    /// sits exactly on the column edge) is inclusive, or a point lying exactly on an internal
+    /// column edge would answer the old ADT height (a zero-width slit in the height query).
     pub fn contains_strict(&self, x: f32, y: f32) -> bool {
         if self.rects.is_empty() {
             return false;
         }
-        let k = |v: f32| (v / self.column_yards).floor() as i32;
-        self.by_column
-            .get(&(k(x), k(y)))
-            .is_some_and(|&i| self.rects[i].contains_strict(x, y))
+        let cy = self.column_yards;
+        let (kx, ky) = ((x / cy).floor() as i32, (y / cy).floor() as i32);
+        let Some(&i) = self.by_column.get(&(kx, ky)) else {
+            return false;
+        };
+        let r = &self.rects[i];
+        let (ex0, ex1) = (kx as f32 * cy, (kx + 1) as f32 * cy);
+        let (ey0, ey1) = (ky as f32 * cy, (ky + 1) as f32 * cy);
+        let lo = |v: f32, side: f32, edge: f32| v > side || (v == side && side == edge);
+        let hi = |v: f32, side: f32, edge: f32| v < side || (v == side && side == edge);
+        lo(x, r.x0, ex0) && hi(x, r.x1, ex1) && lo(y, r.y0, ey0) && hi(y, r.y1, ey1)
     }
 
     /// The rectangles whose interior reaches the XY box `[lo, hi]`.
@@ -546,6 +556,9 @@ mod tests {
         assert!(carve.contains_strict(79.75, 72.0) && carve.contains_strict(80.25, 72.0));
         // Internal edge between (4,4) and (4,5) at Y = 80.
         assert!(carve.contains_strict(72.0, 79.75) && carve.contains_strict(72.0, 80.25));
+        // A point exactly ON an internal column edge is carved too (no zero-width height slit).
+        assert!(carve.contains_strict(80.0, 72.0) && carve.contains_strict(72.0, 80.0));
+        assert!(carve.contains_strict(80.0, 80.0 - 0.75) && !carve.contains_strict(96.0, 72.0));
         // Outer boundary of (5,4) at X = 96 keeps 0.5 yd of ground, and (5,4)'s +Y side borders
         // the missing (5,5): inset there too.
         assert!(carve.contains_strict(95.4, 72.0) && !carve.contains_strict(95.6, 72.0));
