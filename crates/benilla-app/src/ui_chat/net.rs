@@ -131,7 +131,7 @@ fn chat(
     net_commands: &NetCommands,
     server_said: &mut MessageWriter<ServerSaidMessage>,
 ) {
-    // MONKEY (voxel): the P1b terrain-edit relay rides *guild addon* messages (`MV:<hex>`), which
+    // MONKEY (voxel): the P1b terrain-edit relay rides *guild addon* messages (`MV2:<hex>`), which
     // `net::voxel_relay` consumes. They are addon traffic, so the `m.is_addon()` branch below
     // already keeps them out of the visible chat log — no voxel-specific suppression needed here.
     // Addon traffic: 1.12 has no addon opcode or chat type, so `LANG_ADDON` on any lane is the

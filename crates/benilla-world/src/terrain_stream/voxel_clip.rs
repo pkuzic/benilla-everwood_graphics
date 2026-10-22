@@ -67,6 +67,129 @@ impl VoxelCarveRect {
     }
 }
 
+/// MONKEY (voxel): the v2 carve — the UNION of the world voxel layer's surface columns (16 × 16 yd,
+/// `(kx, ky) = floor(wow_xy / 16)`), each as one rectangle inset by `inset` ONLY on the sides whose
+/// neighbour column is not carved too. Internal edges between two carved columns are therefore
+/// shared exactly (no slit), the union's outer boundary keeps `inset` of real ground under the
+/// voxel skirt (CONTRACT §1). Clipping a chunk applies every rectangle reaching it in turn.
+#[derive(Clone, Debug, Default)]
+pub struct VoxelCarve {
+    rects: Vec<VoxelCarveRect>,
+    by_column: std::collections::HashMap<(i32, i32), usize>,
+    column_yards: f32,
+    sig: u64,
+}
+
+impl VoxelCarve {
+    /// The carve of a set of surface columns. `column_yards` = 16 (the chunk edge), `inset` = the
+    /// outer-boundary overlap.
+    pub fn from_columns(
+        columns: impl IntoIterator<Item = (i32, i32)>,
+        column_yards: f32,
+        inset: f32,
+    ) -> Self {
+        let mut cols: Vec<(i32, i32)> = columns.into_iter().collect();
+        cols.sort_unstable();
+        cols.dedup();
+        let set: std::collections::HashSet<(i32, i32)> = cols.iter().copied().collect();
+        let mut rects = Vec::with_capacity(cols.len());
+        let mut by_column = std::collections::HashMap::with_capacity(cols.len());
+        let mut h = 0xcbf29ce484222325u64;
+        for &(kx, ky) in &cols {
+            let ins = |dx: i32, dy: i32| {
+                if set.contains(&(kx + dx, ky + dy)) {
+                    0.0
+                } else {
+                    inset
+                }
+            };
+            let (x0, y0) = (kx as f32 * column_yards, ky as f32 * column_yards);
+            let r = VoxelCarveRect {
+                x0: x0 + ins(-1, 0),
+                x1: x0 + column_yards - ins(1, 0),
+                y0: y0 + ins(0, -1),
+                y1: y0 + column_yards - ins(0, 1),
+            };
+            by_column.insert((kx, ky), rects.len());
+            rects.push(r);
+            h = (h ^ r.sig()).wrapping_mul(0x100000001b3);
+        }
+        Self {
+            rects,
+            by_column,
+            column_yards,
+            sig: if cols.is_empty() { 0 } else { h | 1 },
+        }
+    }
+
+    /// Whether nothing is carved.
+    pub fn is_empty(&self) -> bool {
+        self.rects.is_empty()
+    }
+
+    /// The per-column rectangles.
+    pub fn rects(&self) -> &[VoxelCarveRect] {
+        &self.rects
+    }
+
+    /// A non-zero signature of the whole carve (0 when empty).
+    pub fn sig(&self) -> u64 {
+        self.sig
+    }
+
+    /// Whether the column `(x, y)` lies strictly inside the union (an inset rectangle never
+    /// leaves its own column, so the column under the point decides).
+    pub fn contains_strict(&self, x: f32, y: f32) -> bool {
+        if self.rects.is_empty() {
+            return false;
+        }
+        let k = |v: f32| (v / self.column_yards).floor() as i32;
+        self.by_column
+            .get(&(k(x), k(y)))
+            .is_some_and(|&i| self.rects[i].contains_strict(x, y))
+    }
+
+    /// The rectangles whose interior reaches the XY box `[lo, hi]`.
+    pub fn overlapping(&self, lo: [f32; 2], hi: [f32; 2]) -> impl Iterator<Item = &VoxelCarveRect> {
+        self.rects.iter().filter(move |r| r.box_overlaps(lo, hi))
+    }
+
+    /// A signature of the rectangles reaching `[lo, hi]` (0 = none): a render cell / tile whose
+    /// value is unchanged keeps its clip when columns elsewhere are added or removed.
+    pub fn sig_for_box(&self, lo: [f32; 2], hi: [f32; 2]) -> u64 {
+        let mut h = 0xcbf29ce484222325u64;
+        let mut any = false;
+        for r in self.overlapping(lo, hi) {
+            h = (h ^ r.sig()).wrapping_mul(0x100000001b3);
+            any = true;
+        }
+        if any {
+            h | 1
+        } else {
+            0
+        }
+    }
+
+    /// `chunk` with every triangle's area strictly inside the union removed; `None` when no
+    /// rectangle reaches it (draw / weld the original).
+    pub fn clip_chunk(&self, chunk: &ChunkMesh) -> Option<ChunkMesh> {
+        let first = chunk.positions.first()?;
+        let (mut lo, mut hi) = ([first[0], first[1]], [first[0], first[1]]);
+        for p in &chunk.positions {
+            lo = [lo[0].min(p[0]), lo[1].min(p[1])];
+            hi = [hi[0].max(p[0]), hi[1].max(p[1])];
+        }
+        let mut out: Option<ChunkMesh> = None;
+        for r in self.overlapping(lo, hi) {
+            let src = out.as_ref().unwrap_or(chunk);
+            if let Some(c) = clip_chunk_outside_rect(src, r) {
+                out = Some(c);
+            }
+        }
+        out
+    }
+}
+
 /// One clip-space vertex: everything a `ChunkMesh` stores per vertex.
 #[derive(Clone, Copy)]
 struct V {
@@ -371,6 +494,73 @@ mod tests {
         let full = clip_chunk_outside_rect(&flat_chunk(0), &r).unwrap();
         let a = |c: &ChunkMesh| tris(c).iter().map(|t| tri_area(t).abs()).sum::<f32>();
         assert!(a(&c) < a(&full) - b * b * 1.5, "holes dropped area");
+    }
+
+    /// MONKEY (voxel): an L-shaped union of three 16-yd columns laid across the flat chunk (NW
+    /// corner WoW (100, 100), spanning X/Y [66.67, 100]) — columns (4,4), (5,4), (4,5) = X/Y
+    /// [64, 96] minus the (5,5) quadrant.
+    fn l_carve() -> VoxelCarve {
+        VoxelCarve::from_columns([(4, 4), (5, 4), (4, 5)], 16.0, 0.5)
+    }
+
+    #[test]
+    fn union_carve_keeps_no_triangle_inside_the_union_minus_the_outer_inset() {
+        let carve = l_carve();
+        let src = flat_chunk(0);
+        let c = carve.clip_chunk(&src).expect("the union reaches the chunk");
+        // The union shrunk by the outer inset, as a point test (the three inset rectangles).
+        let inside = |x: f32, y: f32| carve.contains_strict(x, y);
+        for t in tris(&c) {
+            for p in t {
+                assert!(!inside(p[0], p[1]), "vertex {p:?} inside the union");
+            }
+            let cx = (t[0][0] + t[1][0] + t[2][0]) / 3.0;
+            let cy = (t[0][1] + t[1][1] + t[2][1]) / 3.0;
+            assert!(!inside(cx, cy), "triangle {t:?} reaches inside the union");
+        }
+        // The kept area = chunk − (union ∩ chunk) with the inset applied on the outer boundary:
+        // the union rects clipped to the chunk square [100 − CHUNK_SIZE, 100].
+        let lo = 100.0 - CHUNK_SIZE;
+        let carved: f32 = carve
+            .rects()
+            .iter()
+            .map(|r| {
+                let w = (r.x1.min(100.0) - r.x0.max(lo)).max(0.0);
+                let h = (r.y1.min(100.0) - r.y0.max(lo)).max(0.0);
+                w * h
+            })
+            .sum();
+        let full: f32 = tris(&src).iter().map(|t| tri_area(t).abs()).sum();
+        let kept: f32 = tris(&c).iter().map(|t| tri_area(t).abs()).sum();
+        assert!(
+            (kept - (full - carved)).abs() < 1.0e-2,
+            "kept {kept} expected {}",
+            full - carved
+        );
+    }
+
+    #[test]
+    fn union_internal_column_edges_are_not_inset() {
+        let carve = l_carve();
+        // Internal edge between (4,4) and (5,4) at X = 80 (Y mid 72): carved on both sides.
+        assert!(carve.contains_strict(79.75, 72.0) && carve.contains_strict(80.25, 72.0));
+        // Internal edge between (4,4) and (4,5) at Y = 80.
+        assert!(carve.contains_strict(72.0, 79.75) && carve.contains_strict(72.0, 80.25));
+        // Outer boundary of (5,4) at X = 96 keeps 0.5 yd of ground, and (5,4)'s +Y side borders
+        // the missing (5,5): inset there too.
+        assert!(carve.contains_strict(95.4, 72.0) && !carve.contains_strict(95.6, 72.0));
+        assert!(!carve.contains_strict(88.0, 79.75) && carve.contains_strict(88.0, 79.4));
+        // The outer -X edge of (4,4) at X = 64.
+        assert!(!carve.contains_strict(64.25, 72.0) && carve.contains_strict(64.6, 72.0));
+        // Signatures: a box the union does not reach is 0; one it does is non-zero and changes
+        // only when a rect reaching it changes.
+        assert_eq!(carve.sig_for_box([0.0, 0.0], [10.0, 10.0]), 0);
+        let near = carve.sig_for_box([60.0, 60.0], [70.0, 70.0]);
+        assert_ne!(near, 0);
+        let grown = VoxelCarve::from_columns([(4, 4), (5, 4), (4, 5), (20, 20)], 16.0, 0.5);
+        assert_eq!(grown.sig_for_box([60.0, 60.0], [70.0, 70.0]), near);
+        assert_ne!(grown.sig(), carve.sig());
+        assert!(VoxelCarve::from_columns([], 16.0, 0.5).is_empty());
     }
 
     #[test]

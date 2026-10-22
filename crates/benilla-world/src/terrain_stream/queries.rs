@@ -138,7 +138,7 @@ pub fn terrain_height_under_cached<'a>(
     // collider is the ground there); area id, ground effect and MCSH shade keep the un-holed data.
     #[cfg(feature = "voxel")]
     {
-        terrain_height_with_carve(&adt.chunks, wow, streamer.voxel_carve.as_ref())
+        terrain_height_with_carve(&adt.chunks, wow, streamer.voxel_carve.as_deref())
     }
     #[cfg(not(feature = "voxel"))]
     {
@@ -182,13 +182,13 @@ pub fn terrain_height_under_raw_cached<'a>(
 }
 
 #[cfg(feature = "voxel")]
-/// MONKEY (voxel): a height sample with the build site's carve applied — `None` strictly inside the
-/// carve rectangle (the same exact rectangle the render cells and the tile collider are clipped to),
-/// the raw ADT height everywhere else.
+/// MONKEY (voxel): a height sample with the voxel layer's carve applied — `None` strictly inside
+/// the union of carved columns (the same exact shape the render cells and the tile collider are
+/// clipped to), the raw ADT height everywhere else.
 fn terrain_height_with_carve(
     chunks: &[benilla_formats::ChunkMesh],
     wow: [f32; 3],
-    carve: Option<&super::voxel_clip::VoxelCarveRect>,
+    carve: Option<&super::voxel_clip::VoxelCarve>,
 ) -> Option<f32> {
     if carve.is_some_and(|r| r.contains_strict(wow[0], wow[1])) {
         return None;
@@ -303,15 +303,10 @@ mod tests {
     fn voxel_height_override_holes_carved_columns_but_raw_height_remains() {
         let chunk = flat_chunk();
         let chunks = [chunk];
-        // A carve rect off the hole-block grid: 3..13 yd south / west of the chunk's NW corner.
-        let rect = super::super::voxel_clip::VoxelCarveRect {
-            x0: 100.0 - 13.0,
-            x1: 100.0 - 3.0,
-            y0: 100.0 - 13.0,
-            y1: 100.0 - 3.0,
-        };
-        let inside = [100.0 - 3.2, 100.0 - 12.8, 0.0];
-        let outside = [100.0 - 2.8, 100.0 - 8.0, 0.0];
+        // One carved 16-yd column, (5, 5) = X/Y [80, 96], inset 0.5 on every side (no neighbour).
+        let rect = super::super::voxel_clip::VoxelCarve::from_columns([(5, 5)], 16.0, 0.5);
+        let inside = [95.4, 80.6, 0.0];
+        let outside = [95.6, 88.0, 0.0];
         assert_eq!(
             terrain_height_with_carve(&chunks, inside, Some(&rect)),
             None

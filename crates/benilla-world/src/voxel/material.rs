@@ -1,16 +1,16 @@
-//! Surface material for the optional MONKEY voxel build site.
+//! Surface material for the optional MONKEY world voxel layer.
 //!
-//! MONKEY (voxel): it binds the REAL ADT tileset of the ground the volume replaces — the covering
-//! tile's `layer_array`, per-chunk `alpha_array` and MCSH `shadow_array` — plus the SHARED global
-//! light buffer the terrain reads, and `monkey_voxel.wgsl` reproduces `terrain.wgsl`'s mapping, blend
-//! and lighting so a voxel top pixel-matches the ground beside it. The chunk is picked PER FRAGMENT
-//! from a 3×3 neighbourhood of the covering tile's MCNK chunks (see [`MonkeyVoxelParams`]). Until
-//! the covering tile is resident it falls back to a PROCEDURAL grass/rock/dirt slope-blend (built
-//! once at startup into the same `texture_2d_array`), so the volume always renders something.
+//! MONKEY (voxel): ONE material per ADT tile — every voxel chunk wears the tile under its column.
+//! It binds that tile's REAL `layer_array`, per-chunk `alpha_array` and MCSH `shadow_array` plus
+//! the SHARED global light buffer the terrain reads, and `monkey_voxel.wgsl` reproduces
+//! `terrain.wgsl`'s mapping, blend and lighting so a voxel top pixel-matches the ground beside it.
+//! The MCNK chunk is picked PER FRAGMENT from the tile's full 16×16 chunk table (see
+//! [`MonkeyVoxelParams`]). Until the tile is resident the material is a PROCEDURAL
+//! grass/rock/dirt slope-blend (built once at startup into the same `texture_2d_array`).
 //!
-//! `monkey_voxel_texture_from_terrain` (in `voxel.rs`) swaps the handles, the 3×3 chunk table and
-//! the shared light buffer over once they exist. Still `unlit` as a StandardMaterial — the fragment
-//! stage does the terrain's own (fixed-function-faithful) light sum from the shared buffer.
+//! `monkey_voxel_tile_materials` (in `voxel.rs`) creates the per-tile materials, points them at the
+//! tile's arrays + chunk table, and binds the shared light buffer once it exists. Still `unlit` as a
+//! StandardMaterial — the fragment stage does the terrain's own light sum from the shared buffer.
 
 use bevy::asset::RenderAssetUsages;
 use bevy::image::{ImageAddressMode, ImageFilterMode, ImageSampler, ImageSamplerDescriptor};
@@ -25,18 +25,19 @@ use bevy::shader::ShaderRef;
 
 pub type MonkeyVoxelMaterial = ExtendedMaterial<StandardMaterial, MonkeyVoxelExt>;
 
-/// Side of the per-fragment chunk neighbourhood: 3×3 around the chunk under the volume centre (the
-/// 32-yd volume never reaches past the neighbours of a 33.33-yd chunk).
-pub(super) const MONKEY_VOXEL_GRID: usize = 3;
+/// Side of the per-fragment chunk table: a tile's 16×16 MCNK chunks.
+pub(super) const MONKEY_VOXEL_GRID: usize = 16;
+/// Entries of the chunk table.
+const MONKEY_VOXEL_CELLS: usize = MONKEY_VOXEL_GRID * MONKEY_VOXEL_GRID;
 
 /// MONKEY (voxel): the uniform at binding 104 — field order MUST match the WGSL `MonkeyVoxelParams`.
-#[derive(Clone, Default, ShaderType)]
+#[derive(Clone, ShaderType)]
 pub struct MonkeyVoxelParams {
-    /// Each neighbourhood chunk's 4 layer-array indices, row-major (row = south, col = east).
-    pub layers: [Vec4; 9],
+    /// Each tile chunk's 4 layer-array indices, row-major (row = south, col = east).
+    pub layers: [Vec4; MONKEY_VOXEL_CELLS],
     /// `x` = alpha-array index; `y` = shadow-array index (`< 0` = no MCSH map); `zw` unused.
-    pub aux: [Vec4; 9],
-    /// `x`/`y` = WoW X (north) / WoW Y (west) of the grid's NW corner; `z` = chunk size (yd);
+    pub aux: [Vec4; MONKEY_VOXEL_CELLS],
+    /// `x`/`y` = WoW X (north) / WoW Y (west) of the tile's NW corner; `z` = chunk size (yd);
     /// `w` = layer repeats per chunk ([`benilla_formats::TERRAIN_LAYER_TILES`]).
     pub grid: Vec4,
     /// `x` = procedural tiles per yard; `y` = has the real tileset (≥0.5); `z` = the shared light
@@ -70,9 +71,8 @@ impl MaterialExtension for MonkeyVoxelExt {
     }
 }
 
-/// The one shared voxel material (a single volume at a time), plus the procedural fallback image
-/// handles kept resident so the material can be rebuilt without re-synthesising them. `.0` is the
-/// material handle (the field every existing call site reads).
+/// The startup TEMPLATE material (procedural fallback, light placeholder) every per-tile material
+/// is cloned from, plus the procedural fallback image handles kept resident. `.0` is the template.
 #[derive(Resource)]
 pub struct MonkeyVoxelMaterialHandle(
     pub Handle<MonkeyVoxelMaterial>,
@@ -116,8 +116,8 @@ pub fn monkey_voxel_create_material(
             alpha_array: alpha_array.clone(),
             shadow_array: alpha_array.clone(),
             params: MonkeyVoxelParams {
-                layers: [Vec4::new(1.0, 2.0, 3.0, 0.0); 9],
-                aux: [Vec4::new(0.0, -1.0, 0.0, 0.0); 9],
+                layers: [Vec4::new(1.0, 2.0, 3.0, 0.0); MONKEY_VOXEL_CELLS],
+                aux: [Vec4::new(0.0, -1.0, 0.0, 0.0); MONKEY_VOXEL_CELLS],
                 grid: Vec4::new(
                     0.0,
                     0.0,
@@ -145,7 +145,7 @@ pub(super) fn monkey_voxel_bind_light(ext: &mut MonkeyVoxelExt, light: Buffer) {
     ext.params.misc.z = 1.0;
 }
 
-/// One neighbourhood chunk's shading for [`monkey_voxel_apply_real`].
+/// One tile chunk's shading for [`monkey_voxel_apply_real`].
 #[derive(Clone, Copy)]
 pub(super) struct MonkeyVoxelChunkShade {
     pub layers: [u32; 4],
@@ -153,15 +153,15 @@ pub(super) struct MonkeyVoxelChunkShade {
     pub shadow: f32,
 }
 
-/// Update the shared material to wear the real tileset: the tile's own arrays, the 3×3 chunk table
-/// (row-major, row = south, col = east; out-of-tile neighbours already clamped by the caller) and
-/// the grid's NW corner in WoW (x = north, y = west).
+/// Point a tile material at the real tileset: the tile's own arrays, its 16×16 chunk table
+/// (row-major, row = south, col = east; holes / missing chunks already filled by the caller) and
+/// the tile's NW corner in WoW (x = north, y = west).
 pub(super) fn monkey_voxel_apply_real(
     ext: &mut MonkeyVoxelExt,
     layer_array: Handle<Image>,
     alpha_array: Handle<Image>,
     shadow_array: Handle<Image>,
-    grid: &[MonkeyVoxelChunkShade; MONKEY_VOXEL_GRID * MONKEY_VOXEL_GRID],
+    grid: &[MonkeyVoxelChunkShade; MONKEY_VOXEL_CELLS],
     grid_nw: [f32; 2],
 ) {
     ext.layer_array = layer_array;

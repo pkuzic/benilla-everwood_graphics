@@ -98,10 +98,11 @@ pub struct TerrainStreamer {
     settled: bool,
     /// The off-grid focus tile last warned about, so the warning fires once per tile.
     off_grid_reported: Option<(i32, i32)>,
-    /// MONKEY (voxel): the build site's carve rectangle (WoW yards): the height queries answer
-    /// `None` strictly inside it and the torch casters clip the ground out of it.
+    /// MONKEY (voxel): the world voxel layer's carve (the union of its surface columns, WoW
+    /// yards): the height queries answer `None` strictly inside it and the torch casters clip the
+    /// ground out of it.
     #[cfg(feature = "voxel")]
-    voxel_carve: Option<voxel_clip::VoxelCarveRect>,
+    voxel_carve: Option<std::sync::Arc<voxel_clip::VoxelCarve>>,
 }
 
 /// The map-global WMO's placement id: a WMO-only map has no ADT uniqueIds to collide with, and
@@ -134,16 +135,16 @@ impl TerrainStreamer {
         self.tiles.get(&tile).and_then(|t| t.entity)
     }
 
-    /// MONKEY (voxel): publish the build site's carve rectangle (`None` = no carve).
+    /// MONKEY (voxel): publish the voxel layer's carve (`None` = no carve).
     #[cfg(feature = "voxel")]
-    pub(crate) fn set_voxel_carve(&mut self, carve: Option<voxel_clip::VoxelCarveRect>) {
-        self.voxel_carve = carve;
+    pub(crate) fn set_voxel_carve(&mut self, carve: Option<std::sync::Arc<voxel_clip::VoxelCarve>>) {
+        self.voxel_carve = carve.filter(|c| !c.is_empty());
     }
 
-    /// MONKEY (voxel): the published carve rectangle.
+    /// MONKEY (voxel): the published carve.
     #[cfg(feature = "voxel")]
-    pub(crate) fn voxel_carve(&self) -> Option<voxel_clip::VoxelCarveRect> {
-        self.voxel_carve
+    pub(crate) fn voxel_carve(&self) -> Option<&voxel_clip::VoxelCarve> {
+        self.voxel_carve.as_deref()
     }
 }
 

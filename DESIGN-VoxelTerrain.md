@@ -293,3 +293,36 @@ ground (the overlap that prevents a sky slit); NPC navmesh and server-side colli
 (client-side first). Everwood login needs the local-only AUTH_BUILD 7272 change in benilla-protocol
 (never committed here), and the Everwood addon gate needs a GM-rank test account (this branch has no
 native gate report).
+
+## World layer v2 — client side (2026-10-18, branch `everwood-voxel_world`)
+
+Replaces the single Ctrl+P "site" with the CONTRACT §1–2 world voxel layer (`disposable/voxel-v2/CONTRACT.md`).
+
+- **Data** (`benilla-voxel/src/world.rs`, engine-free): world lattice `I = round(wow/0.5)` in WoW axes; chunk
+  `k = floor(wow/16)` OWNS lattice `32k..32k+31` (32³ i8). Meshing reads a 34³ window `32k-1..32k+32`; the
+  apron comes from the owning neighbour (its density if active, else the seed), so every sample has exactly
+  one owner — seams cannot disagree. `ColumnSeed` = raw ADT height (+0.15 `SEED_LIFT`) per lattice column over
+  a 36² window (apron + smooth read ring); holes = air. `VoxelWorldData::build(keys, edits)` is the canonical
+  "seed + every edit touching the set, in order", applied to the whole set in lockstep (smooth is Jacobi over
+  the gathered pre-edit field, so a multi-chunk smooth equals the one-grid result); `apply_incremental` is the
+  in-order shortcut. `MapJournal`: confirmed edits by seq, then local predictions in arrival order;
+  `insert` reports Appended / OutOfOrder (→ rebuild) / Duplicate; `confirm(nonce, seq)`, `reset_region`.
+  `VoxelJournal::encode/decode` = `monkey_voxel_world.bin` ("MVXW", v2). `VoxelEditOp::to_wire/to_hex` = the
+  23-byte CONTRACT §3 EDIT body.
+- **Bevy side** (`benilla-world/src/voxel.rs`): `MonkeyVoxelWorld` resource (wanted chunks per column, seed /
+  build / rebuild / hot+dirty remesh queues, entities, carve). Activation = the edit bbox's chunks; once a
+  column's seed loads (tiles resident), any wanted chunk within ±1 of the surface pulls in the column's
+  surface chunks. One entity per non-empty chunk: `Mesh3d` + per-tile `MonkeyVoxelMaterial` + Static trimesh
+  `Collider`. Brush chunks are meshed the same frame; journal replay uses a 4 ms/frame budget. Cap 4096 chunks.
+- **Carve**: `terrain_stream::voxel_clip::VoxelCarve` = union of fully-meshed surface columns, one rect per
+  column inset 0.5 yd only on sides without a carved neighbour; cells/tiles carry the signature of the rects
+  reaching THEM, so a new column re-clips only its cells and tile colliders.
+- **Material**: one material per ADT tile, the shader picks the MCNK chunk per fragment from the tile's 16×16
+  table (holes filled with the nearest drawing chunk; across a tile border the nearest in-tile chunk).
+- **Brush**: GM-gated; raymarch (0.25 yd steps, bisection) through active voxels else the raw ADT ground;
+  edits emitted at ≤ 8/s (moved ≥ r/2 or 125 ms), exactly those are applied, journalled and sent.
+- **Relay**: guild addon `MV2:` + hex EDIT body (no seq, appended in arrival order) — the CONTRACT §4 fallback.
+- Removed: Ctrl+P / `WOW_VOXEL_AUTOPLACE`, `VS:` site messages, `monkey_voxel_site.bin`, the v1 journal
+  (`monkey_voxel_journal.bin`, ignored with one log line), the capture follow/demo hooks, `WOW_VOXEL_TEST_MOVE_AT`.
+- Dev hooks: `WOW_VOXEL_AUTOEDIT=1|x,y` (scripted craters / chunk-corner dig / mound + overhang / 8-yd + 2-yd
+  digs), `WOW_VOXEL_PROBE_RAY=1` (physics ray under the first dig), `WOW_VOXEL_NO_HIDE=1`.

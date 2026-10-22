@@ -1,31 +1,33 @@
-//! MONKEY (Voxel): P1b multiplayer terrain-edit relay over **guild addon messages**.
+//! MONKEY (Voxel): multiplayer terrain-edit relay over **guild addon messages** — the v2 fallback
+//! transport (CONTRACT §4: "no HELLO-ACK → fall back to the guild relay, prefix `MV2:` + the EDIT
+//! body, no seq, best effort").
 //!
-//! Every edit a player makes with the local brush is pushed to
-//! [`benilla_world::voxel::MonkeyVoxelNet`]'s `outbox` by the world side; a world system drains the
-//! `inbox` and re-applies the edits. This module is the transport in between, and needs **no server
-//! change**: we send each edit as a **guild** addon message (`MV:<hex>`), and the server relays
-//! guild addon traffic to every guild member verbatim (the same mechanism the client's other addons
-//! use — a raw custom WoW channel was NOT relayed on this server). So a guild's terraforming syncs.
+//! Every edit the local brush makes is pushed to [`benilla_world::voxel::MonkeyVoxelNet`]'s
+//! `outbox` by the world side; this module sends each as a **guild** addon message
+//! `MV2:<46 hex>` (the 23-byte v2 EDIT body: `op 0x01, nonce u16, map u16, x f32, y f32, z f32,
+//! radius f32, mode u8, strength u8`, little-endian) and decodes the guild members' lines into the
+//! `inbox`, which the world applies through the canonical path (no seq → appended in arrival
+//! order). The server relays guild addon traffic verbatim, so this needs no server change.
 //!
-//! The whole module is gated behind the crate's `voxel` cargo feature (OFF by default), so the
-//! shipped player build is byte-unchanged.
+//! The server-authority lane (`.mvox` + `MONKEYVOXEL` whispers) will sit beside this and drive the
+//! same mailbox (`inbox` with seq, `confirms`, `resets`, `region_done`).
+//!
+//! The whole module is gated behind the crate's `voxel` cargo feature (OFF by default).
 
 use bevy::prelude::*;
 
 use benilla_protocol::{SessionEvent, SessionEventKind};
 use benilla_ui::script::AddonDistribution;
-use benilla_world::voxel::{MonkeyLocalGm, MonkeyVoxelEdit, MonkeyVoxelNet, MonkeyVoxelSpawn};
+use benilla_world::voxel::{MonkeyLocalGm, MonkeyVoxelEdit, MonkeyVoxelNet};
 
 use crate::net::{ClientCommand, NetCommands, NetHandlerApp, ObjectStore, SelfGuid, SelfPlayer};
 
 /// `PLAYER_FLAGS & 0x8` — GM mode on (`.gm on`); same bit chat's `is_gm` reads.
 const PLAYER_FLAGS_GM: u32 = 0x8;
 
-/// The tag marking a voxel-EDIT addon line (`MV:<34 hex>`). Also used by the chat UI to keep these
-/// lines out of the visible chat log.
-pub(crate) const MONKEY_VOXEL_PREFIX: &str = "MV:";
-/// The tag marking a shared-build-SITE placement line (`VS:<38 hex>`).
-pub(crate) const MONKEY_VOXEL_SPAWN_PREFIX: &str = "VS:";
+/// The tag marking a v2 voxel-EDIT addon line (`MV2:<46 hex>`). Addon traffic, so the chat UI
+/// keeps it out of the visible log.
+pub(crate) const MONKEY_VOXEL_PREFIX: &str = "MV2:";
 
 /// Wire the relay: the inbound-chat interceptor, the outbox-drain sender, and the GM-status bridge.
 pub(crate) fn register(app: &mut App) {
@@ -34,7 +36,7 @@ pub(crate) fn register(app: &mut App) {
 }
 
 /// Bridge the self player's GM flag into benilla-world's `MonkeyLocalGm` each frame (benilla-world
-/// can't read the network descriptor), the `FfxDeathFade` pattern. Gates the GM-only brush/placement.
+/// can't read the network descriptor), the `FfxDeathFade` pattern. Gates the GM-only brush.
 fn monkey_voxel_push_gm(
     self_q: Query<&ObjectStore, With<SelfPlayer>>,
     mut gm: ResMut<MonkeyLocalGm>,
@@ -45,29 +47,20 @@ fn monkey_voxel_push_gm(
         .unwrap_or(false);
 }
 
-/// Drain the brush's outboxes: each local edit goes out as a `MV:<hex>` and each shared-site
-/// placement as a `VS:<hex>` **guild** addon message. The server relays guild addon traffic to all
-/// guild members, so they see the deformation / adopt the build site.
+/// Drain the brush's outbox: each local edit goes out as a `MV2:<hex>` **guild** addon message.
 fn monkey_voxel_drain_outbox(
     mut net: ResMut<MonkeyVoxelNet>,
     self_guid: Res<SelfGuid>,
     commands: Res<NetCommands>,
 ) {
-    if net.outbox.is_empty() && net.spawn_outbox.is_empty() {
+    if net.outbox.is_empty() {
         return;
     }
     // Only in-world (a writer exists); drop anything staged while out of the world so a stale edit
     // can't leak into the next session.
     if self_guid.0.is_none() {
         net.outbox.clear();
-        net.spawn_outbox.clear();
         return;
-    }
-    for spawn in net.spawn_outbox.drain(..).collect::<Vec<_>>() {
-        let _ = commands.0.send(ClientCommand::AddonMessage {
-            distribution: AddonDistribution::Guild,
-            text: format!("{MONKEY_VOXEL_SPAWN_PREFIX}{}", spawn.to_hex()),
-        });
     }
     for edit in net.outbox.drain(..).collect::<Vec<_>>() {
         let _ = commands.0.send(ClientCommand::AddonMessage {
@@ -77,10 +70,9 @@ fn monkey_voxel_drain_outbox(
     }
 }
 
-/// Receive side: an addon line tagged `MV:<hex>` (an edit) or `VS:<hex>` (a shared build-site
-/// placement) from **another** player decodes into the matching inbox, which the world's apply
-/// systems drain and re-mesh. Our own echo (same sender guid) is skipped so what we did locally
-/// isn't applied twice.
+/// Receive side: an addon line tagged `MV2:<hex>` from **another** player decodes into the inbox.
+/// Our own echo (same sender guid) is skipped so what we did locally isn't applied twice. A
+/// malformed / invalid body (bad length, NaN, radius out of range, unknown mode) is dropped.
 fn monkey_voxel_recv(
     In(ev): In<SessionEvent>,
     mut net: ResMut<MonkeyVoxelNet>,
@@ -89,33 +81,14 @@ fn monkey_voxel_recv(
     let SessionEvent::Chat(m) = ev else {
         return;
     };
-    // Classify by tag first, so a non-voxel addon line is ignored cheaply.
-    let edit_hex = m.text.strip_prefix(MONKEY_VOXEL_PREFIX);
-    let spawn_hex = m.text.strip_prefix(MONKEY_VOXEL_SPAWN_PREFIX);
-    if edit_hex.is_none() && spawn_hex.is_none() {
+    let Some(hex) = m.text.strip_prefix(MONKEY_VOXEL_PREFIX) else {
         return;
-    }
-    // Skip our own echo (the server relays our guild message back to us too).
+    };
     if self_guid.0 == Some(m.sender_guid) {
         return;
     }
-    if let Some(hex) = spawn_hex {
-        match MonkeyVoxelSpawn::from_hex(hex) {
-            Some(spawn) => {
-                info!("MONKEY (voxel): received a shared build-site placement");
-                net.spawn_inbox.push(spawn);
-            }
-            None => warn!("MONKEY (voxel): dropping a malformed site payload {:?}", m.text),
-        }
-        return;
-    }
-    if let Some(hex) = edit_hex {
-        match MonkeyVoxelEdit::from_hex(hex) {
-            Some(edit) => {
-                info!("MONKEY (voxel): received a remote terrain edit");
-                net.inbox.push(edit);
-            }
-            None => warn!("MONKEY (voxel): dropping a malformed relay payload {:?}", m.text),
-        }
+    match MonkeyVoxelEdit::from_hex(hex) {
+        Some(edit) => net.inbox.push(edit),
+        None => warn!("MONKEY (voxel): dropping a malformed MV2 payload {:?}", m.text),
     }
 }

@@ -16,6 +16,9 @@
 //! live SDF is `density as f32 / DENSITY_SCALE`, in voxel units, clamped to ±2 voxels (only the
 //! sign and the near-surface gradient matter to the mesher).
 
+// MONKEY (voxel): the v2 world voxel layer (sparse world-aligned chunks, seed, journal v2).
+pub mod world;
+
 use fast_surface_nets::ndshape::{ConstShape, ConstShape3u32};
 use fast_surface_nets::{surface_nets, SurfaceNetsBuffer};
 

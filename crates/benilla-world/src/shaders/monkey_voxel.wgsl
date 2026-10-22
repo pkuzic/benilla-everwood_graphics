@@ -5,8 +5,9 @@
 //     v south, phase locked to the MCNK grid), the per-chunk alpha map at the chunk UV with the same
 //     half-texel inset, the same `mix` chain, the same MCSH bake, the same sampler (one repeating
 //     sampler for layers + alpha + shadow, exactly as terrain binds 105).
-//   · The chunk is chosen PER FRAGMENT from a 3×3 neighbourhood of the covering tile's MCNK chunks
-//     (the volume is 32 yd, a chunk 33.33 yd, so 3×3 around the centre chunk covers any footprint).
+//   · MONKEY (voxel): one material per ADT TILE (the world voxel layer's chunks wear the tile under
+//     them); the MCNK chunk is chosen PER FRAGMENT from the tile's full 16×16 table, clamped to the
+//     tile (across a tile border the nearest in-tile chunk is used — a known limit).
 //   · WALLS / cliffs use a sharp triplanar (|n|^6) of the chunk's most rock/dirt-like layer (lowest
 //     saturation of the layer's mean colour) with a macro-scale second tap + a low-frequency tone
 //     variation so a big wall does not read as a stamp; overhang UNDERSIDES use the same layer
@@ -34,11 +35,11 @@
 
 // Packed uniform at binding 104; MUST match the Rust `MonkeyVoxelParams` (ShaderType) field order.
 struct MonkeyVoxelParams {
-    // The 3×3 neighbourhood's 4 layer-array indices, row-major (row = south step, col = east step).
-    layers: array<vec4<f32>, 9>,
+    // The tile's 16×16 chunks' 4 layer-array indices, row-major (row = south step, col = east step).
+    layers: array<vec4<f32>, 256>,
     // x = alpha-array index; y = shadow-array index (< 0 = no MCSH); zw unused.
-    aux: array<vec4<f32>, 9>,
-    // x = WoW X (north) of the grid's NW corner; y = its WoW Y (west); z = chunk size (yd);
+    aux: array<vec4<f32>, 256>,
+    // x = WoW X (north) of the tile's NW corner; y = its WoW Y (west); z = chunk size (yd);
     // w = layer repeats per chunk (TERRAIN_LAYER_TILES = 8).
     grid: vec4<f32>,
     // x = procedural tiles per yard; y = has_real tileset (>= 0.5); z = has shared light (>= 0.5).
@@ -213,12 +214,12 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     var shadow_lit = 1.0;
 
     if (vp.misc.y >= 0.5) {
-        // This fragment in the 3×3 chunk grid: (east, south) in chunks from the grid's NW corner
-        // (WoW X = north = -bevy.z, WoW Y = west = -bevy.x).
+        // This fragment in the tile's 16×16 chunk grid: (east, south) in chunks from the tile's NW
+        // corner (WoW X = north = -bevy.z, WoW Y = west = -bevy.x).
         let cs = vp.grid.z;
         let g = vec2<f32>((vp.grid.y + p.x) / cs, (vp.grid.x + p.z) / cs);
-        let cell = clamp(floor(g), vec2<f32>(0.0), vec2<f32>(2.0));
-        let ci = i32(cell.y) * 3 + i32(cell.x);
+        let cell = clamp(floor(g), vec2<f32>(0.0), vec2<f32>(15.0));
+        let ci = i32(cell.y) * 16 + i32(cell.x);
         let li = vec4<i32>(round(vp.layers[ci]));
         let aux = vp.aux[ci];
         // The chunk UV (0..1 over the chunk, clamped when the footprint leaves the grid) — the

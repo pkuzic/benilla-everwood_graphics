@@ -1,78 +1,71 @@
-//! MONKEY (voxel): hide the real ADT terrain under a voxel build site, so a region placed on the
-//! real ground REPLACES it — a hole dug into the voxel shows the voxel interior (dark walls going
-//! down), not the old flat heightmap ground poking through at its original height.
+//! MONKEY (voxel): hide the real ADT terrain under the world voxel layer, so the voxel surface
+//! REPLACES the ground wherever it is active — a hole dug into the voxel shows the voxel interior,
+//! not the old heightmap ground poking through at its original height.
 //!
-//! The terrain renderer draws one mesh per CELL = 4×4 MCNK chunks (`terrain_stream::furnish`). This
-//! module finds the cells the voxel footprint overlaps and re-meshes them with every chunk the
-//! footprint reaches CLIPPED to it ([`clip_chunk_outside_rect`]): all ground strictly inside the
-//! carve rectangle — the footprint inset by [`CARVE_INSET`] — is dropped, everything outside is
-//! kept exactly (an exact cut, not the 8.33-yd MCNK hole blocks the first lane used, which left an
-//! un-carved rim of up to a block per side where a dig was covered by the real ground). It is
-//! reversible: a cell is restored (re-meshed from the original chunks) when the region moves off it
-//! or is removed, and re-clipped when a tile streams out and back in (the furnisher respawns the
-//! cell fresh/visible).
+//! The carve is the UNION of the layer's surface columns ([`VoxelCarve`], CONTRACT §1): each 16-yd
+//! column a rectangle, inset 0.5 yd only along the union's OUTER boundary. The terrain renderer
+//! draws one mesh per CELL = 4×4 MCNK chunks (`terrain_stream::furnish`); this module re-meshes the
+//! cells the union reaches with every chunk CLIPPED to it (an exact Sutherland–Hodgman cut, see
+//! `terrain_stream/voxel_clip.rs`). Each cell / tile carries the signature of the rectangles that
+//! reach IT, so adding a column only re-clips the cells and tile colliders that column touches. It
+//! is reversible: a cell is restored (re-meshed from the original chunks) when the union leaves it,
+//! and re-clipped when a tile streams out and back in (the furnisher respawns the cell fresh).
 //!
 //! Dig-through: the tile's one static terrain collider is rebuilt from the same clipped chunks
-//! ([`sync_tile_colliders`]), so a pit dug in the voxel is walkable down to the voxel's own floor,
-//! and the carve rectangle is published to `TerrainStreamer` so the MCNK HEIGHT query answers
-//! `None` strictly inside it (area / ground effect / shade keep the un-clipped data; the voxel seed
-//! samplers read the raw path) and the torch casters clip the ground the same way.
+//! ([`sync_tile_colliders`]), and the carve is published to `TerrainStreamer` so the MCNK HEIGHT
+//! query answers `None` strictly inside it (area / ground effect / shade keep the un-clipped data;
+//! the voxel seed reads the raw path) and the torch casters clip the ground the same way.
 //!
 //! Everything here is gated behind the crate's `voxel` cargo feature, like the rest of `voxel`.
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
-use avian3d::prelude::{Collider, SpatialQuery, SpatialQueryFilter};
+use avian3d::prelude::Collider;
 use bevy::camera::primitives::Aabb;
 use bevy::math::Vec3A;
 use bevy::prelude::*;
 
-use super::{MonkeyVoxelData, MonkeyVoxelVolume};
-use crate::terrain_stream::voxel_clip::{clip_chunk_outside_rect, VoxelCarveRect};
+use super::MonkeyVoxelWorld;
+use crate::terrain_stream::voxel_clip::VoxelCarve;
 use crate::terrain_stream::{build_collider_task, PendingCollider, TerrainStreamer};
-use benilla_assets::coords::{bevy_to_wow, wow_to_bevy};
+use benilla_assets::coords::wow_to_bevy;
 use benilla_assets::materials::TerrainMaterial;
 use benilla_assets::{chunks_to_mesh, AdtTile, ChunkShading};
 use benilla_formats::ChunkMesh;
 
-/// MONKEY (voxel): how far INSIDE the footprint edge the real ground still reaches (yd). The voxel
-/// surface must always overlap the remaining ADT, or the sky shows through a slit along the edge.
-/// Surface-nets puts the outermost vertex in the volume's first cell, i.e. 0..1 voxel (0..0.5 yd)
-/// inside the low-index faces (on flat ground exactly 0.25 yd, the cell centre) and 0.25 yd PAST
-/// the high-index faces; so one full voxel (0.5 yd) is the hard bound that is always covered. The
-/// underlap it leaves is hidden: the seeded voxel surface is lifted `SEED_LIFT` (0.15 yd) above it.
+/// MONKEY (voxel): how far INSIDE the union's outer edge the real ground still reaches (yd). The
+/// voxel surface must always overlap the remaining ADT, or the sky shows through a slit along the
+/// edge. Surface-nets puts a chunk's outermost vertex within ±0.25 yd of its owned boundary (the
+/// mesh window starts one sample before it), so one full voxel (0.5 yd) is the hard bound that is
+/// always covered; the underlap is hidden by the seed's `SEED_LIFT` (0.15 yd).
 pub(super) const CARVE_INSET: f32 = benilla_voxel::VOXEL_SIZE;
 
 /// `(tile_x, tile_y, cell_idx)`: a render cell (4×4 MCNK chunks) of one tile, the unit the
 /// furnisher spawns one `Mesh3d` + `MeshMaterial3d<TerrainMaterial>` per.
 type CellKey = (i32, i32, usize);
 
-/// The build site's terrain-hiding state: the footprint signature (recompute the plan only when it
-/// changes), the carve rectangle, the per-cell / per-tile plan (keyed by the rectangle's signature)
-/// and which cell entities / tile roots are currently clipped (so they are restored when the
-/// footprint leaves them and re-clipped after a stream-out/in respawns them).
+/// The terrain-hiding state: the carve the plan was built for, the per-cell / per-tile plan (each
+/// keyed by the signature of the rectangles reaching it) and which cell entities / tile roots are
+/// currently clipped (so they are restored when the union leaves them and re-clipped after a
+/// stream-out/in respawns them).
 #[derive(Resource, Default)]
 pub(super) struct MonkeyVoxelHideState {
-    /// Quantized footprint signature (centre ×2 rounded, chunk dims); `None` = no volume / cleared.
-    sig: Option<(i64, i64, [u32; 3])>,
-    /// The carve rectangle the plan was built for.
-    rect: Option<VoxelCarveRect>,
-    /// Render cells the rectangle reaches → the rectangle signature they must be clipped with.
+    /// Signature of the carve the plan was built for (0 = none).
+    sig: u64,
+    carve: Option<Arc<VoxelCarve>>,
+    /// Render cells the union reaches → the signature of the rectangles reaching that cell.
     desired: HashMap<CellKey, u64>,
-    /// Tiles whose collider the rectangle reaches → the rectangle signature.
+    /// Tiles whose collider the union reaches → the signature of the rectangles reaching it.
     desired_tiles: HashMap<(i32, i32), u64>,
-    /// Clipped cell entities → (key, rect signature) they were clipped for.
-    applied: HashMap<Entity, (CellKey, u64)>,
-    /// MONKEY (voxel): collider root -> (rect signature, 0 = original), also detects streamed roots.
+    /// Clipped cells → (entity, signature) they were clipped for.
+    applied: HashMap<CellKey, (Entity, u64)>,
+    /// Collider root → (entity, signature; 0 = original), also detects streamed roots.
     applied_tiles: HashMap<(i32, i32), (Entity, u64)>,
-    /// MONKEY (voxel): re-plan until resident — the last plan found 0 cells or a footprint corner's
-    /// tile wasn't resident, so re-plan every ~0.5 s even with an unchanged signature.
-    incomplete: bool,
-    replan_timer: f32,
 }
 
-/// `WOW_VOXEL_NO_HIDE=1`: keep the real ADT ground under the build site (the pre-hiding look), a
+/// `WOW_VOXEL_NO_HIDE=1`: keep the real ADT ground under the voxel layer (the pre-hiding look), a
 /// dev A/B switch read once.
 fn monkey_voxel_hide_disabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -104,66 +97,94 @@ fn cell_key_of(center: Vec3A) -> CellKey {
     cell_key_at(-center.z, -center.x)
 }
 
-/// The carve rectangle of the footprint `[fx0,fx1]×[fy0,fy1]` (WoW X×Y): inset by [`CARVE_INSET`].
-fn carve_rect(fx0: f32, fx1: f32, fy0: f32, fy1: f32) -> VoxelCarveRect {
-    VoxelCarveRect {
-        x0: fx0 + CARVE_INSET,
-        x1: fx1 - CARVE_INSET,
-        y0: fy0 + CARVE_INSET,
-        y1: fy1 - CARVE_INSET,
-    }
-}
-
-/// The render cells the carve rectangle reaches, each tagged with the rectangle's signature. Pure
-/// geometry: cells of tiles not yet resident keep their plan and are clipped once they stream in.
-/// A chunk merely touching the rectangle's edge is planned too; clipping it is a no-op.
-fn compute_desired(rect: &VoxelCarveRect) -> HashMap<CellKey, u64> {
+/// The WoW XY box `([x_lo, y_lo], [x_hi, y_hi])` of a render cell.
+fn cell_box(key: CellKey) -> ([f32; 2], [f32; 2]) {
     let cs = benilla_formats::CHUNK_SIZE;
     let mc = map_center();
-    let sig = rect.sig();
-    // The global MCNK chunk index range the rectangle touches.
-    let gx_lo = (((mc - rect.x1) / cs).floor() as i32).clamp(0, 1023);
-    let gx_hi = (((mc - rect.x0) / cs).floor() as i32).clamp(0, 1023);
-    let gy_lo = (((mc - rect.y1) / cs).floor() as i32).clamp(0, 1023);
-    let gy_hi = (((mc - rect.y0) / cs).floor() as i32).clamp(0, 1023);
-    let mut desired = HashMap::new();
-    for gx in gx_lo..=gx_hi {
-        for gy in gy_lo..=gy_hi {
-            let (tx, ty) = (gy / 16, gx / 16);
-            let (row, col) = ((gx % 16) as usize, (gy % 16) as usize);
-            desired.insert((tx, ty, (row / 4) * 4 + (col / 4)), sig);
-        }
-    }
-    desired
+    let (tx, ty, cell) = key;
+    let gx = ty * 16 + (cell / 4) as i32 * 4;
+    let gy = tx * 16 + (cell % 4) as i32 * 4;
+    (
+        [mc - (gx + 4) as f32 * cs, mc - (gy + 4) as f32 * cs],
+        [mc - gx as f32 * cs, mc - gy as f32 * cs],
+    )
 }
 
-/// MONKEY (voxel): fold the cell plan into the tile-level terrain collider plan.
-fn tile_plans(cells: &HashMap<CellKey, u64>) -> HashMap<(i32, i32), u64> {
+/// The WoW XY box of a tile.
+fn tile_box(tile: (i32, i32)) -> ([f32; 2], [f32; 2]) {
+    let ts = benilla_formats::TILE_SIZE;
+    let mc = map_center();
+    (
+        [mc - (tile.1 + 1) as f32 * ts, mc - (tile.0 + 1) as f32 * ts],
+        [mc - tile.1 as f32 * ts, mc - tile.0 as f32 * ts],
+    )
+}
+
+/// The render cells the union reaches, each tagged with the signature of the rectangles reaching
+/// it. Pure geometry: cells of tiles not yet resident keep their plan and are clipped once they
+/// stream in.
+fn compute_desired(carve: &VoxelCarve) -> HashMap<CellKey, u64> {
+    let cs = benilla_formats::CHUNK_SIZE;
+    let mc = map_center();
+    let mut cells: HashSet<CellKey> = HashSet::new();
+    for r in carve.rects() {
+        let gx_lo = (((mc - r.x1) / cs).floor() as i32).clamp(0, 1023);
+        let gx_hi = (((mc - r.x0) / cs).floor() as i32).clamp(0, 1023);
+        let gy_lo = (((mc - r.y1) / cs).floor() as i32).clamp(0, 1023);
+        let gy_hi = (((mc - r.y0) / cs).floor() as i32).clamp(0, 1023);
+        for gx in gx_lo..=gx_hi {
+            for gy in gy_lo..=gy_hi {
+                let (tx, ty) = (gy / 16, gx / 16);
+                let (row, col) = ((gx % 16) as usize, (gy % 16) as usize);
+                cells.insert((tx, ty, (row / 4) * 4 + (col / 4)));
+            }
+        }
+    }
     cells
-        .iter()
-        .map(|(&(tx, ty, _), &sig)| ((tx, ty), sig))
+        .into_iter()
+        .filter_map(|k| {
+            let (lo, hi) = cell_box(k);
+            let s = carve.sig_for_box(lo, hi);
+            (s != 0).then_some((k, s))
+        })
         .collect()
 }
 
-/// `chunk` clipped to `rect` when the rectangle reaches it, else borrowed as-is.
-fn clipped<'a>(chunk: &'a ChunkMesh, rect: Option<&VoxelCarveRect>) -> Cow<'a, ChunkMesh> {
-    match rect.and_then(|r| clip_chunk_outside_rect(chunk, r)) {
+/// The tile-level collider plan: every tile a planned cell lies in, tagged by the rectangles
+/// reaching the whole tile.
+fn tile_plans(cells: &HashMap<CellKey, u64>, carve: &VoxelCarve) -> HashMap<(i32, i32), u64> {
+    cells
+        .keys()
+        .map(|&(tx, ty, _)| (tx, ty))
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .filter_map(|t| {
+            let (lo, hi) = tile_box(t);
+            let s = carve.sig_for_box(lo, hi);
+            (s != 0).then_some((t, s))
+        })
+        .collect()
+}
+
+/// `chunk` clipped to the carve when it reaches it, else borrowed as-is.
+fn clipped<'a>(chunk: &'a ChunkMesh, carve: Option<&VoxelCarve>) -> Cow<'a, ChunkMesh> {
+    match carve.and_then(|c| c.clip_chunk(chunk)) {
         Some(c) => Cow::Owned(c),
         None => Cow::Borrowed(chunk),
     }
 }
 
-/// MONKEY (voxel): one tile's terrain collider data from its chunks clipped to `rect` (`None` = the
-/// original trimesh) — the same weld as `terrain_stream`'s `terrain_collider_data`: draw space, each
-/// chunk's indices rebased onto the running vertex count.
+/// One tile's terrain collider data from its chunks clipped to `carve` (`None` = the original
+/// trimesh) — the same weld as `terrain_stream`'s `terrain_collider_data`: draw space, each chunk's
+/// indices rebased onto the running vertex count.
 fn tile_collider_data(
     chunks: &[ChunkMesh],
-    rect: Option<&VoxelCarveRect>,
+    carve: Option<&VoxelCarve>,
 ) -> Option<(Vec<Vec3>, Vec<[u32; 3]>)> {
     let mut verts: Vec<Vec3> = Vec::new();
     let mut tris: Vec<[u32; 3]> = Vec::new();
     for chunk in chunks {
-        let chunk = clipped(chunk, rect);
+        let chunk = clipped(chunk, carve);
         let base = verts.len() as u32;
         verts.extend(chunk.positions.iter().map(|p| wow_to_bevy(*p)));
         tris.extend(
@@ -178,10 +199,9 @@ fn tile_collider_data(
     (!tris.is_empty()).then_some((verts, tris))
 }
 
-/// Re-mesh one render cell of `adt` with its chunks clipped to `rect`; `None` restores the
-/// original cell. `None` result if every chunk is a hole (a 32-yd footprint never covers a whole
-/// 133-yd cell, so in practice this always builds a mesh).
-fn rebuild_cell_mesh(adt: &AdtTile, cell: usize, rect: Option<&VoxelCarveRect>) -> Option<Mesh> {
+/// Re-mesh one render cell of `adt` with its chunks clipped to `carve`; `None` restores the
+/// original cell. `None` result if every chunk is a hole.
+fn rebuild_cell_mesh(adt: &AdtTile, cell: usize, carve: Option<&VoxelCarve>) -> Option<Mesh> {
     let (cy, cx) = (cell / 4, cell % 4);
     let mut parts: Vec<(Cow<ChunkMesh>, &ChunkShading)> = Vec::with_capacity(16);
     for dy in 0..4usize {
@@ -190,21 +210,21 @@ fn rebuild_cell_mesh(adt: &AdtTile, cell: usize, rect: Option<&VoxelCarveRect>) 
             let (Some(shading), Some(chunk)) = (adt.shading.get(ci), adt.chunks.get(ci)) else {
                 continue;
             };
-            parts.push((clipped(chunk, rect), shading));
+            parts.push((clipped(chunk, carve), shading));
         }
     }
     let refs: Vec<(&ChunkMesh, &ChunkShading)> = parts.iter().map(|(c, s)| (&**c, *s)).collect();
     chunks_to_mesh(&refs)
 }
 
-/// Swap the cell entity's rendered mesh in place (clip with `rect`, or restore with `None`).
+/// Swap the cell entity's rendered mesh in place (clip with `carve`, or restore with `None`).
 /// Returns whether the swap happened (the tile must still be resident to re-read its chunks).
 fn swap_cell(
     adts: &Assets<AdtTile>,
     streamer: &TerrainStreamer,
     meshes: &mut Assets<Mesh>,
     key: CellKey,
-    rect: Option<&VoxelCarveRect>,
+    carve: Option<&VoxelCarve>,
     mesh3d: &Mesh3d,
 ) -> bool {
     let (tx, ty, cell) = key;
@@ -214,7 +234,7 @@ fn swap_cell(
     let Some(adt) = adts.get(&handle) else {
         return false;
     };
-    let Some(mesh) = rebuild_cell_mesh(adt, cell, rect) else {
+    let Some(mesh) = rebuild_cell_mesh(adt, cell, carve) else {
         return false;
     };
     // Clipping only removes area (every appended vertex lies on an original triangle), so the
@@ -223,149 +243,9 @@ fn swap_cell(
     true
 }
 
-/// MONKEY (voxel): optional numeric ray check for the centre and two yards inside the footprint edge.
-fn monkey_voxel_probe_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("WOW_VOXEL_PROBE_RAY").is_ok_and(|value| value == "1"))
-}
-
-/// MONKEY (voxel): the probe's frame-to-frame state — the periodic site probes, plus the one-shot
-/// probe of the OLD centre after the site moved (the restore check).
-#[derive(Default)]
-pub(super) struct MonkeyVoxelProbe {
-    timer: f32,
-    count: u8,
-    last_centre: Option<Vec3>,
-    /// The centre the site left, and the seconds since — probed once the restore has settled.
-    old: Option<(Vec3, f32)>,
-}
-
-/// MONKEY (voxel): log collision ownership above the carved centre and near its edge (at most ten
-/// times), and once after a move the OLD centre: PASS = the restored terrain tile at raw ADT height.
-pub(super) fn monkey_voxel_probe_rays(
-    time: Res<Time>,
-    spatial: SpatialQuery,
-    streamer: Res<TerrainStreamer>,
-    adts: Res<Assets<AdtTile>>,
-    volumes: Query<(Entity, &Transform, &MonkeyVoxelData), With<MonkeyVoxelVolume>>,
-    mut probe: Local<MonkeyVoxelProbe>,
-) {
-    if !monkey_voxel_probe_enabled() {
-        return;
-    }
-    let Ok((voxel, tf, data)) = volumes.single() else {
-        return;
-    };
-    let half = super::half_extent_for(data.0.chunk_dims());
-    let centre = tf.translation + half;
-    // The tile root under a column: the ray is vertical, so it is the only terrain trimesh it can hit.
-    let tile_root_under = |point: Vec3| {
-        let w = bevy_to_wow(point);
-        let (tx, ty) = benilla_formats::world_to_tile(w[0], w[1]);
-        streamer.tile_entity((tx as i32, ty as i32))
-    };
-    let kind_of = |e: Entity, tile_root: Option<Entity>| {
-        if e == voxel {
-            "voxel"
-        } else if tile_root == Some(e) {
-            "terrain-tile"
-        } else {
-            "other"
-        }
-    };
-    let filter = SpatialQueryFilter::default();
-
-    // A horizontal move of the site arms the one-shot old-centre probe (a re-seed only moves y).
-    if let Some(last) = probe.last_centre {
-        if last.xz().distance(centre.xz()) > 1.0 {
-            probe.old = Some((last, 0.0));
-        }
-    }
-    probe.last_centre = Some(centre);
-    if let Some((old, waited)) = probe.old {
-        let waited = waited + time.delta_secs();
-        // ~3 s for the restored collider's off-thread build to land.
-        if waited < 3.0 {
-            probe.old = Some((old, waited));
-        } else {
-            probe.old = None;
-            let root = tile_root_under(old);
-            let origin = old + Vec3::Y * 60.0;
-            let height = crate::terrain_stream::terrain_height_under(&streamer, &adts, old);
-            let raw = crate::terrain_stream::terrain_height_under_raw(&streamer, &adts, old);
-            let ground =
-                spatial.cast_ray_predicate(origin, Dir3::NEG_Y, 160.0, true, &filter, &|e| {
-                    kind_of(e, root) != "other"
-                });
-            let hit = ground.map(|h| (kind_of(h.entity, root), origin.y - h.distance));
-            let pass = matches!((hit, raw), (Some(("terrain-tile", y)), Some(r)) if (y - r).abs() < 0.05)
-                && height == raw;
-            let w = bevy_to_wow(old);
-            info!(
-                "MONKEY (voxel): old-centre probe {} at WoW ({:.1}, {:.1}): ground = {:?}; \
-                 terrain_height_under={:?} (raw ADT {:?})",
-                if pass { "PASS" } else { "FAIL" },
-                w[0],
-                w[1],
-                hit,
-                height,
-                raw
-            );
-        }
-    }
-
-    if probe.count >= 10 {
-        return;
-    }
-    probe.timer += time.delta_secs();
-    if probe.timer < 2.0 {
-        return;
-    }
-    probe.timer = 0.0;
-    let points = [
-        ("centre", centre),
-        ("edge", centre + Vec3::X * (half.x - 2.0)),
-    ];
-    for (name, point) in points {
-        let origin = point + Vec3::Y * 60.0;
-        let tile_root = tile_root_under(point);
-        let height = crate::terrain_stream::terrain_height_under(&streamer, &adts, point);
-        let raw = crate::terrain_stream::terrain_height_under_raw(&streamer, &adts, point);
-        match spatial.cast_ray(origin, Dir3::NEG_Y, 160.0, true, &filter) {
-            Some(hit) => info!(
-                "MONKEY (voxel): probe ray {} hit {} entity {:?} at y={:.3}; \
-                 terrain_height_under={:?} (raw ADT {:?})",
-                name,
-                kind_of(hit.entity, tile_root),
-                hit.entity,
-                origin.y - hit.distance,
-                height,
-                raw
-            ),
-            None => info!(
-                "MONKEY (voxel): probe ray {} hit none; terrain_height_under={:?} (raw ADT {:?})",
-                name, height, raw
-            ),
-        }
-        // The first GROUND hit (voxel or this tile's terrain), past any canopy / doodad hull.
-        let ground = spatial.cast_ray_predicate(origin, Dir3::NEG_Y, 160.0, true, &filter, &|e| {
-            kind_of(e, tile_root) != "other"
-        });
-        if let Some(hit) = ground {
-            info!(
-                "MONKEY (voxel): probe ray {} ground = {} at y={:.3}",
-                name,
-                kind_of(hit.entity, tile_root),
-                origin.y - hit.distance
-            );
-        }
-    }
-    probe.count += 1;
-}
-
-/// Carve the ADT terrain under the voxel build site, and keep the carve in step with the region:
-/// recompute the plan when the footprint moves, clip newly-resident cells, restore cells the
-/// footprint has left (or whose rectangle changed), and re-clip cells the streamer respawned.
+/// Carve the ADT terrain under the voxel layer's surface columns and keep it in step: re-plan when
+/// the union changes, clip newly-resident cells, restore cells the union has left (or whose
+/// rectangles changed), and re-clip cells the streamer respawned.
 #[allow(clippy::type_complexity)]
 pub(super) fn monkey_voxel_hide_terrain(
     mut commands: Commands,
@@ -373,175 +253,95 @@ pub(super) fn monkey_voxel_hide_terrain(
     adts: Res<Assets<AdtTile>>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut state: ResMut<MonkeyVoxelHideState>,
-    time: Res<Time>, // MONKEY (voxel): re-plan until resident
-    volume: Query<(&Transform, &MonkeyVoxelData), With<MonkeyVoxelVolume>>,
+    world: Res<MonkeyVoxelWorld>,
     cells: Query<(Entity, &Mesh3d, &Aabb), With<MeshMaterial3d<TerrainMaterial>>>,
-    settled: Query<(), (With<Collider>, Without<PendingCollider>)>, // MONKEY (voxel)
+    settled: Query<(), (With<Collider>, Without<PendingCollider>)>,
 ) {
-    // Dev A/B switch (`WOW_VOXEL_NO_HIDE=1`): leave the real ground showing under the patch, as the
-    // pre-hiding behaviour, so a capture can compare carved vs un-carved. Restores first so a live
-    // toggle reverts cleanly.
-    let no_hide = monkey_voxel_hide_disabled();
-
-    // No volume (or hiding disabled): restore every still-living clipped cell, then forget the plan.
-    let volume = if no_hide {
-        Err(())
+    // Dev A/B switch (`WOW_VOXEL_NO_HIDE=1`): leave the real ground showing under the layer.
+    let carve = if monkey_voxel_hide_disabled() {
+        None
     } else {
-        volume.single().map_err(|_| ())
+        world.carve()
     };
-    let Ok((tf, data)) = volume else {
-        if state.sig.is_some() {
-            streamer.set_voxel_carve(None);
-        }
-        if !state.applied.is_empty() {
-            let living: HashMap<Entity, Mesh3d> =
-                cells.iter().map(|(e, m, _)| (e, m.clone())).collect();
-            for (e, (key, _)) in std::mem::take(&mut state.applied) {
-                if let Some(mesh3d) = living.get(&e) {
-                    if swap_cell(&adts, &streamer, &mut meshes, key, None, mesh3d) {
-                        info!("MONKEY (voxel): restored terrain cell {key:?} (no build site).");
-                    }
-                }
+    let sig = carve.as_ref().map_or(0, |c| c.sig());
+    if sig == 0 && state.sig == 0 && state.applied.is_empty() && state.applied_tiles.is_empty() {
+        return; // nothing carved, nothing to restore
+    }
+
+    if sig != state.sig {
+        state.sig = sig;
+        state.carve = carve.clone();
+        match &carve {
+            Some(c) => {
+                state.desired = compute_desired(c);
+                state.desired_tiles = tile_plans(&state.desired, c);
+                info!(
+                    "MONKEY (voxel): hide plan — {} surface column(s) carved (outer inset \
+                     {CARVE_INSET} yd) across {} render cell(s) / {} tile(s)",
+                    c.rects().len(),
+                    state.desired.len(),
+                    state.desired_tiles.len(),
+                );
+            }
+            None => {
+                state.desired.clear();
+                state.desired_tiles.clear();
             }
         }
-        state.desired.clear();
-        state.desired_tiles.clear();
-        state.sig = None;
-        state.rect = None;
-        state.incomplete = false;
-        // An empty plan restores every clipped tile collider to its original ADT trimesh.
-        sync_tile_colliders(&mut commands, &streamer, &adts, &settled, &mut state);
-        return;
-    };
-
-    // Footprint in WoW yards: the volume centre ± the horizontal half-extent. Bevy X ↔ WoW Y, Bevy
-    // Z ↔ WoW X, so the WoW X span is half.z and the WoW Y span is half.x.
-    let half = super::half_extent_for(data.0.chunk_dims());
-    let centre = tf.translation + half;
-    let wow = bevy_to_wow(centre);
-    let (fx0, fx1) = (wow[0] - half.z, wow[0] + half.z);
-    let (fy0, fy1) = (wow[1] - half.x, wow[1] + half.x);
-
-    // Recompute the plan only when the footprint meaningfully moves (quantised to 0.5 yd).
-    let q = |v: f32| (v * 2.0).round() as i64;
-    let sig = (q(wow[0]), q(wow[1]), data.0.chunk_dims());
-    // MONKEY (voxel): re-plan until resident (the plan is XZ-only, so a re-seed's centre.y change
-    // needs no re-plan).
-    let mut retry = false;
-    if state.incomplete && state.sig == Some(sig) {
-        state.replan_timer += time.delta_secs();
-        if state.replan_timer >= 0.5 {
-            state.replan_timer = 0.0;
-            retry = true;
-        }
-    }
-    if state.sig != Some(sig) || retry {
-        let resident = |x: f32, y: f32| {
-            let (tx, ty, _) = cell_key_at(x, y);
-            streamer
-                .tile_handle((tx, ty))
-                .is_some_and(|h| adts.get(&h).is_some())
-        };
-        let all_resident = [(fx0, fy0), (fx0, fy1), (fx1, fy0), (fx1, fy1)]
-            .iter()
-            .all(|&(x, y)| resident(x, y));
-        let was_retry = retry && state.sig == Some(sig);
-        let rect = carve_rect(fx0, fx1, fy0, fy1);
-        state.sig = Some(sig);
-        state.rect = Some(rect);
-        state.desired = compute_desired(&rect);
-        state.desired_tiles = tile_plans(&state.desired);
-        // The height queries' / torch casters' carve, published only when the plan is rebuilt (not
+        // The height queries' / torch casters' carve, published only when the plan changes (not
         // every frame, so the streamer resource isn't marked changed each frame).
-        streamer.set_voxel_carve(Some(rect));
-        state.incomplete = !all_resident || state.desired.is_empty();
-        if was_retry && state.incomplete {
-            // still waiting on the stream: stay quiet (no per-0.5 s log spam)
-        } else {
-            let mut keys: Vec<CellKey> = state.desired.keys().copied().collect();
-            keys.sort_unstable();
-            info!(
-                "MONKEY (voxel): hide plan — footprint WoW X[{:.1},{:.1}] Y[{:.1},{:.1}], ground \
-                 clipped to X[{:.2},{:.2}] Y[{:.2},{:.2}] (inset {CARVE_INSET} yd) in {} render \
-                 cell(s): {:?}",
-                fx0,
-                fx1,
-                fy0,
-                fy1,
-                rect.x0,
-                rect.x1,
-                rect.y0,
-                rect.y1,
-                keys.len(),
-                keys,
-            );
-        }
+        streamer.set_voxel_carve(carve);
     }
-    let rect = state.rect;
+    let carve = state.carve.clone();
 
     // Index the resident terrain cells by their render-cell key.
     let mut by_key: HashMap<CellKey, (Entity, Mesh3d)> = HashMap::new();
-    let mut living: HashSet<Entity> = HashSet::new();
     for (e, mesh3d, aabb) in &cells {
-        living.insert(e);
         by_key.insert(cell_key_of(aabb.center), (e, mesh3d.clone()));
     }
 
-    // Restore cells no longer clipped the way the plan wants (moved off, rectangle changed), and
-    // forget clipped cells the streamer despawned (their mesh asset went with them).
-    let snapshot: Vec<(Entity, CellKey, u64)> = state
-        .applied
-        .iter()
-        .map(|(e, (k, s))| (*e, *k, *s))
-        .collect();
-    for (e, key, applied_sig) in snapshot {
-        if !living.contains(&e) {
-            state.applied.remove(&e);
+    // Restore cells no longer clipped the way the plan wants, and forget clipped cells the
+    // streamer despawned (their mesh asset went with them).
+    let snapshot: Vec<(CellKey, Entity, u64)> =
+        state.applied.iter().map(|(k, (e, s))| (*k, *e, *s)).collect();
+    for (key, e, applied_sig) in snapshot {
+        let live = by_key.get(&key).filter(|(le, _)| *le == e);
+        let Some((_, mesh3d)) = live else {
+            state.applied.remove(&key);
             continue;
-        }
+        };
         if state.desired.get(&key).copied() != Some(applied_sig) {
-            if let Some((_, mesh3d)) = by_key.get(&key) {
-                if swap_cell(&adts, &streamer, &mut meshes, key, None, mesh3d) {
-                    info!(
-                        "MONKEY (voxel): restored terrain cell {key:?} (entity {e:?}) — the build \
-                         site left it or moved."
-                    );
-                }
+            if state.desired.get(&key).is_none()
+                && swap_cell(&adts, &streamer, &mut meshes, key, None, mesh3d)
+            {
+                debug!("MONKEY (voxel): restored terrain cell {key:?} (the carve left it).");
             }
-            state.applied.remove(&e);
+            state.applied.remove(&key);
         }
     }
 
     // Clip desired cells that aren't already clipped on a live entity for the current plan.
     let desired: Vec<(CellKey, u64)> = state.desired.iter().map(|(k, s)| (*k, *s)).collect();
     for (key, plan_sig) in desired {
-        let already = state
-            .applied
-            .iter()
-            .any(|(e, (k, s))| *k == key && *s == plan_sig && living.contains(e));
-        if already {
-            continue;
-        }
         let Some((e, mesh3d)) = by_key.get(&key).map(|(e, m)| (*e, m.clone())) else {
             continue; // the cell hasn't streamed in yet; caught on a later frame
         };
-        if swap_cell(&adts, &streamer, &mut meshes, key, rect.as_ref(), &mesh3d) {
-            state.applied.insert(e, (key, plan_sig));
-            // `debug!`, not `info!`: this re-fires whenever a tile streams out and back in and the
-            // cell respawns, so it must not spam the player's log on every pass near a build site.
-            debug!(
-                "MONKEY (voxel): clipped terrain cell {key:?} (entity {e:?}) — the real ADT ground \
-                 under the build site is now cut out."
-            );
+        if state.applied.get(&key) == Some(&(e, plan_sig)) {
+            continue;
+        }
+        if swap_cell(&adts, &streamer, &mut meshes, key, carve.as_deref(), &mesh3d) {
+            state.applied.insert(key, (e, plan_sig));
+            // `debug!`: this re-fires whenever a tile streams out and back in.
+            debug!("MONKEY (voxel): clipped terrain cell {key:?} (entity {e:?}).");
         }
     }
 
     sync_tile_colliders(&mut commands, &streamer, &adts, &settled, &mut state);
 }
 
-/// MONKEY (voxel): keep each tile's one static terrain collider in step with the carve plan —
-/// built from the clipped chunks while the footprint covers it, the original ADT trimesh again once
-/// it no longer does. Rebuilds only when a tile's (root entity, plan signature) changes.
+/// Keep each tile's one static terrain collider in step with the carve plan — built from the
+/// clipped chunks while the union reaches it, the original ADT trimesh again once it no longer
+/// does. Rebuilds only when a tile's (root entity, plan signature) changes.
 ///
 /// No frame without ground: the replacement is a [`PendingCollider`] on the SAME root, and
 /// `finish_colliders` swaps the `Collider` component in place when the off-thread build lands (and
@@ -585,12 +385,12 @@ fn sync_tile_colliders(
         let Some(adt) = adts.get(&handle) else {
             continue;
         };
-        let rect = if want_sig != 0 {
-            state.rect.as_ref()
+        let carve = if want_sig != 0 {
+            state.carve.as_deref()
         } else {
             None
         };
-        let Some((verts, tris)) = tile_collider_data(&adt.chunks, rect) else {
+        let Some((verts, tris)) = tile_collider_data(&adt.chunks, carve) else {
             continue;
         };
         let ntris = tris.len();
@@ -599,16 +399,18 @@ fn sync_tile_colliders(
             None,
             true,
         ));
-        match rect {
-            Some(r) => info!(
-                "MONKEY (voxel): tile ({},{}) collider rebuilt with the ground clipped to WoW \
-                 X[{:.2},{:.2}] Y[{:.2},{:.2}] ({} tris)",
-                tile.0, tile.1, r.x0, r.x1, r.y0, r.y1, ntris
-            ),
-            None => info!(
-                "MONKEY (voxel): tile ({},{}) collider restored to the original ADT trimesh ({} tris)",
-                tile.0, tile.1, ntris
-            ),
+        if carve.is_some() {
+            info!(
+                "MONKEY (voxel): tile ({},{}) collider rebuilt with the ground clipped to the carve \
+                 ({ntris} tris)",
+                tile.0, tile.1
+            );
+        } else {
+            info!(
+                "MONKEY (voxel): tile ({},{}) collider restored to the original ADT trimesh ({ntris} \
+                 tris)",
+                tile.0, tile.1
+            );
         }
         state.applied_tiles.insert(tile, (root, want_sig));
     }
@@ -657,57 +459,43 @@ mod tests {
         }
     }
 
-    /// MONKEY (voxel): the planner — a 32-yd footprint whose inset rectangle reaches into four
-    /// chunks across a chunk corner plans exactly the render cells of those chunks, all tagged with
-    /// the rectangle's (non-zero) signature, and folds them into one tile.
+    /// The planner — two adjacent columns just south-east of the map centre (WoW (0, 0) is global
+    /// chunk (512, 512)'s NW corner) plan exactly render cell 0 of tile (32, 32), tagged non-zero,
+    /// and fold into that one tile. A column far away does not change the cell's signature.
     #[test]
-    fn planner_covers_the_cells_the_rect_reaches() {
-        let cs = benilla_formats::CHUNK_SIZE;
-        // Global chunk (512, 512)'s NW corner is the map centre, WoW (0, 0); a footprint centred
-        // one chunk south-east of it straddles global chunks 512..=513 on both axes.
-        let c = -cs;
-        let rect = carve_rect(c - 16.0, c + 16.0, c - 16.0, c + 16.0);
-        assert!((rect.x1 - rect.x0 - (32.0 - 2.0 * CARVE_INSET)).abs() < 1.0e-4);
-        let desired = compute_desired(&rect);
+    fn planner_covers_the_cells_the_union_reaches() {
+        let carve = VoxelCarve::from_columns([(-2, -2), (-2, -1)], 16.0, CARVE_INSET);
+        let desired = compute_desired(&carve);
         let mut keys: Vec<_> = desired.keys().copied().collect();
         keys.sort_unstable();
-        // Rows/cols 0..=1 of tile (32, 32) are all in render cell 0.
         assert_eq!(keys, vec![(32, 32, 0)], "plan {keys:?}");
-        assert!(desired.values().all(|&s| s == rect.sig() && s != 0));
-        let tiles = tile_plans(&desired);
-        assert_eq!(tiles.get(&(32, 32)), Some(&rect.sig()));
+        assert!(desired.values().all(|&s| s != 0));
+        let tiles = tile_plans(&desired, &carve);
+        assert_eq!(tiles.len(), 1);
+        assert!(tiles.contains_key(&(32, 32)));
+        let far = VoxelCarve::from_columns([(-2, -2), (-2, -1), (-300, -300)], 16.0, CARVE_INSET);
+        assert_eq!(compute_desired(&far).get(&(32, 32, 0)), desired.get(&(32, 32, 0)));
     }
 
     #[test]
-    fn collider_is_clipped_and_restores_without_a_rect() {
+    fn collider_is_clipped_and_restores_without_a_carve() {
         let chunk = flat_chunk();
         let (_, base) = tile_collider_data(std::slice::from_ref(&chunk), None).unwrap();
-        assert_eq!(
-            base.len(),
-            256,
-            "an unclipped chunk welds all its fan triangles"
-        );
-        let rect = VoxelCarveRect {
-            x0: 80.0,
-            x1: 90.0,
-            y0: 80.0,
-            y1: 90.0,
-        };
+        assert_eq!(base.len(), 256, "an unclipped chunk welds all its fan triangles");
+        // Columns (5,5) and (4,5): X [80, 96] ∪ [64, 80], Y [80, 96].
+        let carve = VoxelCarve::from_columns([(5, 5), (4, 5)], 16.0, CARVE_INSET);
         let (verts, clipped) =
-            tile_collider_data(std::slice::from_ref(&chunk), Some(&rect)).unwrap();
+            tile_collider_data(std::slice::from_ref(&chunk), Some(&carve)).unwrap();
         assert_ne!(clipped.len(), base.len());
-        // No collider triangle's centroid lies inside the rect (WoW x = −bevy z, y = −bevy x).
+        // No collider triangle's centroid lies inside the union (WoW x = −bevy z, y = −bevy x).
         for t in &clipped {
             let c = (verts[t[0] as usize] + verts[t[1] as usize] + verts[t[2] as usize]) / 3.0;
-            assert!(
-                !rect.contains_strict(-c.z, -c.x),
-                "collider tri inside the carve"
-            );
+            assert!(!carve.contains_strict(-c.z, -c.x), "collider tri inside the carve");
         }
     }
 
     /// The render-cell key round-trips Bevy-centre → WoW → (tile, cell) consistently with the
-    /// footprint planner's own `cell_key_at`, for a handful of tile/cell centres.
+    /// planner's own `cell_key_at` and `cell_box`, for a handful of tile/cell centres.
     #[test]
     fn cell_key_round_trips_through_bevy_centre() {
         let cs = benilla_formats::CHUNK_SIZE;
@@ -717,19 +505,18 @@ mod tests {
             (0, 0, 0, 0),
             (63, 63, 15, 15),
         ] {
-            // The WoW centre of chunk (tile_y row, tile_x col) → its render cell.
             let gx = ty * 16 + row as i32;
             let gy = tx * 16 + col as i32;
             let wow_x = mc - (gx as f32 + 0.5) * cs;
             let wow_y = mc - (gy as f32 + 0.5) * cs;
-            let expect = (
-                (tx, ty, (row / 4) * 4 + (col / 4)),
-                cell_key_at(wow_x, wow_y),
-            );
-            assert_eq!(expect.0, expect.1, "cell_key_at mismatch");
-            // Bevy horizontal centre = wow_to_bevy: (−wow_y, _, −wow_x).
+            let expect = (tx, ty, (row / 4) * 4 + (col / 4));
+            assert_eq!(expect, cell_key_at(wow_x, wow_y), "cell_key_at mismatch");
             let via_aabb = cell_key_of(Vec3A::new(-wow_y, 123.0, -wow_x));
-            assert_eq!(via_aabb, expect.0, "aabb centre → cell key");
+            assert_eq!(via_aabb, expect, "aabb centre → cell key");
+            let (lo, hi) = cell_box(expect);
+            assert!(lo[0] < wow_x && wow_x < hi[0] && lo[1] < wow_y && wow_y < hi[1]);
+            let (tlo, thi) = tile_box((tx, ty));
+            assert!(tlo[0] <= lo[0] && hi[0] <= thi[0] && tlo[1] <= lo[1] && hi[1] <= thi[1]);
         }
     }
 }
