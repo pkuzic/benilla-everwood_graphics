@@ -716,6 +716,66 @@ impl VoxelWorldData {
         }
         acc / DENSITY_SCALE
     }
+
+    /// MONKEY (voxel): the upward-facing surface ("top") over the WoW column `(x, y)` nearest
+    /// `near_z`, within ±`reach` yd: `Some((z, outward unit normal))` where the field crosses from
+    /// air above to solid below and the normal's z ≥ `min_up`. `None` when the column holds no
+    /// such top in range (only walls / undersides, or all air / all solid) — a ground-effect tuft
+    /// there has nothing to grow on. Bilinear in XY, linear in z between lattice samples.
+    pub fn top_near(
+        &self,
+        x: f32,
+        y: f32,
+        near_z: f32,
+        reach: f32,
+        min_up: f32,
+    ) -> Option<(f32, [f32; 3])> {
+        let (px, py) = (x / VOXEL_SIZE, y / VOXEL_SIZE);
+        let (ix, iy) = (px.floor() as i32, py.floor() as i32);
+        let (fx, fy) = (px - ix as f32, py - iy as f32);
+        let w = [
+            (1.0 - fx) * (1.0 - fy),
+            fx * (1.0 - fy),
+            (1.0 - fx) * fy,
+            fx * fy,
+        ];
+        let d = |iz: i32| -> f32 {
+            (w[0] * self.sample([ix, iy, iz]) as f32
+                + w[1] * self.sample([ix + 1, iy, iz]) as f32
+                + w[2] * self.sample([ix, iy + 1, iz]) as f32
+                + w[3] * self.sample([ix + 1, iy + 1, iz]) as f32)
+                / DENSITY_SCALE
+        };
+        let lo = ((near_z - reach) / VOXEL_SIZE).floor() as i32;
+        let hi = ((near_z + reach) / VOXEL_SIZE).ceil() as i32;
+        let mut best: Option<(f32, [f32; 3])> = None;
+        let mut above = d(hi);
+        for iz in (lo..hi).rev() {
+            let here = d(iz);
+            if above >= 0.0 && here < 0.0 {
+                // Air at iz+1, solid at iz: the crossing.
+                let t = above / (above - here);
+                let z = lattice_to_wow(iz + 1) - t * VOXEL_SIZE;
+                let h = VOXEL_SIZE;
+                let g = [
+                    self.density_at([x + h, y, z]) - self.density_at([x - h, y, z]),
+                    self.density_at([x, y + h, z]) - self.density_at([x, y - h, z]),
+                    self.density_at([x, y, z + h]) - self.density_at([x, y, z - h]),
+                ];
+                let len = (g[0] * g[0] + g[1] * g[1] + g[2] * g[2]).sqrt();
+                if len > 1.0e-6 {
+                    let n = [g[0] / len, g[1] / len, g[2] / len];
+                    let closer =
+                        best.is_none_or(|(bz, _)| (z - near_z).abs() < (bz - near_z).abs());
+                    if n[2] >= min_up && closer {
+                        best = Some((z, n));
+                    }
+                }
+            }
+            above = here;
+        }
+        best
+    }
 }
 
 /// MONKEY (voxel): a self-contained canonical chunk build ([`VoxelWorldData::build_job`]) — `Send`,
@@ -824,6 +884,163 @@ pub fn synth_edits(
             }
         })
         .collect()
+}
+
+/// MONKEY (voxel): hang a SKIRT (a short outward ledge, then straight down to `depth` yd below the
+/// lip) from every open boundary edge of a
+/// [`mesh_window`] mesh that lies on a flagged horizontal side of the window (`sides` = −x, +x,
+/// −y, +y). Where the voxel layer ENDS (the neighbour chunk is not active) its surface is a lip
+/// [`SEED_LIFT`] above the real ground it overlaps; a grazing ray could slip into that slit, pass
+/// the terrain's carved edge and see the sky under the voxel surface (the owner's "wounds"). The
+/// skirt closes the slit; it continues the lip's own vertex normals, so it shades like the ground.
+pub fn add_skirts(m: &mut VoxelMesh, sides: [bool; 4], depth: f32) {
+    if !sides.iter().any(|&s| s) || m.indices.len() < 3 {
+        return;
+    }
+    // The outermost cube layer per side, in window yards: cube 0 spans [0, 1] samples, cube 32
+    // spans [32, 33].
+    let lo_edge = VOXEL_SIZE;
+    let hi_edge = (SAMPLES - 2) as f32 * VOXEL_SIZE;
+    let on_side = |p: [f32; 3]| -> [bool; 4] {
+        [
+            p[0] <= lo_edge,
+            p[0] >= hi_edge,
+            p[1] <= lo_edge,
+            p[1] >= hi_edge,
+        ]
+    };
+    let mut uses: HashMap<(u32, u32), (u32, u32, u32)> = HashMap::new();
+    for t in m.indices.chunks_exact(3) {
+        for (a, b) in [(t[0], t[1]), (t[1], t[2]), (t[2], t[0])] {
+            let key = (a.min(b), a.max(b));
+            let e = uses.entry(key).or_insert((0, a, b));
+            e.0 += 1;
+        }
+    }
+    let mut open: Vec<(u32, u32)> = uses
+        .into_values()
+        .filter(|&(n, a, b)| {
+            if n != 1 {
+                return false;
+            }
+            let (sa, sb) = (
+                on_side(m.positions[a as usize]),
+                on_side(m.positions[b as usize]),
+            );
+            (0..4).any(|i| sides[i] && sa[i] && sb[i])
+        })
+        .map(|(_, a, b)| (a, b))
+        .collect();
+    open.sort_unstable();
+    // Per lip vertex: a gentle outward-and-down ledge (so the visible strip above the real ground
+    // shades like ground, not a vertically smeared band) then a vertical drop to `depth` (so a
+    // steep downhill outside still cannot open a slit). Outward = the flagged sides the vertex
+    // lies on, so the pieces of neighbouring edges share their offset vertices (watertight).
+    let dirs = [[-1.0f32, 0.0], [1.0, 0.0], [0.0, -1.0], [0.0, 1.0]];
+    let mut lip: HashMap<u32, (u32, u32)> = HashMap::new();
+    let mut ring = |m: &mut VoxelMesh, v: u32| -> (u32, u32) {
+        *lip.entry(v).or_insert_with(|| {
+            let p = m.positions[v as usize];
+            let s = on_side(p);
+            let mut d = [0.0f32, 0.0];
+            for i in 0..4 {
+                if sides[i] && s[i] {
+                    d = [d[0] + dirs[i][0], d[1] + dirs[i][1]];
+                }
+            }
+            let l = (d[0] * d[0] + d[1] * d[1]).sqrt().max(1.0e-6);
+            let (ox, oy) = (d[0] / l * SKIRT_OUT, d[1] / l * SKIRT_OUT);
+            let n = m.normals[v as usize];
+            let base = m.positions.len() as u32;
+            m.positions
+                .push([p[0] + ox, p[1] + oy, p[2] - SKIRT_LEDGE_DROP]);
+            m.positions.push([p[0] + ox, p[1] + oy, p[2] - depth]);
+            m.normals.push(n);
+            m.normals.push(n);
+            (base, base + 1)
+        })
+    };
+    for (a, b) in open {
+        let (am, ab) = ring(m, a);
+        let (bm, bb) = ring(m, b);
+        // a, b → the ledge → the drop, in the surface triangle's own edge order (cull is off, the
+        // order only keeps the skirt consistent with its surface).
+        m.indices
+            .extend_from_slice(&[b, a, am, b, am, bm, bm, am, ab, bm, ab, bb]);
+    }
+}
+
+/// MONKEY (voxel): how far a skirt's ledge reaches OUTWARD past the lip (yd) …
+pub const SKIRT_OUT: f32 = 0.6;
+/// … and how far it drops there: with the lip [`SEED_LIFT`] above the ground, the ledge meets the
+/// ground ~0.2 yd out on level ground (a short 37° bevel), then the skirt falls straight down.
+pub const SKIRT_LEDGE_DROP: f32 = 0.45;
+
+/// MONKEY (voxel): the XY points (a `step`-yard grid over `cols`) where `inside(x, y)` holds — the
+/// real ground is carved there — but NO triangle of the meshes of `keys` covers the point in XY
+/// projection: a sky crack. `meshes` = `(key, mesh)` pairs (positions relative to
+/// [`window_origin`]). Used by the coverage audit (`WOW_VOXEL_COVERAGE`) and the tests.
+pub fn xy_coverage_gaps(
+    meshes: &[(ChunkKey, VoxelMesh)],
+    cols: &[ColumnKey],
+    step: f32,
+    inside: impl Fn(f32, f32) -> bool,
+) -> Vec<[f32; 2]> {
+    const BIN: f32 = 0.5;
+    let bin = |v: f32| (v / BIN).floor() as i32;
+    let mut tris: Vec<[[f32; 2]; 3]> = Vec::new();
+    let mut bins: HashMap<(i32, i32), Vec<u32>> = HashMap::new();
+    for (k, m) in meshes {
+        let o = window_origin(*k);
+        for t in m.indices.chunks_exact(3) {
+            let p = |i: u32| {
+                let q = m.positions[i as usize];
+                [q[0] + o[0], q[1] + o[1]]
+            };
+            let tri = [p(t[0]), p(t[1]), p(t[2])];
+            let lo = [
+                tri[0][0].min(tri[1][0]).min(tri[2][0]),
+                tri[0][1].min(tri[1][1]).min(tri[2][1]),
+            ];
+            let hi = [
+                tri[0][0].max(tri[1][0]).max(tri[2][0]),
+                tri[0][1].max(tri[1][1]).max(tri[2][1]),
+            ];
+            let id = tris.len() as u32;
+            tris.push(tri);
+            for bx in bin(lo[0])..=bin(hi[0]) {
+                for by in bin(lo[1])..=bin(hi[1]) {
+                    bins.entry((bx, by)).or_default().push(id);
+                }
+            }
+        }
+    }
+    let covers = |t: &[[f32; 2]; 3], x: f32, y: f32| {
+        let d = |a: [f32; 2], b: [f32; 2]| (b[0] - a[0]) * (y - a[1]) - (b[1] - a[1]) * (x - a[0]);
+        let (d0, d1, d2) = (d(t[0], t[1]), d(t[1], t[2]), d(t[2], t[0]));
+        const E: f32 = 1.0e-4;
+        (d0 >= -E && d1 >= -E && d2 >= -E) || (d0 <= E && d1 <= E && d2 <= E)
+    };
+    let n = (CHUNK_YARDS / step).round() as i32;
+    let mut gaps = Vec::new();
+    for c in cols {
+        for j in 0..n {
+            for i in 0..n {
+                let x = c[0] as f32 * CHUNK_YARDS + (i as f32 + 0.5) * step;
+                let y = c[1] as f32 * CHUNK_YARDS + (j as f32 + 0.5) * step;
+                if !inside(x, y) {
+                    continue;
+                }
+                let hit = bins
+                    .get(&(bin(x), bin(y)))
+                    .is_some_and(|ids| ids.iter().any(|&id| covers(&tris[id as usize], x, y)));
+                if !hit {
+                    gaps.push([x, y]);
+                }
+            }
+        }
+    }
+    gaps
 }
 
 /// WoW position of a chunk's mesh-window origin (lattice `32k-1` per axis).
@@ -1768,5 +1985,35 @@ mod tests {
         let hit = raymarch([8.0, 8.0, 60.0], [0.0, 0.1, -1.0], 100.0, 0.25, |p| w.density_at(p))
             .expect("hit the seed");
         assert!((hit[2] - 32.05).abs() < 0.1, "{hit:?}");
+    }
+
+    /// MONKEY (voxel): the ground-effect re-placement's top finder — a pit's floor, a mound's
+    /// crown, the untouched surface, and nothing on a vertical wall.
+    #[test]
+    fn top_near_finds_pit_floor_mound_crown_and_no_wall_top() {
+        let flat = |_: f32, _: f32| Some(20.0);
+        let keys: Vec<ChunkKey> = vec![[0, 0, 0], [0, 0, 1], [1, 0, 0], [1, 0, 1]];
+        let mut w = VoxelWorldData::default();
+        for k in &keys {
+            w.seeds
+                .entry([k[0], k[1]])
+                .or_insert_with(|| Arc::new(ColumnSeed::from_fn([k[0], k[1]], flat)));
+        }
+        let pit = edit([8.0, 8.0, 20.0], 3.0, 0);
+        let mound = edit([24.0, 8.0, 20.0], 3.0, 1);
+        w.build(&keys, [pit, mound].iter());
+        // Untouched ground: the seeded surface (ADT + SEED_LIFT), facing up.
+        let (z, n) = w.top_near(8.0, 2.0, 20.0, 24.0, 0.65).expect("ground top");
+        assert!((z - 20.15).abs() < 0.1 && n[2] > 0.95, "{z} {n:?}");
+        // Pit floor ≈ 17 (centre 20, radius 3), from the old ground height 20.
+        let (z, n) = w.top_near(8.0, 8.0, 20.0, 24.0, 0.65).expect("pit floor");
+        assert!((z - 17.0).abs() < 0.3 && n[2] > 0.9, "{z} {n:?}");
+        // Mound crown ≈ 23.
+        let (z, _) = w
+            .top_near(24.0, 8.0, 20.0, 24.0, 0.65)
+            .expect("mound crown");
+        assert!((z - 23.0).abs() < 0.3, "{z}");
+        // The steep flank of the pit, near its rim: no top steep enough to grow on.
+        assert!(w.top_near(10.9, 8.0, 20.0, 24.0, 0.65).is_none());
     }
 }

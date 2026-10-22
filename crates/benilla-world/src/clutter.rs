@@ -179,11 +179,18 @@ pub(crate) struct ClutterGeometry(
 pub(crate) struct ClutterChunk {
     /// The chunk's terrain box grown by a tuft's height, in Bevy space. The gate measures to its
     /// nearest point, not its centre, so a chunk on relief is not built late.
-    bounds: (Vec3, Vec3),
+    pub(crate) bounds: (Vec3, Vec3),
     /// Placements by model path; each model merges into one mesh per submesh.
-    models: Vec<(String, Vec<ShadedPlacement>)>,
+    pub(crate) models: Vec<(String, Vec<ShadedPlacement>)>,
     /// The built meshes, children of this entity; empty when not built.
-    built: Vec<Entity>,
+    pub(crate) built: Vec<Entity>,
+    /// MONKEY (voxel): the scatter as the ADT placed it, kept while `models` is re-placed onto the
+    /// voxel layer's tops (`None` = `models` IS the original scatter).
+    #[cfg(feature = "voxel")]
+    pub(crate) raw_models: Option<Vec<(String, Vec<ShadedPlacement>)>>,
+    /// MONKEY (voxel): the voxel state `models` was re-placed for (0 = untouched).
+    #[cfg(feature = "voxel")]
+    pub(crate) voxel_sig: u64,
 }
 
 /// Slack (yd) past the fade reach, so a chunk is built before any of its grass can show.
@@ -242,14 +249,15 @@ fn terrain_normal_at(chunk: &ChunkMesh, world: [f32; 3]) -> [f32; 3] {
 }
 
 /// A scattered placement with its baked MCSH tint and ground normal.
-struct ShadedPlacement {
-    placement: GroundDoodadPlacement,
-    tint: f32,
+#[derive(Clone)]
+pub(crate) struct ShadedPlacement {
+    pub(crate) placement: GroundDoodadPlacement,
+    pub(crate) tint: f32,
     /// The ground normal under the tuft, in Bevy space, on every vertex: here the MCNR normal of
     /// the nearest outer-grid vertex ([`terrain_normal_at`]). The reference uses the plane of the
     /// cell's centre-fan triangle the tuft lands in (planes built at `0x6bfec1`–`0x6bfefe`, the
     /// triangle picked at `0x6c0148`–`0x6c0193`, the normal stored at `0x6b2a87`–`0x6b2a9c`).
-    ground_normal: [f32; 3],
+    pub(crate) ground_normal: [f32; 3],
 }
 
 /// Scatter a tile's clutter into [`ClutterChunk`]s, tint and normal baked, building no meshes.
@@ -294,6 +302,10 @@ pub(crate) fn scatter_tile_clutter(
                     bounds: (lo, hi),
                     models: by_model.into_iter().collect(),
                     built: Vec::new(),
+                    #[cfg(feature = "voxel")]
+                    raw_models: None,
+                    #[cfg(feature = "voxel")]
+                    voxel_sig: 0,
                 })
                 .id(),
         );

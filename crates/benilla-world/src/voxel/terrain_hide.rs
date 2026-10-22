@@ -278,7 +278,7 @@ pub(super) fn monkey_voxel_hide_terrain(
                 info!(
                     "MONKEY (voxel): hide plan — {} surface column(s) carved (outer inset \
                      {CARVE_INSET} yd) across {} render cell(s) / {} tile(s)",
-                    c.rects().len(),
+                    c.columns(),
                     state.desired.len(),
                     state.desired_tiles.len(),
                 );
