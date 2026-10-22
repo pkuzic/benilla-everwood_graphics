@@ -56,6 +56,12 @@ pub const MONKEY_VOXEL_MAX_CHUNKS: usize = 4096;
 const DISPATCH_MS: f32 = 2.0;
 /// MONKEY (voxel): main-thread wall clock per frame for attaching finished meshes (≥ 1 per frame).
 const ATTACH_MS: f32 = 2.0;
+/// MONKEY (voxel): triangles attached per frame at most (≥ 1 mesh): the queued inserts — the
+/// mesh asset swap and avian's trimesh collider insert — run at the command flush, outside the
+/// [`ATTACH_MS`] clock, and cost ~2e-5 ms per triangle.
+const ATTACH_TRIS: usize = 60_000;
+/// MONKEY (voxel): frames a finished hot mesh may wait for its sibling hot tasks.
+const HOT_HOLD_FRAMES: u32 = 3;
 /// MONKEY (voxel): chunks per off-thread build group (built in lockstep, like the sync build).
 const BUILD_GROUP: usize = 4;
 /// MONKEY (voxel): bulk build groups / bulk meshes in flight at most, so a live edit's hot task
@@ -190,6 +196,11 @@ pub struct MonkeyVoxelWorld {
     stale_meshes: usize,
     built_total: usize,
     meshed_total: usize,
+    /// MONKEY (voxel): last stream pass, ms per phase: seeds, build poll, build dispatch, mesh
+    /// poll + attach, mesh dispatch, carve, whole stream.
+    phase_ms: [f32; 7],
+    /// MONKEY (voxel): consecutive frames hot results have been held for their siblings.
+    hot_hold: u32,
 }
 
 impl Default for MonkeyVoxelWorld {
@@ -234,6 +245,8 @@ impl Default for MonkeyVoxelWorld {
             stale_meshes: 0,
             built_total: 0,
             meshed_total: 0,
+            phase_ms: [0.0; 7],
+            hot_hold: 0,
         }
     }
 }
@@ -804,10 +817,28 @@ fn monkey_voxel_journal_load() -> VoxelJournal {
 
 /// Write the journal atomically (temp + rename).
 fn monkey_voxel_journal_save(j: &VoxelJournal) {
+    // MONKEY (voxel): encode here (µs), write + rename on the IO pool — a file write / rename on
+    // Windows (AV scan) measured ~90 ms on the frame. Serialised by a lock so writes never
+    // interleave; the newest bytes always land last.
+    static SAVE: std::sync::Mutex<u64> = std::sync::Mutex::new(0);
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let bytes = j.encode();
+    let my = SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
     let path = monkey_voxel_journal_path();
-    let tmp = path.with_extension("bin.tmp");
-    if std::fs::write(&tmp, j.encode()).is_ok() {
-        let _ = std::fs::rename(&tmp, &path);
+    let write = move || {
+        let mut last = SAVE.lock().unwrap_or_else(|e| e.into_inner());
+        if *last > my {
+            return; // a newer save already landed
+        }
+        *last = my;
+        let tmp = path.with_extension("bin.tmp");
+        if std::fs::write(&tmp, &bytes).is_ok() {
+            let _ = std::fs::rename(&tmp, &path);
+        }
+    };
+    match bevy::tasks::IoTaskPool::try_get() {
+        Some(pool) => pool.spawn(async move { write() }).detach(),
+        None => write(),
     }
 }
 
@@ -1410,6 +1441,7 @@ fn monkey_voxel_apply_inbox(mut net: ResMut<MonkeyVoxelNet>, mut world: ResMut<M
     }
     let (mut applied, mut dup, mut confirmed) = (Vec::new(), 0usize, Vec::new());
     let mut bulk = 0usize;
+    let mut resets: Vec<(u16, i16, i16, u16)> = Vec::new();
     for ev in events {
         match ev {
             MonkeyVoxelNetEvent::Edit(mut e) => {
@@ -1430,10 +1462,9 @@ fn monkey_voxel_apply_inbox(mut net: ResMut<MonkeyVoxelNet>, mut world: ResMut<M
             }
             MonkeyVoxelNetEvent::Reset { map, rx, ry, epoch } => {
                 world.reset_region(map, rx, ry, epoch);
-                info!(
-                    "MONKEY (voxel): region ({rx}, {ry}) on map {map} RESET to epoch {epoch} — its \
-                     journal dropped, chunks rebuilding"
-                );
+                // MONKEY (voxel): one summary line below — a log line per region measured ~1 ms
+                // each on a redirected console (a 9-region resync was a 16 ms frame).
+                resets.push((map, rx, ry, epoch));
             }
             MonkeyVoxelNetEvent::SyncPoint {
                 map,
@@ -1473,6 +1504,14 @@ fn monkey_voxel_apply_inbox(mut net: ResMut<MonkeyVoxelNet>, mut world: ResMut<M
     }
     if !confirmed.is_empty() {
         info!("MONKEY (voxel): own edits CONFIRMED by seq {confirmed:?} (not re-applied)");
+    }
+    if !resets.is_empty() {
+        info!(
+            "MONKEY (voxel): {} region(s) RESET (map, rx, ry, epoch) {:?} — their journal dropped, \
+             chunks rebuilding",
+            resets.len(),
+            resets
+        );
     }
 }
 
@@ -1567,6 +1606,7 @@ fn monkey_voxel_stream(
 ) {
     let world = &mut *world;
     let t_stream = Instant::now();
+    let mut t_phase = t_stream;
     // 1. Column seeds (raw ADT heights) for columns whose tiles are now resident.
     if !world.need_seed.is_empty() {
         let resident = |x: f32, y: f32| {
@@ -1607,6 +1647,8 @@ fn monkey_voxel_stream(
         }
     }
 
+    world.phase_ms[0] = t_phase.elapsed().as_secs_f32() * 1000.0;
+    t_phase = Instant::now();
     // 2. Finished builds: adopt the fresh ones (→ remesh around them), requeue the stale ones.
     let mut i = 0;
     while i < world.builds.len() {
@@ -1618,7 +1660,7 @@ fn monkey_voxel_stream(
         let t = world.builds.swap_remove(i);
         let n = out.len();
         let adopted = world.finish_build(&t.keys, &t.gens, t.hot, out);
-        if world.timing_logs > 0 {
+        if world.timing_logs > 0 && (t.hot || !adopted) {
             world.timing_logs -= 1;
             info!(
                 "MONKEY (voxel): build of {n} chunk(s) {} — {run_ms:.2} ms off-thread{}",
@@ -1628,6 +1670,8 @@ fn monkey_voxel_stream(
         }
     }
 
+    world.phase_ms[1] = t_phase.elapsed().as_secs_f32() * 1000.0;
+    t_phase = Instant::now();
     // 3. Dispatch builds (hot first; bulk under the in-flight cap + dispatch budget).
     let dispatch_deadline = t_stream + std::time::Duration::from_secs_f32(DISPATCH_MS / 1000.0);
     let pool = AsyncComputeTaskPool::get();
@@ -1646,6 +1690,8 @@ fn monkey_voxel_stream(
         });
     }
 
+    world.phase_ms[2] = t_phase.elapsed().as_secs_f32() * 1000.0;
+    t_phase = Instant::now();
     // 4. Finished meshes → the ready map (newest per chunk).
     let mut i = 0;
     while i < world.meshing.len() {
@@ -1673,13 +1719,29 @@ fn monkey_voxel_stream(
     order.sort();
     let (mut attached, mut hot_attached, mut tris_n) = (0usize, 0usize, 0usize);
     let mut colliders = false;
-    for (_, k) in order {
-        if attached > 0 && t_attach.elapsed().as_secs_f32() * 1000.0 >= ATTACH_MS {
+    // MONKEY (voxel): a live edit's hot meshes land TOGETHER (neighbours meshed from different
+    // density versions would show a seam for a frame): held while a sibling hot task is still on
+    // the pool, at most [`HOT_HOLD_FRAMES`]. They are exempt from the triangle budget.
+    let hold_hot = world.meshing.iter().any(|t| t.hot) && world.hot_hold < HOT_HOLD_FRAMES;
+    world.hot_hold = if hold_hot { world.hot_hold + 1 } else { 0 };
+    let mut bulk_tris = 0usize;
+    for (bulk, k) in order {
+        if bulk
+            && attached > 0
+            && (t_attach.elapsed().as_secs_f32() * 1000.0 >= ATTACH_MS
+                || bulk_tris >= ATTACH_TRIS)
+        {
             break;
+        }
+        if !bulk && hold_hot {
+            continue;
         }
         let Some(r) = world.mesh_ready.remove(&k) else {
             continue;
         };
+        if bulk {
+            bulk_tris += r.out.tris;
+        }
         if !world.mesh_is_fresh(k, r.gen) {
             world.stale_meshes += 1;
             if !world.mesh_in_flight.contains_key(&k) && !world.hot.contains(&k) {
@@ -1754,6 +1816,8 @@ fn monkey_voxel_stream(
     }
     let attach_ms = t_attach.elapsed().as_secs_f32() * 1000.0;
 
+    world.phase_ms[3] = t_phase.elapsed().as_secs_f32() * 1000.0;
+    t_phase = Instant::now();
     // 6. Dispatch remeshes (hot first; bulk under the in-flight cap + dispatch budget).
     let mut dispatched = 0usize;
     for d in world.take_mesh_jobs(dispatch_deadline) {
@@ -1767,8 +1831,9 @@ fn monkey_voxel_stream(
         });
         dispatched += 1;
     }
+    world.phase_ms[4] = t_phase.elapsed().as_secs_f32() * 1000.0;
     if attached > 0 {
-        if world.timing_logs > 0 {
+        if world.timing_logs > 0 && hot_attached > 0 {
             world.timing_logs -= 1;
             info!(
                 "MONKEY (voxel): attached {attached} chunk mesh(es) ({hot_attached} hot, {tris_n} \
@@ -1800,16 +1865,22 @@ fn monkey_voxel_stream(
         }
     }
     if !world.perf.is_empty() {
-        for (r, ingest_ms) in std::mem::take(&mut world.perf) {
-            info!(
-                "MONKEY (voxel): perf edit r={r:.1} yd: ingest {ingest_ms:.2} ms + stream \
-                 {frame_ms_now:.2} ms ({dispatched} remesh(es) dispatched, {attached} attached, {} \
-                 active)",
-                world.data.chunks.len()
-            );
-        }
+        // MONKEY (voxel): ONE line per frame (a line per edit cost ~1 ms each on a redirected
+        // console — the logging itself showed up as the burst frame's hitch).
+        let edits = std::mem::take(&mut world.perf);
+        let radii: Vec<String> = edits.iter().map(|(r, _)| format!("{r:.1}")).collect();
+        let ingest_ms: f32 = edits.iter().map(|(_, ms)| ms).sum();
+        info!(
+            "MONKEY (voxel): perf edit x{} r=[{}] yd: ingest {ingest_ms:.2} ms + stream \
+             {frame_ms_now:.2} ms ({dispatched} remesh(es) dispatched, {attached} attached, {} \
+             active)",
+            edits.len(),
+            radii.join(","),
+            world.data.chunks.len()
+        );
     }
 
+    let t_phase = Instant::now();
     // 7. Carve = the surface columns whose surface chunks are all meshed. During a bulk replay it
     //    waits for the queues to drain, so the tile collider / render cells are re-clipped once,
     //    not once per finished column.
@@ -1841,6 +1912,8 @@ fn monkey_voxel_stream(
             world.carve_cols = cols;
         }
     }
+    world.phase_ms[5] = t_phase.elapsed().as_secs_f32() * 1000.0;
+    world.phase_ms[6] = t_stream.elapsed().as_secs_f32() * 1000.0;
 }
 
 /// MONKEY (voxel): `WOW_VOXEL_PROBE_RAY=1` — every 2 s (10 times) after a local dig, cast a
@@ -1912,6 +1985,8 @@ fn monkey_voxel_probe_rays(
 #[derive(Resource, Default)]
 pub struct MonkeyVoxelPerf {
     frame_t0: Option<Instant>,
+    /// MONKEY (voxel): this frame's journal-save (encode + hand-off) ms.
+    save_ms: f32,
     busy: Option<MonkeyVoxelBusy>,
     hitch_logs: u32,
 }
@@ -1920,14 +1995,17 @@ struct MonkeyVoxelBusy {
     since: Instant,
     frames: u32,
     worst_ms: f32,
+    worst_stream_ms: f32,
     sum_ms: f32,
     worst_dt_ms: f32,
     over8: u32,
     over16: u32,
 }
 
-fn monkey_voxel_clock_start(mut perf: ResMut<MonkeyVoxelPerf>) {
+fn monkey_voxel_clock_start(mut perf: ResMut<MonkeyVoxelPerf>, mut world: ResMut<MonkeyVoxelWorld>) {
     perf.frame_t0 = Some(Instant::now());
+    perf.save_ms = 0.0;
+    world.phase_ms = [0.0; 7];
 }
 
 fn monkey_voxel_clock_end(
@@ -1944,8 +2022,18 @@ fn monkey_voxel_clock_end(
     if ms > 8.0 && perf.hitch_logs < 30 {
         perf.hitch_logs += 1;
         info!(
-            "MONKEY (voxel): perf hitch — voxel frame {ms:.2} ms (whole frame {dt:.1} ms), {} active",
-            world.data.chunks.len()
+            "MONKEY (voxel): perf hitch — voxel frame {ms:.2} ms (whole frame {dt:.1} ms), {} \
+             active; stream {:.2} ms = seeds {:.2} + build poll {:.2} + build dispatch {:.2} + \
+             mesh attach {:.2} + mesh dispatch {:.2} + carve {:.2}; journal save {:.2} ms",
+            world.data.chunks.len(),
+            world.phase_ms[6],
+            world.phase_ms[0],
+            world.phase_ms[1],
+            world.phase_ms[2],
+            world.phase_ms[3],
+            world.phase_ms[4],
+            world.phase_ms[5],
+            perf.save_ms
         );
     }
     if busy && perf.busy.is_none() {
@@ -1953,6 +2041,7 @@ fn monkey_voxel_clock_end(
             since: t0,
             frames: 0,
             worst_ms: 0.0,
+            worst_stream_ms: 0.0,
             sum_ms: 0.0,
             worst_dt_ms: 0.0,
             over8: 0,
@@ -1964,6 +2053,7 @@ fn monkey_voxel_clock_end(
     };
     b.frames += 1;
     b.worst_ms = b.worst_ms.max(ms);
+    b.worst_stream_ms = b.worst_stream_ms.max(world.phase_ms[6]);
     b.sum_ms += ms;
     b.worst_dt_ms = b.worst_dt_ms.max(dt);
     b.over8 += (ms > 8.0) as u32;
@@ -1972,14 +2062,15 @@ fn monkey_voxel_clock_end(
         let b = perf.busy.take().unwrap();
         info!(
             "MONKEY (voxel): perf settle — {} frame(s), {:.0} ms to settle; voxel frame worst \
-             {:.2} ms / mean {:.2} ms ({} > 8 ms, {} > 16 ms); worst whole frame {:.1} ms; {} \
-             active chunk(s)",
+             {:.2} ms / mean {:.2} ms ({} > 8 ms, {} > 16 ms), worst stream pass {:.2} ms; worst \
+             whole frame {:.1} ms; {} active chunk(s)",
             b.frames,
             b.since.elapsed().as_secs_f32() * 1000.0,
             b.worst_ms,
             b.sum_ms / b.frames.max(1) as f32,
             b.over8,
             b.over16,
+            b.worst_stream_ms,
             b.worst_dt_ms,
             world.data.chunks.len()
         );
@@ -2116,6 +2207,7 @@ fn monkey_voxel_synth(
 fn monkey_voxel_journal_autosave(
     time: Res<Time>,
     mut world: ResMut<MonkeyVoxelWorld>,
+    mut perf: ResMut<MonkeyVoxelPerf>,
     mut since: Local<f32>,
 ) {
     if !world.journal_dirty {
@@ -2128,7 +2220,9 @@ fn monkey_voxel_journal_autosave(
     }
     *since = 0.0;
     world.journal_dirty = false;
+    let t = Instant::now();
     monkey_voxel_journal_save(&world.journal);
+    perf.save_ms = t.elapsed().as_secs_f32() * 1000.0;
 }
 
 #[cfg(test)]

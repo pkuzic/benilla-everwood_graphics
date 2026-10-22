@@ -29,7 +29,7 @@ use bevy::prelude::*;
 
 use super::MonkeyVoxelWorld;
 use crate::terrain_stream::voxel_clip::VoxelCarve;
-use crate::terrain_stream::{build_collider_task, PendingCollider, TerrainStreamer};
+use crate::terrain_stream::{PendingCollider, TerrainStreamer};
 use benilla_assets::coords::wow_to_bevy;
 use benilla_assets::materials::TerrainMaterial;
 use benilla_assets::{chunks_to_mesh, AdtTile, ChunkShading};
@@ -293,6 +293,8 @@ pub(super) fn monkey_voxel_hide_terrain(
         streamer.set_voxel_carve(carve);
     }
     let carve = state.carve.clone();
+    let t_cells = std::time::Instant::now();
+    let mut swapped = 0usize;
 
     // Index the resident terrain cells by their render-cell key.
     let mut by_key: HashMap<CellKey, (Entity, Mesh3d)> = HashMap::new();
@@ -330,13 +332,48 @@ pub(super) fn monkey_voxel_hide_terrain(
             continue;
         }
         if swap_cell(&adts, &streamer, &mut meshes, key, carve.as_deref(), &mesh3d) {
+            swapped += 1;
             state.applied.insert(key, (e, plan_sig));
             // `debug!`: this re-fires whenever a tile streams out and back in.
             debug!("MONKEY (voxel): clipped terrain cell {key:?} (entity {e:?}).");
         }
     }
 
-    sync_tile_colliders(&mut commands, &streamer, &adts, &settled, &mut state);
+    let cells_ms = t_cells.elapsed().as_secs_f32() * 1000.0;
+    let t_col = std::time::Instant::now();
+    let rebuilt = sync_tile_colliders(&mut commands, &streamer, &adts, &settled, &mut state);
+    if swapped > 0 || rebuilt > 0 {
+        // MONKEY (voxel): the main-thread cost of a re-clip (the perf lane's hitch accounting).
+        info!(
+            "MONKEY (voxel): hide re-clip — {swapped} render cell(s) in {cells_ms:.2} ms, {rebuilt} \
+             tile collider(s) queued in {:.2} ms",
+            t_col.elapsed().as_secs_f32() * 1000.0
+        );
+    }
+}
+
+/// MONKEY (voxel): the collider-relevant part of a chunk (geometry only — the alpha / shadow maps
+/// stay behind), so a tile's clip + weld can run on the async pool.
+fn light_chunk(c: &ChunkMesh) -> ChunkMesh {
+    ChunkMesh {
+        positions: c.positions.clone(),
+        normals: c.normals.clone(),
+        uvs: c.uvs.clone(),
+        indices: c.indices.clone(),
+        holes: c.holes,
+        base_texture: None,
+        layer_textures: Vec::new(),
+        layer_effect_ids: Vec::new(),
+        alpha_map: None,
+        shadow: None,
+        pred_tex: c.pred_tex,
+        no_effect_doodad: c.no_effect_doodad,
+        index_x: c.index_x,
+        index_y: c.index_y,
+        area_id: c.area_id,
+        impassable: c.impassable,
+        liquids: Vec::new(),
+    }
 }
 
 /// Keep each tile's one static terrain collider in step with the carve plan — built from the
@@ -355,7 +392,8 @@ fn sync_tile_colliders(
     adts: &Assets<AdtTile>,
     settled: &Query<(), (With<Collider>, Without<PendingCollider>)>,
     state: &mut MonkeyVoxelHideState,
-) {
+) -> usize {
+    let mut rebuilt = 0;
     let mut tiles: HashSet<(i32, i32)> = state.applied_tiles.keys().copied().collect();
     tiles.extend(state.desired_tiles.keys().copied());
     for tile in tiles {
@@ -385,35 +423,44 @@ fn sync_tile_colliders(
         let Some(adt) = adts.get(&handle) else {
             continue;
         };
-        let carve = if want_sig != 0 {
-            state.carve.as_deref()
+        let carve: Option<Arc<VoxelCarve>> = if want_sig != 0 {
+            state.carve.clone()
         } else {
             None
         };
-        let Some((verts, tris)) = tile_collider_data(&adt.chunks, carve) else {
+        if adt.chunks.iter().all(|c| c.indices.len() < 3) {
             continue;
-        };
-        let ntris = tris.len();
-        commands.entity(root).insert(PendingCollider::new(
-            build_collider_task(verts, tris),
-            None,
-            true,
-        ));
-        if carve.is_some() {
+        }
+        // MONKEY (voxel): the clip + weld + parry build all run on the async pool (the clip of a
+        // whole tile measured several ms on the frame); the old trimesh stays live until then.
+        let chunks: Vec<ChunkMesh> = adt.chunks.iter().map(light_chunk).collect();
+        let clipped_tile = carve.is_some();
+        let task = bevy::tasks::AsyncComputeTaskPool::get().spawn(async move {
+            let (verts, tris) = tile_collider_data(&chunks, carve.as_deref())
+                .or_else(|| tile_collider_data(&chunks, None))
+                .unwrap_or_default();
+            Collider::trimesh(verts, tris)
+        });
+        commands
+            .entity(root)
+            .insert(PendingCollider::new(task, None, true));
+        rebuilt += 1;
+        if clipped_tile {
             info!(
-                "MONKEY (voxel): tile ({},{}) collider rebuilt with the ground clipped to the carve \
-                 ({ntris} tris)",
+                "MONKEY (voxel): tile ({},{}) collider rebuilding with the ground clipped to the \
+                 carve (off-thread)",
                 tile.0, tile.1
             );
         } else {
             info!(
-                "MONKEY (voxel): tile ({},{}) collider restored to the original ADT trimesh ({ntris} \
-                 tris)",
+                "MONKEY (voxel): tile ({},{}) collider restoring to the original ADT trimesh \
+                 (off-thread)",
                 tile.0, tile.1
             );
         }
         state.applied_tiles.insert(tile, (root, want_sig));
     }
+    rebuilt
 }
 
 #[cfg(test)]
