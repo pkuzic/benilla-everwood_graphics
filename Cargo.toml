@@ -87,3 +87,16 @@ lto = "off"
 # the leg pin, at one the profile is +0.5, and a cold build is no slower.
 [profile.play.package."*"]
 codegen-units = 1
+
+# MONKEY (build speed, test-only): `--profile fasttest` for worker builds + offline captures. The dev profile builds
+# every dependency at one codegen unit with full debuginfo (great runtime, slow cold builds on a busy box); this keeps
+# dependencies optimized but compiles them in parallel (16 units) with line tables only. Pair with the env
+# `CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER=rust-lld` for a faster link. Never used for shipping.
+[profile.fasttest]
+inherits = "dev"
+debug = "line-tables-only"
+
+[profile.fasttest.package."*"]
+opt-level = 3
+codegen-units = 16
+debug = false
