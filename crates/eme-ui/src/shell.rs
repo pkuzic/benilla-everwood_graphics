@@ -515,6 +515,20 @@ fn options_panel(ui: &mut Ui, f: &mut Frame) {
         return;
     };
     ui.label(RichText::new(f.tool_name(id)).strong());
+    // MONKEY (EME overlay): water / area edits the server does not enforce (CONTRACT §11.5,
+    // `caps.enforced = 0`) are visual only: every client draws them, the server ignores them.
+    if let Some(layer) = overlay_layer_of(id.as_str()) {
+        let enforced = m.session.caps.as_ref().is_some_and(|c| {
+            c.enforced && c.enforced_layers.contains(&layer)
+        });
+        if !enforced {
+            ui.label(
+                RichText::new(format!("⚠ {}", tr.t("MONKEY_EME_VISUAL_ONLY")))
+                    .color(m.theme.warn),
+            )
+            .on_hover_text(tr.t("MONKEY_EME_VISUAL_ONLY_TIP"));
+        }
+    }
     let fields = tool.options_ui_model();
     if fields.is_empty() {
         ui.label(tr.t("MONKEY_EME_NO_OPTIONS"));
@@ -528,6 +542,15 @@ fn options_panel(ui: &mut Ui, f: &mut Frame) {
             option_field(ui, f, id, field, tool_enabled && !field.disabled);
         }
     });
+}
+
+/// The overlay layer a tool edits (`water` → liquid, `area` → area).
+fn overlay_layer_of(tool: &str) -> Option<eme_core::service::EmeOverlayLayer> {
+    match tool {
+        "water" => Some(eme_core::service::EmeOverlayLayer::Liquid),
+        "area" => Some(eme_core::service::EmeOverlayLayer::Area),
+        _ => None,
+    }
 }
 
 fn option_field(

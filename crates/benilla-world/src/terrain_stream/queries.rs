@@ -34,11 +34,12 @@ fn capture_camera_area(
     };
     let wow = bevy_to_wow(eye);
     let (tx, ty) = world_to_tile(wow[0], wow[1]);
-    let found = streamer
+    // MONKEY (EME overlay): an area cell answers first.
+    let found = streamer.monkey_area_override(wow[0], wow[1]).or_else(|| streamer
         .tiles
         .get(&(tx as i32, ty as i32))
         .and_then(|ts| adt_tiles.get(&ts.handle))
-        .and_then(|adt| benilla_formats::area_id_at(&adt.chunks, wow))
+        .and_then(|adt| benilla_formats::area_id_at(&adt.chunks, wow)))
         .filter(|&id| id != 0);
     if found.is_some() && out.0 != found {
         out.0 = found;
@@ -85,6 +86,10 @@ pub fn area_id_under(
     bevy_pos: Vec3,
 ) -> Option<u32> {
     let wow = bevy_to_wow(bevy_pos);
+    // MONKEY (EME overlay): an area cell answers first (CONTRACT §11.5).
+    if let Some(id) = streamer.monkey_area_override(wow[0], wow[1]) {
+        return Some(id);
+    }
     let (tx, ty) = world_to_tile(wow[0], wow[1]);
     let ts = streamer.tiles.get(&(tx as i32, ty as i32))?;
     let adt = adt_tiles.get(&ts.handle)?;
@@ -239,7 +244,9 @@ pub(super) fn update_current_area(
             .map(|a| a.area_table_id)
             .filter(|&id| id != 0)
     });
-    let found = interior_area.or_else(|| {
+    // MONKEY (EME overlay): an area cell beats the WMO interior and the MCNK (CONTRACT v3.2).
+    let overlay_area = streamer.monkey_area_override(wow[0], wow[1]);
+    let found = overlay_area.or(interior_area).or_else(|| {
         let (tx, ty) = world_to_tile(wow[0], wow[1]);
         streamer
             .tiles

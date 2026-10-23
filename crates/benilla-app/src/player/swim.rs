@@ -94,6 +94,9 @@ pub(super) fn update_swimming(player: &mut Player, surface_y: Option<f32>, now: 
     let Some(surface) = surface_y else {
         player.swimming = false; // not in liquid
         stop_pitch(player, was);
+        if was {
+            info!("MONKEY: swim latch OFF (no liquid over the feet)");
+        }
         return false;
     };
     let depth = surface - player.pos.y;
@@ -108,6 +111,14 @@ pub(super) fn update_swimming(player: &mut Player, surface_y: Option<f32>, now: 
         depth > swim_enter_depth(h) && !hop_blocked
     };
     stop_pitch(player, was);
+    // MONKEY (EME overlay): one line per latch change, the live check's swim evidence.
+    if was != player.swimming {
+        info!(
+            "MONKEY: swim latch {} (depth {depth:.2} yd over the feet, enter at {:.2})",
+            if player.swimming { "ON" } else { "OFF" },
+            swim_enter_depth(h)
+        );
+    }
     player.swimming
 }
 

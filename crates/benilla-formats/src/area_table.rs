@@ -102,6 +102,11 @@ impl AreaTableCatalog {
         self.by_id.values()
     }
 
+    /// MONKEY (EME): every `(id, row)`, unordered (the area-paint picker lists a map's areas).
+    pub fn entries(&self) -> impl Iterator<Item = (u32, &AreaTableRow)> {
+        self.by_id.iter().map(|(&id, r)| (id, r))
+    }
+
     pub fn len(&self) -> usize {
         self.by_id.len()
     }

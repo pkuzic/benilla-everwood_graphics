@@ -64,6 +64,20 @@ impl LiquidLod {
     }
 }
 
+/// MONKEY (EME overlay): a new coverage mask for this surface (an overlay cell took over some of
+/// its cells): drop the fine copy so the next near-ring pass subdivides the new mask; returns the
+/// coarse handle the caller must show and rebuild.
+#[cfg(feature = "voxel")]
+impl LiquidLod {
+    pub(super) fn monkey_reset_wet(&mut self, wet: Vec<bool>, meshes: &mut Assets<Mesh>) -> Handle<Mesh> {
+        self.wet = wet;
+        if let Some(fine) = self.fine.take() {
+            meshes.remove(fine.id());
+        }
+        self.coarse.clone()
+    }
+}
+
 pub(super) fn register(app: &mut App) {
     app.add_systems(Update, update_liquid_lod);
 }

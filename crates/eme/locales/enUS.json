@@ -13,5 +13,16 @@
   "MONKEY_EME_SCULPT_FALLOFF_LINEAR": "Linear",
   "MONKEY_EME_SCULPT_FALLOFF_FLAT": "Flat",
   "MONKEY_EME_SCULPT_HARDNESS": "Hardness, %",
-  "MONKEY_EME_SCULPT_HARD": "Hard brush (spheres)"
+  "MONKEY_EME_SCULPT_HARD": "Hard brush (spheres)",
+  "MONKEY_EME_WATER_RADIUS": "Radius, yd",
+  "MONKEY_EME_WATER_OFFSET": "Level over the aimed ground, yd",
+  "MONKEY_EME_WATER_KIND": "Paint",
+  "MONKEY_EME_WATER_KIND_WATER": "Water",
+  "MONKEY_EME_WATER_KIND_DRY": "Dry (no water here)",
+  "MONKEY_EME_AREA_SEARCH": "Search",
+  "MONKEY_EME_AREA_AREA": "Area",
+  "MONKEY_EME_AREA_ID": "Area id",
+  "MONKEY_EME_AREA_RADIUS": "Radius, yd (0 = one 16-yd cell)",
+  "MONKEY_EME_AREA_ERASE": "Remove the override (original area)",
+  "MONKEY_EME_AREA_PICK_NONE": "(pick an area)"
 }

@@ -103,6 +103,10 @@ pub struct TerrainStreamer {
     /// ground out of it.
     #[cfg(feature = "voxel")]
     voxel_carve: Option<std::sync::Arc<voxel_clip::VoxelCarve>>,
+    /// MONKEY (EME overlay): the current map's area overrides (16-yd cell → `AreaTable` id, CONTRACT
+    /// §11.1), answered before the MCNK area id and before a WMO interior's (§11.5 / v3.2).
+    #[cfg(feature = "voxel")]
+    monkey_area_overlay: Option<std::sync::Arc<std::collections::HashMap<(i16, i16), u16>>>,
 }
 
 /// The map-global WMO's placement id: a WMO-only map has no ADT uniqueIds to collide with, and
@@ -145,6 +149,30 @@ impl TerrainStreamer {
     #[cfg(feature = "voxel")]
     pub(crate) fn voxel_carve(&self) -> Option<&voxel_clip::VoxelCarve> {
         self.voxel_carve.as_deref()
+    }
+
+    /// MONKEY (EME overlay): publish the area overrides of the current map (`None` / empty = none).
+    #[cfg(feature = "voxel")]
+    pub(crate) fn set_monkey_area_overlay(
+        &mut self,
+        cells: Option<std::sync::Arc<std::collections::HashMap<(i16, i16), u16>>>,
+    ) {
+        self.monkey_area_overlay = cells.filter(|c| !c.is_empty());
+    }
+
+    /// MONKEY (EME overlay): the overriding area id at a WoW XY, if an area cell covers it.
+    pub fn monkey_area_override(&self, wow_x: f32, wow_y: f32) -> Option<u32> {
+        #[cfg(feature = "voxel")]
+        {
+            let cells = self.monkey_area_overlay.as_ref()?;
+            let key = benilla_voxel::overlay::area_cell_of(wow_x, wow_y);
+            cells.get(&key).map(|&id| u32::from(id)).filter(|&id| id != 0)
+        }
+        #[cfg(not(feature = "voxel"))]
+        {
+            let _ = (wow_x, wow_y);
+            None
+        }
     }
 }
 

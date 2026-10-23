@@ -35,6 +35,9 @@ use benilla_assets::coords::bevy_to_wow;
 use benilla_protocol::{SessionEvent, SessionEventKind};
 use benilla_ui::script::AddonDistribution;
 use benilla_world::voxel::wire::{self, ServerRecord, SyncEntry};
+use benilla_world::voxel::overlay_cells::{cell_region, LAYER_AREA, LAYER_LIQUID};
+use benilla_world::voxel::overlay::{area_event, liquid_event};
+use benilla_world::voxel::{MonkeyOverlay, MonkeyOverlayNet, MonkeyOverlayNetEvent};
 use benilla_world::voxel::{
     region_of, MonkeyLocalGm, MonkeyVoxelEdit, MonkeyVoxelNet, MonkeyVoxelNetEvent,
     MonkeyVoxelWorld, RegionSync, REGION_YARDS,
@@ -115,6 +118,247 @@ pub(crate) struct MonkeyVoxelLink {
     sync_edits: u32,
     /// A SYNC round is open (logged once when it drains).
     sync_open: bool,
+    /// MONKEY (EME overlay): the OSYNC state of the liquid (`[0]`) and area (`[1]`) layers.
+    ov: [MonkeyOverlayLink; 2],
+    /// MONKEY (EME overlay): the next free gap slot tries the overlays first (the server's 200-ms
+    /// SYNC gap is SHARED with OSYNC, so the streams take turns).
+    ov_turn: bool,
+    /// Which overlay layer the next overlay slot tries first.
+    ov_layer_turn: usize,
+}
+
+/// MONKEY (EME overlay): one overlay layer's OSYNC bookkeeping (the SYNC model, CONTRACT §9.1).
+#[derive(Default)]
+pub(crate) struct MonkeyOverlayLink {
+    known: HashMap<(i16, i16), RegionSync>,
+    synced: HashSet<(i16, i16)>,
+    inflight: HashMap<(i16, i16), f32>,
+    again: VecDeque<(i16, i16)>,
+}
+
+/// The wire layer id of `ov[i]`.
+const OV_LAYERS: [u8; 2] = [LAYER_LIQUID, LAYER_AREA];
+
+fn ov_index(layer: u8) -> Option<usize> {
+    OV_LAYERS.iter().position(|&l| l == layer)
+}
+
+/// MONKEY (EME overlay): route the overlay records (`L` `A` `O` `Z`) into overlay events and the
+/// OSYNC bookkeeping. Pure, unit-tested.
+fn monkey_overlay_route(
+    link: &mut MonkeyVoxelLink,
+    map: u16,
+    records: Vec<ServerRecord>,
+    events: &mut Vec<MonkeyOverlayNetEvent>,
+) {
+    for r in records {
+        let (layer, cell_map, region, seq, ev) = match r {
+            ServerRecord::Liquid {
+                seq,
+                stroke,
+                map: m,
+                cx,
+                cy,
+                cell,
+                actor,
+            } => (
+                LAYER_LIQUID,
+                m,
+                cell_region(LAYER_LIQUID, cx, cy),
+                seq,
+                liquid_event(seq, stroke, m, cx, cy, cell, actor),
+            ),
+            ServerRecord::Area {
+                seq,
+                stroke,
+                map: m,
+                ax,
+                ay,
+                area_id,
+                actor,
+            } => (
+                LAYER_AREA,
+                m,
+                cell_region(LAYER_AREA, ax, ay),
+                seq,
+                area_event(seq, stroke, m, ax, ay, area_id, actor),
+            ),
+            ServerRecord::OverlayDone {
+                layer,
+                map: m,
+                rx,
+                ry,
+                epoch,
+                last_seq,
+                more,
+            } => {
+                let Some(i) = ov_index(layer) else { continue };
+                if m != map {
+                    continue;
+                }
+                let ol = &mut link.ov[i];
+                let reg = (rx, ry);
+                ol.inflight.remove(&reg);
+                let sync = RegionSync { epoch, last_seq };
+                ol.known.insert(reg, sync);
+                events.push(MonkeyOverlayNetEvent::SyncPoint {
+                    layer,
+                    map,
+                    rx,
+                    ry,
+                    sync,
+                });
+                if more {
+                    if !ol.again.contains(&reg) {
+                        ol.again.push_back(reg);
+                    }
+                } else {
+                    ol.synced.insert(reg);
+                }
+                continue;
+            }
+            ServerRecord::OverlayReset {
+                layer,
+                map: m,
+                rx,
+                ry,
+                epoch,
+            } => {
+                events.push(MonkeyOverlayNetEvent::Reset {
+                    layer,
+                    map: m,
+                    rx,
+                    ry,
+                    epoch,
+                });
+                let Some(i) = ov_index(layer) else { continue };
+                if m != map {
+                    continue;
+                }
+                let ol = &mut link.ov[i];
+                let reg = (rx, ry);
+                info!(
+                    "MONKEY (EME overlay): Z OVERLAY-RESET layer {layer} ({rx}, {ry}) epoch {epoch} \
+                     - re-OSYNC from 0"
+                );
+                ol.known.insert(reg, RegionSync { epoch, last_seq: 0 });
+                ol.synced.remove(&reg);
+                if !ol.inflight.contains_key(&reg) && !ol.again.contains(&reg) {
+                    ol.again.push_back(reg);
+                }
+                continue;
+            }
+            _ => continue,
+        };
+        events.push(ev);
+        // A live cell in a region already synced this session keeps its sync point contiguous.
+        let Some(i) = ov_index(layer) else { continue };
+        let ol = &mut link.ov[i];
+        if cell_map == map && ol.synced.contains(&region) {
+            if let Some(k) = ol.known.get_mut(&region) {
+                if seq > k.last_seq {
+                    k.last_seq = seq;
+                    events.push(MonkeyOverlayNetEvent::SyncPoint {
+                        layer,
+                        map,
+                        rx: region.0,
+                        ry: region.1,
+                        sync: *k,
+                    });
+                }
+            }
+        }
+    }
+}
+
+/// Is this one of the overlay records?
+fn is_overlay_record(r: &ServerRecord) -> bool {
+    matches!(
+        r,
+        ServerRecord::Liquid { .. }
+            | ServerRecord::Area { .. }
+            | ServerRecord::OverlayDone { .. }
+            | ServerRecord::OverlayReset { .. }
+    )
+}
+
+/// MONKEY (EME overlay): the OSYNC entries of one layer to send now (re-asks first, then unsynced
+/// regions near the player, nearest first, ≤ 12) — [`monkey_voxel_sync_batch`] for an overlay.
+fn monkey_overlay_sync_batch(
+    ol: &mut MonkeyOverlayLink,
+    near: &[((i16, i16), f32)],
+    sync_point: impl Fn((i16, i16)) -> RegionSync,
+) -> Vec<SyncEntry> {
+    let mut regs: Vec<(i16, i16)> = Vec::new();
+    while regs.len() < wire::SYNC_MAX_ENTRIES {
+        let Some(r) = ol.again.pop_front() else {
+            break;
+        };
+        if !regs.contains(&r) {
+            regs.push(r);
+        }
+    }
+    for (r, _) in near {
+        if regs.len() >= wire::SYNC_MAX_ENTRIES {
+            break;
+        }
+        if !ol.synced.contains(r) && !ol.inflight.contains_key(r) && !regs.contains(r) {
+            regs.push(*r);
+        }
+    }
+    regs.into_iter()
+        .map(|r| {
+            let s = ol.known.get(&r).copied().unwrap_or_else(|| sync_point(r));
+            ol.known.insert(r, s);
+            SyncEntry {
+                rx: r.0,
+                ry: r.1,
+                epoch: s.epoch,
+                after_seq: s.last_seq,
+            }
+        })
+        .collect()
+}
+
+/// MONKEY (EME overlay): use this gap slot for one OSYNC command (liquid / area, alternating);
+/// `true` = one was sent.
+fn monkey_overlay_sync_slot(
+    link: &mut MonkeyVoxelLink,
+    map: u16,
+    near: &[((i16, i16), f32)],
+    overlay: &MonkeyOverlay,
+    now: f32,
+    commands: &NetCommands,
+) -> bool {
+    for k in 0..2 {
+        let i = (link.ov_layer_turn + k) % 2;
+        let layer = OV_LAYERS[i];
+        let entries = monkey_overlay_sync_batch(&mut link.ov[i], near, |r| {
+            overlay.region_sync(layer, map, r.0, r.1)
+        });
+        if entries.is_empty() {
+            continue;
+        }
+        link.ov_layer_turn = (i + 1) % 2;
+        link.last_sync_cmd = now;
+        for e in &entries {
+            link.ov[i].inflight.insert((e.rx, e.ry), now);
+        }
+        let after: Vec<String> = entries
+            .iter()
+            .map(|e| format!("({},{})e{}>{}", e.rx, e.ry, e.epoch, e.after_seq))
+            .collect();
+        info!(
+            "MONKEY (EME overlay): OSYNC layer {layer} map {map}: {} region(s) {}",
+            entries.len(),
+            after.join(" ")
+        );
+        for c in wire::osync_commands(layer, map, &entries) {
+            say(commands, c);
+        }
+        return true;
+    }
+    false
 }
 
 /// Wire the link: the inbound-chat interceptor, the GM-status bridge, the mode / SYNC tick and
@@ -187,6 +431,11 @@ fn monkey_voxel_route(
     for r in records {
         match r {
             ServerRecord::Hello { .. } => {}
+            // MONKEY (EME overlay): routed by `monkey_overlay_route` (split off before this).
+            ServerRecord::Liquid { .. }
+            | ServerRecord::Area { .. }
+            | ServerRecord::OverlayDone { .. }
+            | ServerRecord::OverlayReset { .. } => {}
             ServerRecord::Edit(_) | ServerRecord::Edit3 { .. } => {
                 // MONKEY (voxel): `E` (v2) confirms on the body; `e` (v3) also on stroke, param
                 // and the actor being this character.
@@ -380,7 +629,9 @@ fn monkey_voxel_link_tick(
     commands: Res<NetCommands>,
     mut link: ResMut<MonkeyVoxelLink>,
     mut net: ResMut<MonkeyVoxelNet>,
+    overlay: (Res<MonkeyOverlay>, ResMut<MonkeyOverlayNet>),
 ) {
+    let (overlay, mut ov_net) = overlay;
     let now = time.elapsed_secs();
     let (Some(guid), Some(map)) = (self_guid.0, world.map()) else {
         if link.mode != MonkeyVoxelMode::Idle {
@@ -426,6 +677,10 @@ fn monkey_voxel_link_tick(
                 link.mode = MonkeyVoxelMode::Server;
             }
         }
+        // MONKEY (EME overlay): the overlay records take their own route.
+        let (ov_records, records): (Vec<ServerRecord>, Vec<ServerRecord>) =
+            records.into_iter().partition(is_overlay_record);
+        monkey_overlay_route(link, map16, ov_records, &mut ov_net.events);
         let pending = world.pending_local(map16);
         // The low GUID (CONTRACT §9.2 `actor_guid` = the character's low 32 bits).
         monkey_voxel_route(link, map16, guid as u32, &pending, records, &mut net.events);
@@ -464,6 +719,24 @@ fn monkey_voxel_link_tick(
             for r in far {
                 link.synced.remove(&r);
             }
+            // MONKEY (EME overlay): the same forgetting / retry for both overlay layers.
+            for ol in &mut link.ov {
+                ol.synced.retain(|r| {
+                    let cx = (r.0 as f32 + 0.5) * REGION_YARDS;
+                    let cy = (r.1 as f32 + 0.5) * REGION_YARDS;
+                    ((cx - p[0]).powi(2) + (cy - p[1]).powi(2)).sqrt() <= UNSYNC_RADIUS
+                });
+                let lost: Vec<(i16, i16)> = ol
+                    .inflight
+                    .iter()
+                    .filter(|(_, t)| now - **t > SYNC_RETRY_S)
+                    .map(|(r, _)| *r)
+                    .collect();
+                for r in lost {
+                    ol.inflight.remove(&r);
+                    ol.again.push_back(r);
+                }
+            }
             let lost: Vec<(i16, i16)> = link
                 .inflight
                 .iter()
@@ -478,9 +751,20 @@ fn monkey_voxel_link_tick(
                 return;
             }
             let near = regions_near(p[0], p[1], SYNC_RADIUS);
+            // MONKEY (EME overlay): OSYNC only on a v3 negotiation (CONTRACT §7); slots alternate.
+            let v3 = link.version >= wire::CLIENT_VERSION_V3;
+            if v3 && link.ov_turn {
+                link.ov_turn = false;
+                if monkey_overlay_sync_slot(link, map16, &near, &overlay, now, &commands) {
+                    return;
+                }
+            }
             let entries =
                 monkey_voxel_sync_batch(link, &near, |r| world.region_sync(map16, r.0, r.1));
             if entries.is_empty() {
+                if v3 && monkey_overlay_sync_slot(link, map16, &near, &overlay, now, &commands) {
+                    return;
+                }
                 // Nothing left to ask and every answer in: one line per SYNC round.
                 if link.sync_open && link.inflight.is_empty() {
                     link.sync_open = false;
@@ -494,6 +778,7 @@ fn monkey_voxel_link_tick(
                 return;
             }
             link.last_sync_cmd = now;
+            link.ov_turn = true;
             link.sync_cmds += 1;
             link.sync_open = true;
             for e in &entries {
@@ -859,5 +1144,79 @@ mod tests {
         let cmds = wire::sync_commands(0, &b2);
         assert_eq!(cmds.len(), 1);
         assert_eq!(cmds[0].len(), ".mvox ".len() + 2 * (4 + 10 * 12));
+    }
+
+    /// MONKEY (EME overlay): L/A → cell events, O → sync point (+ re-ask on more), Z → reset +
+    /// re-OSYNC from 0, a live cell in a synced region advances its sync point.
+    #[test]
+    fn overlay_records_route_to_overlay_events_and_osync_state() {
+        use benilla_world::voxel::overlay_cells::LiquidCell;
+        let mut link = MonkeyVoxelLink::default();
+        let mut ev = Vec::new();
+        let reg = cell_region(LAYER_AREA, -557, -8);
+        assert_eq!(reg, (-140, -2));
+        monkey_overlay_route(
+            &mut link,
+            0,
+            vec![
+                ServerRecord::OverlayDone {
+                    layer: LAYER_AREA,
+                    map: 0,
+                    rx: -140,
+                    ry: -2,
+                    epoch: 0,
+                    last_seq: 1,
+                    more: false,
+                },
+                ServerRecord::Area {
+                    seq: 2,
+                    stroke: 4,
+                    map: 0,
+                    ax: -557,
+                    ay: -8,
+                    area_id: 87,
+                    actor: 42,
+                },
+            ],
+            &mut ev,
+        );
+        assert!(link.ov[1].synced.contains(&reg));
+        assert_eq!(ev.len(), 3, "{ev:?}");
+        assert!(matches!(ev[1], MonkeyOverlayNetEvent::Cell { layer: 2, cell: (-557, -8), .. }));
+        assert!(matches!(
+            ev[2],
+            MonkeyOverlayNetEvent::SyncPoint { layer: 2, sync: RegionSync { epoch: 0, last_seq: 2 }, .. }
+        ));
+        // Z: reset event, region unsynced and re-asked from 0.
+        ev.clear();
+        monkey_overlay_route(
+            &mut link,
+            0,
+            vec![ServerRecord::OverlayReset {
+                layer: LAYER_AREA,
+                map: 0,
+                rx: -140,
+                ry: -2,
+                epoch: 1,
+            }],
+            &mut ev,
+        );
+        assert!(matches!(ev[0], MonkeyOverlayNetEvent::Reset { epoch: 1, .. }));
+        assert!(!link.ov[1].synced.contains(&reg));
+        let b = monkey_overlay_sync_batch(&mut link.ov[1], &[], |_| RegionSync::default());
+        assert_eq!(b, vec![SyncEntry { rx: -140, ry: -2, epoch: 1, after_seq: 0 }]);
+        // A liquid cell goes to the liquid layer; an unsynced region does not move its sync point.
+        ev.clear();
+        let cell = LiquidCell { kind: 1, level: 81.0, flags: 0, fade: 0 };
+        monkey_overlay_route(
+            &mut link,
+            0,
+            vec![ServerRecord::Liquid { seq: 5, stroke: 3, map: 0, cx: 100, cy: -20, cell, actor: 42 }],
+            &mut ev,
+        );
+        assert_eq!(ev.len(), 1);
+        assert!(matches!(ev[0], MonkeyOverlayNetEvent::Cell { layer: 1, .. }));
+        assert!(is_overlay_record(&ServerRecord::OverlayReset { layer: 1, map: 0, rx: 0, ry: 0, epoch: 0 }));
+        assert!(!is_overlay_record(&ServerRecord::Hello { version: 3 }));
     }
 }

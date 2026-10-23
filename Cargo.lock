@@ -3034,6 +3034,7 @@ name = "eme"
 version = "0.2.0"
 dependencies = [
  "benilla-assets",
+ "benilla-formats",
  "benilla-world",
  "bevy",
  "eme-core",

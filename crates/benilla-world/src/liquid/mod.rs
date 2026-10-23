@@ -39,6 +39,11 @@ mod scene_depth;
 // MONKEY (ao): the label orders the AO pass.
 pub use scene_depth::{WaterDepthLabel, WaterDepthPlugin};
 mod query;
+// MONKEY (EME overlay): ADT liquid cells an overlay liquid cell replaces.
+#[cfg(feature = "voxel")]
+mod overlay_mask;
+#[cfg(feature = "voxel")]
+pub use overlay_mask::{MonkeyLiquidMask, MonkeyOverlayLiquid};
 #[cfg(test)]
 mod real_data;
 mod spatial;
@@ -130,6 +135,10 @@ impl Plugin for LiquidPlugin {
                     .in_set(SubmersionVerdict),
             );
         }
+        // MONKEY (EME overlay): fit the ADT surfaces to the overlay's covered cells.
+        #[cfg(feature = "voxel")]
+        app.init_resource::<MonkeyLiquidMask>()
+            .add_systems(Update, overlay_mask::monkey_mask_adt_liquid);
         drift::register(app);
         lod::register(app);
     }

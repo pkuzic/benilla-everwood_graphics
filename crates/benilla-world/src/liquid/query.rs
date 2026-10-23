@@ -446,6 +446,54 @@ impl WaterChunkInfo {
     }
 }
 
+/// MONKEY (EME overlay): the per-cell coverage mask and the cell centres, so an overlay liquid
+/// cell can take over the ADT cells it covers (CONTRACT §11.5: an overlay cell replaces the ADT
+/// cell entirely).
+#[cfg(feature = "voxel")]
+impl WaterChunkInfo {
+    /// Is this an ADT (MCLQ) surface?
+    pub(crate) fn is_adt(&self) -> bool {
+        matches!(self.source, LiquidSource::AdtChunk)
+    }
+
+    /// The current per-cell coverage, row-major over `(cols−1) × (rows−1)`.
+    pub(crate) fn wet_mask(&self) -> &[bool] {
+        &self.grid.wet
+    }
+
+    /// The grid's vertex counts `[cols, rows]`.
+    pub(crate) fn grid_dims(&self) -> [usize; 2] {
+        [self.grid.cols, self.grid.rows]
+    }
+
+    /// The world WoW XY centre of every cell, row-major like [`Self::wet_mask`].
+    pub(crate) fn cell_centres(&self) -> Vec<[f32; 2]> {
+        let g = &self.grid;
+        let (Some(cx), Some(cy)) = (g.cols.checked_sub(1), g.rows.checked_sub(1)) else {
+            return Vec::new();
+        };
+        let mut out = Vec::with_capacity(cx * cy);
+        for j in 0..cy {
+            for i in 0..cx {
+                let (a, b) = (i as f32 + 0.5, j as f32 + 0.5);
+                out.push([
+                    g.origin[0] + a * g.u[0] + b * g.v[0],
+                    g.origin[1] + a * g.u[1] + b * g.v[1],
+                ]);
+            }
+        }
+        out
+    }
+
+    /// Replace the coverage mask (same length; the bounds stay the original wet footprint's, a
+    /// conservative box the per-cell test narrows).
+    pub(crate) fn set_wet_mask(&mut self, wet: Vec<bool>) {
+        if wet.len() == self.grid.wet.len() {
+            self.grid.wet = wet;
+        }
+    }
+}
+
 /// A surface's [`WaterChunkInfo`], its grid carried into world WoW space by `transform`:
 /// `IDENTITY` for MCLQ, whose positions are already absolute (the axis round trip is exact), the
 /// MODF placement for model-local WMO liquid.

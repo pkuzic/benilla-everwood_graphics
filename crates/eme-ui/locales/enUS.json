@@ -114,5 +114,7 @@
   "MONKEY_EME_ERR_INTERNAL": "Server error; try again.",
   "MONKEY_EME_ERR_TIMEOUT": "The server did not answer in time.",
   "MONKEY_EME_ERR_LINK_LOST": "The link dropped before the answer.",
-  "MONKEY_EME_ERR_OTHER": "The server refused: {0}"
+  "MONKEY_EME_ERR_OTHER": "The server refused: {0}",
+  "MONKEY_EME_VISUAL_ONLY": "Visual only",
+  "MONKEY_EME_VISUAL_ONLY_TIP": "This server does not enforce water and area edits yet: every client shows them, but the server's swimming, drowning and zone rules still follow the original map."
 }

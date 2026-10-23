@@ -39,6 +39,11 @@ pub use api::{
     MonkeyVoxelRegionState, MonkeyVoxelSubmit,
 };
 use terrain_hide::{monkey_voxel_hide_terrain, MonkeyVoxelHideState, CARVE_INSET};
+// MONKEY (EME overlay): the v3 liquid + area overlay layers (CONTRACT §11).
+pub mod overlay;
+pub use overlay::{MonkeyOverlay, MonkeyOverlayNet, MonkeyOverlayNetEvent};
+/// MONKEY (EME overlay): the engine-free cell maths + journal types.
+pub use benilla_voxel::overlay as overlay_cells;
 
 use crate::terrain_stream::voxel_clip::VoxelCarve;
 use crate::terrain_stream::TerrainStreamer;
@@ -1406,6 +1411,23 @@ impl Plugin for MonkeyVoxelPlugin {
         // MONKEY (EME seam): the editor claim + the edit-outcome messages.
         app.init_resource::<MonkeyVoxelInputClaimed>();
         app.add_message::<MonkeyVoxelEvent>();
+        // MONKEY (EME overlay): liquid + area cells (after the voxel stream, so a pit's floor is
+        // known when the water's depth ramp is measured).
+        app.init_resource::<MonkeyOverlay>();
+        app.init_resource::<MonkeyOverlayNet>();
+        app.add_systems(
+            Update,
+            (
+                overlay::monkey_overlay_apply,
+                overlay::monkey_overlay_publish,
+                overlay::monkey_overlay_autosave,
+                overlay::monkey_overlay_probe,
+            )
+                .chain()
+                .after(monkey_voxel_stream)
+                .in_set(MonkeyVoxelSet)
+                .run_if(crate::schedule::world_is_live),
+        );
         app.add_systems(
             Update,
             (
