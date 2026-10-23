@@ -333,12 +333,20 @@ fn split(poly: &[V], axis: usize, value: f32) -> (Vec<V>, Vec<V>) {
 }
 
 /// Twice the signed XY area of a polygon.
+///
+/// MONKEY (voxel fix): taken RELATIVE to the first vertex. The plain shoelace over absolute WoW
+/// coordinates multiplies ~10⁴-yard values (Westfall: x ≈ −10400, y ≈ 1300 → products ≈ 1.4·10⁷,
+/// where one f32 ulp is 1.0), so a good clipped triangle of a few square yards could cancel to 0
+/// and be dropped as a "sliver": a hole in the kept ground along the carve's outer edge, where
+/// neither the ADT nor the voxel layer draws (the sky-cyan triangles in a line).
 fn area2(poly: &[V]) -> f32 {
-    let n = poly.len();
-    (0..n)
+    let Some(o) = poly.first().map(|v| v.p) else {
+        return 0.0;
+    };
+    (1..poly.len().saturating_sub(1))
         .map(|i| {
-            let (a, b) = (poly[i].p, poly[(i + 1) % n].p);
-            a[0] * b[1] - b[0] * a[1]
+            let (a, b) = (poly[i].p, poly[i + 1].p);
+            (a[0] - o[0]) * (b[1] - o[1]) - (b[0] - o[0]) * (a[1] - o[1])
         })
         .sum()
 }
@@ -441,19 +449,24 @@ mod tests {
 
     /// A flat 145-vertex chunk whose NW corner is WoW (100, 100), with chunk UVs and up normals.
     fn flat_chunk(holes: u16) -> ChunkMesh {
+        flat_chunk_at([100.0, 100.0], holes)
+    }
+
+    /// The same flat chunk with its NW corner at WoW `nw`.
+    fn flat_chunk_at(nw: [f32; 2], holes: u16) -> ChunkMesh {
         let step = CHUNK_SIZE / 8.0;
         let mut positions = Vec::with_capacity(145);
         let mut uvs = Vec::with_capacity(145);
         for row in 0..9 {
             for col in 0..9 {
-                positions.push([100.0 - row as f32 * step, 100.0 - col as f32 * step, 5.0]);
+                positions.push([nw[0] - row as f32 * step, nw[1] - col as f32 * step, 5.0]);
                 uvs.push([col as f32 / 8.0, row as f32 / 8.0]);
             }
             if row < 8 {
                 for col in 0..8 {
                     positions.push([
-                        100.0 - (row as f32 + 0.5) * step,
-                        100.0 - (col as f32 + 0.5) * step,
+                        nw[0] - (row as f32 + 0.5) * step,
+                        nw[1] - (col as f32 + 0.5) * step,
                         5.0,
                     ]);
                     uvs.push([(col as f32 + 0.5) / 8.0, (row as f32 + 0.5) / 8.0]);
@@ -550,6 +563,44 @@ mod tests {
             let u = (100.0 - p[1]) / CHUNK_SIZE;
             let v = (100.0 - p[0]) / CHUNK_SIZE;
             assert!((uv[0] - u).abs() < 1.0e-4 && (uv[1] - v).abs() < 1.0e-4);
+        }
+    }
+
+    /// MONKEY (voxel fix): far from the map origin (Westfall, x ≈ −10400, y ≈ 1300) the clip must
+    /// keep exactly the ground outside the carve too. The absolute-coordinate shoelace lost every
+    /// bit of a few-yd² piece there and dropped good triangles as slivers: sky holes in a line
+    /// along the carve's outer edge.
+    #[test]
+    fn far_from_the_origin_no_kept_ground_is_lost() {
+        let cs = CHUNK_SIZE;
+        // The MCNK chunk west of the y = 1300 chunk line, rows from x = −10400 south.
+        let nw = [-10400.0f32, 1300.0 + cs];
+        let src = flat_chunk_at(nw, 0);
+        let rel_area = |t: &[[f32; 3]; 3]| {
+            let o = t[0];
+            tri_area(&t.map(|p| [p[0] - o[0], p[1] - o[1], p[2]])).abs()
+        };
+        let chunk_area: f32 = tris(&src).iter().map(rel_area).sum();
+        for (y1, x0, x1) in [
+            (1311.5f32, -10416.0f32, -10384.0f32), // the outer edge y = 1312 − inset
+            (1311.5, -10421.3, -10403.7),
+            (1327.25, -10431.9, -10405.05),
+        ] {
+            let r = VoxelCarveRect {
+                x0,
+                x1,
+                y0: 1296.0,
+                y1,
+            };
+            let c = clip_chunk_outside_rect(&src, &r).expect("overlaps");
+            let kept: f32 = tris(&c).iter().map(rel_area).sum();
+            let ox = r.x1.min(nw[0]) - r.x0.max(nw[0] - cs);
+            let oy = r.y1.min(nw[1]) - r.y0.max(nw[1] - cs);
+            let expect = chunk_area - ox.max(0.0) * oy.max(0.0);
+            assert!(
+                (kept - expect).abs() < 0.05,
+                "rect {r:?}: kept {kept} yd², expected {expect} yd² (ground lost = sky holes)"
+            );
         }
     }
 
