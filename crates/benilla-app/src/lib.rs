@@ -92,6 +92,7 @@ mod names;
 mod net;
 mod npc_text;
 /// Ships in part (the FPS journal and the clocks it reads); the rest is `dev`.
+mod gpu_lost;
 mod perf;
 mod pipe_warm;
 mod player;
@@ -454,6 +455,8 @@ fn launch(build: BuildId, extend: Option<Extension<'_>>) -> AppExit {
     // cost and the GPU's per-pass split to `benilla-config/Diagnostics/fps-journal.csv`;
     // `WOW_FPS_JOURNAL=<csv>` is the harness lever.
     .add_plugins(perf::FpsJournalPlugin)
+    // MONKEY (EME): a lost GPU device names its reason in the log (the crash report quotes it).
+    .add_plugins(gpu_lost::GpuLostPlugin)
     // The game as one group on top of the engine; `game_plugins.rs` has its members, its
     // load-bearing ordering edges and the test that builds it headless.
     .add_plugins(game_plugins::GamePlugins {
