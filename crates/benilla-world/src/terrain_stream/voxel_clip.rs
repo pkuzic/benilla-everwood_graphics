@@ -265,8 +265,240 @@ impl VoxelCarve {
                 out = Some(c);
             }
         }
+        if let Some(c) = out.as_mut() {
+            close_t_junctions(c, chunk.positions.len());
+        }
         out
     }
+
+    /// MONKEY (voxel fix): [`Self::clip_chunk`] for DRAWING — the clipped chunk plus a vertical
+    /// [`CARVE_SKIRT`] curtain hung under every kept edge that borders the carve (see
+    /// [`add_carve_skirts`]). The collider / height / torch paths keep the plain clip.
+    pub fn clip_chunk_drawn(&self, chunk: &ChunkMesh) -> Option<ChunkMesh> {
+        let mut out = self.clip_chunk(chunk)?;
+        add_carve_skirts(&mut out, |x, y| self.contains_strict(x, y), CARVE_SKIRT);
+        Some(out)
+    }
+}
+
+/// MONKEY (voxel fix): weld the T-junctions the clip leaves inside a chunk. The half-plane splits
+/// run each cut line across the WHOLE straddling triangle, so past a rectangle's corner a cut vertex
+/// lands on an edge that the neighbouring piece / triangle keeps whole (e.g. a right piece's long
+/// edge on `x = x1` beside the low piece's short one): a T-junction, which rasterises with
+/// hairline pinholes. Every kept triangle with a vertex appended by the clip (index ≥ `first_new`)
+/// lying strictly inside one of its edges is re-fanned around its centroid (a new interior vertex,
+/// attributes interpolated), so every such edge is split exactly where its neighbour's is. The
+/// winding is the triangle's own.
+fn close_t_junctions(chunk: &mut ChunkMesh, first_new: usize) {
+    let np = chunk.positions.len();
+    if np <= first_new {
+        return;
+    }
+    let has_n = chunk.normals.len() == np;
+    let has_uv = chunk.uvs.len() == np;
+    // Appended vertices, deduplicated by position (two passes may append the same point twice).
+    let mut cand: Vec<u32> = Vec::new();
+    let mut seen: std::collections::HashSet<[u32; 3]> = std::collections::HashSet::new();
+    for i in first_new..np {
+        let p = chunk.positions[i];
+        if seen.insert([p[0].to_bits(), p[1].to_bits(), p[2].to_bits()]) {
+            cand.push(i as u32);
+        }
+    }
+    let tris: Vec<[u32; 3]> = chunk
+        .indices
+        .as_chunks::<3>()
+        .0
+        .iter()
+        .copied()
+        .filter(|t| t.iter().all(|&i| (i as usize) < np))
+        .collect();
+    let mut indices: Vec<u32> = Vec::with_capacity(chunk.indices.len());
+    for t in tris {
+        let pos = |i: u32| chunk.positions[i as usize];
+        // Per edge k (t[k] → t[k+1]): the candidates strictly inside it, by their parameter.
+        let mut on_edge: [Vec<(f32, u32)>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+        let mut any = false;
+        for k in 0..3 {
+            let (a, b) = (pos(t[k]), pos(t[(k + 1) % 3]));
+            let (ex, ey) = (b[0] - a[0], b[1] - a[1]);
+            let l2 = ex * ex + ey * ey;
+            if l2 < 1.0e-10 {
+                continue;
+            }
+            let len = l2.sqrt();
+            for &v in &cand {
+                if t.contains(&v) {
+                    continue;
+                }
+                let p = pos(v);
+                if p == a || p == b {
+                    continue;
+                }
+                let (px, py) = (p[0] - a[0], p[1] - a[1]);
+                let s = (px * ex + py * ey) / l2;
+                if s <= 1.0e-5 || s >= 1.0 - 1.0e-5 {
+                    continue;
+                }
+                // Off the edge's line in XY, or in height.
+                if (px * ey - py * ex).abs() / len > 1.0e-3 {
+                    continue;
+                }
+                if (a[2] + (b[2] - a[2]) * s - p[2]).abs() > 1.0e-2 {
+                    continue;
+                }
+                on_edge[k].push((s, v));
+                any = true;
+            }
+            on_edge[k].sort_by(|x, y| x.0.total_cmp(&y.0));
+        }
+        if !any {
+            indices.extend_from_slice(&t);
+            continue;
+        }
+        let mut ring: Vec<u32> = Vec::with_capacity(6);
+        for k in 0..3 {
+            ring.push(t[k]);
+            ring.extend(on_edge[k].iter().map(|&(_, v)| v));
+        }
+        let (a, b, c) = (pos(t[0]), pos(t[1]), pos(t[2]));
+        let centre = (0..3)
+            .map(|i| (a[i] + b[i] + c[i]) / 3.0)
+            .collect::<Vec<_>>();
+        chunk.positions.push([centre[0], centre[1], centre[2]]);
+        if has_n {
+            let (na, nb, nc) = (
+                chunk.normals[t[0] as usize],
+                chunk.normals[t[1] as usize],
+                chunk.normals[t[2] as usize],
+            );
+            let n = [
+                na[0] + nb[0] + nc[0],
+                na[1] + nb[1] + nc[1],
+                na[2] + nb[2] + nc[2],
+            ];
+            let l = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt().max(1.0e-6);
+            chunk.normals.push([n[0] / l, n[1] / l, n[2] / l]);
+        }
+        if has_uv {
+            let (ua, ub, uc) = (
+                chunk.uvs[t[0] as usize],
+                chunk.uvs[t[1] as usize],
+                chunk.uvs[t[2] as usize],
+            );
+            chunk.uvs.push([
+                (ua[0] + ub[0] + uc[0]) / 3.0,
+                (ua[1] + ub[1] + uc[1]) / 3.0,
+            ]);
+        }
+        let ci = (chunk.positions.len() - 1) as u32;
+        for i in 0..ring.len() {
+            indices.extend_from_slice(&[ci, ring[i], ring[(i + 1) % ring.len()]]);
+        }
+    }
+    chunk.indices = indices;
+}
+
+/// MONKEY (voxel fix): how far (yd) the drawn ADT curtain hangs below the carve's cut edge.
+///
+/// The voxel layer is drawn `RENDER_DROP` (0.17 yd) under its density surface, i.e. ~0.02 yd UNDER
+/// the real ground plus the surface-nets error, and its unedited fragments stop 0.1 yd past the
+/// carve region (`BAND_DISCARD`). Seen from INSIDE the carve at a grazing angle, a ray that clears
+/// the voxel top reaches the cut ADT edge in the slit BETWEEN the two sheets, runs on under the
+/// ADT (backface-culled from below) far beyond the 0.1-yd overlap before it has fallen the few cm
+/// to the voxel plane, and finds nothing: the sky showed through as a dashed hairline along the
+/// carve's outer edge (owner, Northshire 2026-10-23). The curtain closes that slit; it sits under
+/// the kept ground and faces the carve, so it is only ever seen edge-on.
+pub const CARVE_SKIRT: f32 = 0.3;
+
+/// Hang a `depth`-yd vertical curtain under every BOUNDARY edge of `chunk` (an edge only one kept
+/// triangle uses) whose open side lies in the carve (`carved(x, y)`, tested just past the edge's
+/// midpoint) — the cut edges, not the chunk's outer border or an original MCNK hole. Each curtain
+/// quad copies its edge's normals and chunk UVs (it shades like the ground it hangs from) and
+/// faces the carve: its winding is the kept triangle's folded down about the edge, reversed.
+pub fn add_carve_skirts(chunk: &mut ChunkMesh, carved: impl Fn(f32, f32) -> bool, depth: f32) {
+    let np = chunk.positions.len();
+    let key = |p: [f32; 3]| [p[0].to_bits(), p[1].to_bits(), p[2].to_bits()];
+    let ekey = |a: [f32; 3], b: [f32; 3]| {
+        let (ka, kb) = (key(a), key(b));
+        if ka <= kb {
+            (ka, kb)
+        } else {
+            (kb, ka)
+        }
+    };
+    let tris: Vec<[u32; 3]> = chunk
+        .indices
+        .as_chunks::<3>()
+        .0
+        .iter()
+        .copied()
+        .filter(|t| t.iter().all(|&i| (i as usize) < np))
+        .collect();
+    let mut uses: std::collections::HashMap<([u32; 3], [u32; 3]), u32> =
+        std::collections::HashMap::new();
+    for t in &tris {
+        for k in 0..3 {
+            let (a, b) = (
+                chunk.positions[t[k] as usize],
+                chunk.positions[t[(k + 1) % 3] as usize],
+            );
+            *uses.entry(ekey(a, b)).or_default() += 1;
+        }
+    }
+    let has_n = chunk.normals.len() == np;
+    let has_uv = chunk.uvs.len() == np;
+    // One lowered copy per skirted vertex, so adjacent curtain quads share their verticals.
+    let mut low: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
+    let mut new_idx: Vec<u32> = Vec::new();
+    for t in &tris {
+        for k in 0..3 {
+            let (ia, ib, ic) = (t[k], t[(k + 1) % 3], t[(k + 2) % 3]);
+            let (a, b, c) = (
+                chunk.positions[ia as usize],
+                chunk.positions[ib as usize],
+                chunk.positions[ic as usize],
+            );
+            if uses.get(&ekey(a, b)).copied() != Some(1) {
+                continue;
+            }
+            // The open side: perpendicular to a→b in XY, away from the third vertex.
+            let (ex, ey) = (b[0] - a[0], b[1] - a[1]);
+            let len = (ex * ex + ey * ey).sqrt();
+            if len < 1.0e-4 {
+                continue;
+            }
+            let (mut nx, mut ny) = (-ey / len, ex / len);
+            let (mx, my) = ((a[0] + b[0]) * 0.5, (a[1] + b[1]) * 0.5);
+            if nx * (c[0] - mx) + ny * (c[1] - my) > 0.0 {
+                (nx, ny) = (-nx, -ny);
+            }
+            const PROBE: f32 = 0.05;
+            if !carved(mx + nx * PROBE, my + ny * PROBE) {
+                continue;
+            }
+            let mut lower = |i: u32| -> u32 {
+                *low.entry(i).or_insert_with(|| {
+                    let p = chunk.positions[i as usize];
+                    chunk.positions.push([p[0], p[1], p[2] - depth]);
+                    if has_n {
+                        let n = chunk.normals[i as usize];
+                        chunk.normals.push(n);
+                    }
+                    if has_uv {
+                        let uv = chunk.uvs[i as usize];
+                        chunk.uvs.push(uv);
+                    }
+                    (chunk.positions.len() - 1) as u32
+                })
+            };
+            let (la, lb) = (lower(ia), lower(ib));
+            // The kept triangle (a, b, c) folded down about a–b would face the KEPT side; the
+            // curtain faces the carve, so it runs b → a.
+            new_idx.extend_from_slice(&[ib, ia, la, ib, la, lb]);
+        }
+    }
+    chunk.indices.extend(new_idx);
 }
 
 /// One clip-space vertex: everything a `ChunkMesh` stores per vertex.
@@ -751,5 +983,211 @@ mod tests {
             );
         }
         assert_eq!(carve.columns(), 3);
+    }
+
+    /// The first FRONT-facing hit of a ray on a mesh (`up` = the sign of a top triangle's normal Z,
+    /// so a top faces up), or `None`. Möller–Trumbore.
+    fn ray_hits_front(c: &ChunkMesh, o: [f32; 3], d: [f32; 3], up: f32) -> Option<f32> {
+        let sub = |a: [f32; 3], b: [f32; 3]| [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
+        let crs = |a: [f32; 3], b: [f32; 3]| {
+            [
+                a[1] * b[2] - a[2] * b[1],
+                a[2] * b[0] - a[0] * b[2],
+                a[0] * b[1] - a[1] * b[0],
+            ]
+        };
+        let dot = |a: [f32; 3], b: [f32; 3]| a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+        let mut best: Option<f32> = None;
+        for t in tris(c) {
+            let (e1, e2) = (sub(t[1], t[0]), sub(t[2], t[0]));
+            if dot(d, crs(e1, e2)) * up >= 0.0 {
+                continue; // back-facing (culled)
+            }
+            let pv = crs(d, e2);
+            let det = dot(e1, pv);
+            if det.abs() < 1.0e-12 {
+                continue;
+            }
+            let tv = sub(o, t[0]);
+            let u = dot(tv, pv) / det;
+            let qv = crs(tv, e1);
+            let v = dot(d, qv) / det;
+            let s = dot(e2, qv) / det;
+            if u >= -1.0e-6 && v >= -1.0e-6 && u + v <= 1.0 + 1.0e-6 && s > 0.0 {
+                best = Some(best.map_or(s, |b: f32| b.min(s)));
+            }
+        }
+        best
+    }
+
+    /// MONKEY (voxel fix, owner's Northshire hairline): a GRAZING look from inside the carve
+    /// across its cut edge must land on ground. The voxel layer lies ~0.02 yd UNDER the real ground
+    /// (drawn `RENDER_DROP` below its seed) and its unedited fragments end 0.1 yd past the carve
+    /// region, so a ray that clears the voxel top enters the slit under the cut ADT edge and —
+    /// with the plain clip — met nothing for metres: sky through a dashed line. The drawn clip
+    /// hangs a curtain there; the collider's plain clip keeps the slit (documented below).
+    #[cfg(feature = "voxel")]
+    #[test]
+    fn grazing_rays_across_the_cut_edge_hit_ground() {
+        use benilla_voxel::world::{BAND_DISCARD, RENDER_DROP, SEED_LIFT};
+        // Column (5,5) alone: carve region X/Y [80.5, 95.5], wholly inside the flat chunk
+        // ([66.67, 100], ground z = 5).
+        let carve = VoxelCarve::from_columns([(5, 5)], 16.0, 0.5);
+        let src = flat_chunk(0);
+        let plain = carve.clip_chunk(&src).expect("reaches");
+        let drawn = carve.clip_chunk_drawn(&src).expect("reaches");
+        let up = {
+            let t = tris(&src)[0];
+            tri_area(&t).signum()
+        };
+        let r = carve.rects()[0];
+        // The voxel's untouched top: the seed RENDER_DROP lower, kept to BAND_DISCARD past the region.
+        let vz = 5.0 + SEED_LIFT - RENDER_DROP;
+        assert!(vz < 5.0, "the voxel is drawn under the real ground");
+        let voxel_hit = |o: [f32; 3], d: [f32; 3]| {
+            let s = (vz - o[2]) / d[2];
+            let (x, y) = (o[0] + d[0] * s, o[1] + d[1] * s);
+            let b = BAND_DISCARD;
+            (s > 0.0 && x > r.x0 - b && x < r.x1 + b && y > r.y0 - b && y < r.y1 + b).then_some(s)
+        };
+        let mut plain_misses = 0;
+        let mut rays = 0;
+        // Rays from 3 yd inside each side, outward, falling so they cross the edge midway
+        // between the voxel top and the real ground (a 0.25° grazing look).
+        let slope = 0.25f32.to_radians().tan();
+        for side in 0..4 {
+            for k in 1..8 {
+                let f = k as f32 / 8.0;
+                let along = |lo: f32, hi: f32| lo + (hi - lo) * f;
+                let (edge, dir): ([f32; 2], [f32; 2]) = match side {
+                    0 => ([r.x0, along(r.y0, r.y1)], [-1.0, 0.0]),
+                    1 => ([r.x1, along(r.y0, r.y1)], [1.0, 0.0]),
+                    2 => ([along(r.x0, r.x1), r.y0], [0.0, -1.0]),
+                    _ => ([along(r.x0, r.x1), r.y1], [0.0, 1.0]),
+                };
+                let z_edge = (vz + 5.0) * 0.5;
+                let o = [
+                    edge[0] - dir[0] * 3.0,
+                    edge[1] - dir[1] * 3.0,
+                    z_edge + slope * 3.0,
+                ];
+                let n = (1.0 + slope * slope).sqrt();
+                let d = [dir[0] / n, dir[1] / n, -slope / n];
+                rays += 1;
+                let hit = |m: &ChunkMesh| {
+                    let a = ray_hits_front(m, o, d, up);
+                    let b = voxel_hit(o, d);
+                    match (a, b) {
+                        (Some(a), Some(b)) => Some(a.min(b)),
+                        (a, b) => a.or(b),
+                    }
+                };
+                // The hit must be at the edge, not metres beyond it (a 3-yd run-up + the slit).
+                let h = hit(&drawn);
+                assert!(
+                    h.is_some_and(|s| s < 3.0 + 0.2),
+                    "side {side} ray {k}: grazing look across the cut edge hits {h:?} (sky)"
+                );
+                if hit(&plain).is_none_or(|s| s > 3.0 + 0.2) {
+                    plain_misses += 1;
+                }
+            }
+        }
+        assert_eq!(plain_misses, rays, "the plain clip's slit (the bug this guards)");
+        // The curtain runs exactly along the region's perimeter, 0.3 yd deep (no curtain on the
+        // chunk's own border or anywhere else).
+        let vert_area: f32 = tris(&drawn)
+            .iter()
+            .filter(|t| tri_area(t).abs() < 1.0e-6)
+            .map(|t| {
+                let (e1, e2) = (
+                    [t[1][0] - t[0][0], t[1][1] - t[0][1], t[1][2] - t[0][2]],
+                    [t[2][0] - t[0][0], t[2][1] - t[0][1], t[2][2] - t[0][2]],
+                );
+                let c = [
+                    e1[1] * e2[2] - e1[2] * e2[1],
+                    e1[2] * e2[0] - e1[0] * e2[2],
+                    e1[0] * e2[1] - e1[1] * e2[0],
+                ];
+                0.5 * (c[0] * c[0] + c[1] * c[1] + c[2] * c[2]).sqrt()
+            })
+            .sum();
+        let perimeter = 2.0 * ((r.x1 - r.x0) + (r.y1 - r.y0));
+        assert!(
+            (vert_area - perimeter * CARVE_SKIRT).abs() < 1.0e-2,
+            "curtain area {vert_area} vs {}",
+            perimeter * CARVE_SKIRT
+        );
+        // Every drawn vertex keeps its attributes.
+        assert_eq!(drawn.normals.len(), drawn.positions.len());
+        assert_eq!(drawn.uvs.len(), drawn.positions.len());
+    }
+
+    /// MONKEY (voxel fix): the clipped chunk is watertight — no vertex lies strictly inside a kept
+    /// edge (a T-junction: hairline pinholes past every rectangle corner, where a cut line ran on
+    /// across the straddling triangle), for a lone rect, the L-shaped union and its notch.
+    #[test]
+    fn clipped_chunk_has_no_t_junctions() {
+        let check = |c: &ChunkMesh, what: &str| {
+            for t in tris(c) {
+                for k in 0..3 {
+                    let (a, b) = (t[k], t[(k + 1) % 3]);
+                    let (ex, ey) = (b[0] - a[0], b[1] - a[1]);
+                    let l2 = ex * ex + ey * ey;
+                    for p in &c.positions {
+                        if *p == a || *p == b {
+                            continue;
+                        }
+                        let (px, py) = (p[0] - a[0], p[1] - a[1]);
+                        let s = (px * ex + py * ey) / l2;
+                        let off = (px * ey - py * ex).abs() / l2.sqrt();
+                        let used = tris(c).iter().any(|u| u.contains(p));
+                        assert!(
+                            !(used && s > 1.0e-4 && s < 1.0 - 1.0e-4 && off < 1.0e-4),
+                            "{what}: vertex {p:?} splits edge {a:?}-{b:?} (T-junction)"
+                        );
+                    }
+                }
+            }
+        };
+        let carve = VoxelCarve::from_columns([(5, 5)], 16.0, 0.5);
+        check(&carve.clip_chunk(&flat_chunk(0)).unwrap(), "lone column");
+        check(&l_carve().clip_chunk(&flat_chunk(0)).unwrap(), "L union");
+        let one = VoxelCarve::from_columns([(4, 4)], 16.0, 0.5);
+        check(&one.clip_chunk(&flat_chunk(0)).unwrap(), "corner column");
+        // Re-fanning keeps exactly the kept area and the winding.
+        let src = flat_chunk(0);
+        let c = carve.clip_chunk(&src).unwrap();
+        let r = carve.rects()[0];
+        let full: f32 = tris(&src).iter().map(|t| tri_area(t).abs()).sum();
+        let kept: f32 = tris(&c).iter().map(|t| tri_area(t).abs()).sum();
+        let hole = (r.x1 - r.x0) * (r.y1 - r.y0);
+        assert!((kept - (full - hole)).abs() < 1.0e-2, "kept {kept} vs {}", full - hole);
+        let sign = tri_area(&tris(&src)[0]).signum();
+        for t in tris(&c) {
+            assert_eq!(tri_area(&t).signum(), sign, "flipped {t:?}");
+        }
+    }
+
+    /// The curtain also hangs on a carve that crosses the chunk's border (only the cut edges, not
+    /// the chunk border inside the carve) and not along an original MCNK hole.
+    #[test]
+    fn curtain_only_on_cut_edges() {
+        let r = rect();
+        let carve = VoxelCarve::from_columns([], 16.0, 0.5);
+        assert!(carve.clip_chunk_drawn(&flat_chunk(0)).is_none());
+        let holes = 1u16; // block 0 (NW corner), far from the rect
+        let mut c = clip_chunk_outside_rect(&flat_chunk(holes), &r).expect("overlaps");
+        let n0 = c.indices.len();
+        add_carve_skirts(&mut c, |x, y| r.contains_strict(x, y), CARVE_SKIRT);
+        let walls: Vec<_> = tris(&c).into_iter().skip(n0 / 3).collect();
+        assert!(!walls.is_empty());
+        for t in &walls {
+            for p in t {
+                // On the rect's x1 or y1 line (its x0 / y0 sides lie past the chunk).
+                let on = (p[0] - r.x1).abs() < 1.0e-4 || (p[1] - r.y1).abs() < 1.0e-4;
+                assert!(on, "curtain vertex {p:?} off the cut edges");
+            }
+        }
     }
 }

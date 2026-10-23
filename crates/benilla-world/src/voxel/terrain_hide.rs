@@ -210,7 +210,12 @@ fn rebuild_cell_mesh(adt: &AdtTile, cell: usize, carve: Option<&VoxelCarve>) -> 
             let (Some(shading), Some(chunk)) = (adt.shading.get(ci), adt.chunks.get(ci)) else {
                 continue;
             };
-            parts.push((clipped(chunk, carve), shading));
+            // MONKEY (voxel fix): drawn with the curtain under the cut edges (CARVE_SKIRT).
+            let drawn = match carve.and_then(|c| c.clip_chunk_drawn(chunk)) {
+                Some(c) => Cow::Owned(c),
+                None => Cow::Borrowed(chunk),
+            };
+            parts.push((drawn, shading));
         }
     }
     let refs: Vec<(&ChunkMesh, &ChunkShading)> = parts.iter().map(|(c, s)| (&**c, *s)).collect();
@@ -237,8 +242,9 @@ fn swap_cell(
     let Some(mesh) = rebuild_cell_mesh(adt, cell, carve) else {
         return false;
     };
-    // Clipping only removes area (every appended vertex lies on an original triangle), so the
-    // clipped mesh stays inside the original bounds and the entity's cull Aabb stays valid.
+    // Clipping only removes area (every appended vertex lies on an original triangle); only the
+    // cut-edge curtain (`CARVE_SKIRT`, 0.3 yd) may reach under the original bounds' floor, and it
+    // is only seen together with the ground above it, so the entity's cull Aabb stays valid.
     let _ = meshes.insert(&mesh3d.0, mesh);
     true
 }
