@@ -10,6 +10,9 @@
 //! - MONKEY (voxel) v3 (CONTRACT §7, §9): HELLO offers version 3 (`10 03`); an ACK of 3 selects the
 //!   27-byte EDIT3 uplink (`02…`, + stroke + param) and the 35-byte `e` record (+ stroke, param,
 //!   actor guid); an ACK of 2 keeps the v2 wire. Reject reason 6 = stroke.
+//! - MONKEY (EME) v3 overlays (CONTRACT §9.1, §11.3): uplink `0x12 OSYNC` (5 + 10·n bytes, per layer);
+//!   downlink `L` liquid cell (24), `A` area cell (19), `O` overlay region done (15), `Z` overlay
+//!   region reset (10).
 
 use crate::world::{VoxelEditOp, EDIT3_WIRE_LEN, EDIT_WIRE_LEN};
 
@@ -26,6 +29,14 @@ pub const CLIENT_VERSION_V3: u8 = 3;
 pub const EDIT3_RECORD_LEN: usize = 35;
 /// Max SYNC entries per command (CONTRACT §3).
 pub const SYNC_MAX_ENTRIES: usize = 12;
+/// MONKEY (EME): bytes of the `L` record (CONTRACT §11.3).
+pub const LIQUID_RECORD_LEN: usize = 24;
+/// MONKEY (EME): bytes of the `A` record.
+pub const AREA_RECORD_LEN: usize = 19;
+/// MONKEY (EME): bytes of the `O` record.
+pub const OVERLAY_DONE_LEN: usize = 15;
+/// MONKEY (EME): bytes of the `Z` record.
+pub const OVERLAY_RESET_LEN: usize = 10;
 
 /// One SYNC entry: a region and the client's persisted sync point.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -59,6 +70,45 @@ pub enum ServerRecord {
     Reset { map: u16, rx: i16, ry: i16, epoch: u16 },
     /// `R`: our EDIT `nonce` was refused (1 rank, 2 range, 3 rate, 4 invalid, 5 map, 6 stroke).
     Reject { nonce: u16, reason: u8 },
+    /// MONKEY (EME): `L` — one liquid overlay cell (liquid-layer `seq`).
+    Liquid {
+        seq: u32,
+        stroke: u16,
+        map: u16,
+        cx: i16,
+        cy: i16,
+        cell: crate::overlay::LiquidCell,
+        actor: u32,
+    },
+    /// MONKEY (EME): `A` — one area overlay cell (area-layer `seq`; `area_id` 0 = override removed).
+    Area {
+        seq: u32,
+        stroke: u16,
+        map: u16,
+        ax: i16,
+        ay: i16,
+        area_id: u16,
+        actor: u32,
+    },
+    /// MONKEY (EME): `O` — an overlay region's sync point (`layer` 1 liquid, 2 area).
+    OverlayDone {
+        layer: u8,
+        map: u16,
+        rx: i16,
+        ry: i16,
+        epoch: u16,
+        last_seq: u32,
+        more: bool,
+    },
+    /// MONKEY (EME): `Z` — an overlay region was reverted: drop that layer's cells there, adopt
+    /// `epoch`, re-OSYNC from 0.
+    OverlayReset {
+        layer: u8,
+        map: u16,
+        rx: i16,
+        ry: i16,
+        epoch: u16,
+    },
 }
 
 /// Why a whisper payload could not be decoded.
@@ -72,6 +122,8 @@ pub enum WireError {
     Truncated,
     /// An `E` whose body is not a sane edit (NaN, radius out of range, …).
     BadEdit,
+    /// MONKEY (EME): an `L` with a non-finite level, or an `O` / `Z` with an unknown layer.
+    BadOverlay,
 }
 
 /// The human reason of an `R` code.
@@ -145,6 +197,32 @@ pub fn sync_commands(map: u16, entries: &[SyncEntry]) -> Vec<String> {
         .collect()
 }
 
+/// MONKEY (EME): the OSYNC body (`0x12`, CONTRACT §9.1) for ≤ 12 entries of one layer: `op, layer,
+/// map u16, count u8, count × (rx, ry, epoch, after_seq)` = 5 + 10·n bytes.
+pub fn osync_body(layer: u8, map: u16, entries: &[SyncEntry]) -> Vec<u8> {
+    debug_assert!(!entries.is_empty() && entries.len() <= SYNC_MAX_ENTRIES);
+    let mut b = Vec::with_capacity(5 + 10 * entries.len());
+    b.push(0x12);
+    b.push(layer);
+    b.extend_from_slice(&map.to_le_bytes());
+    b.push(entries.len() as u8);
+    for e in entries {
+        b.extend_from_slice(&e.rx.to_le_bytes());
+        b.extend_from_slice(&e.ry.to_le_bytes());
+        b.extend_from_slice(&e.epoch.to_le_bytes());
+        b.extend_from_slice(&e.after_seq.to_le_bytes());
+    }
+    b
+}
+
+/// MONKEY (EME): the `.mvox 12…` commands for any number of entries of one layer, ≤ 12 each.
+pub fn osync_commands(layer: u8, map: u16, entries: &[SyncEntry]) -> Vec<String> {
+    entries
+        .chunks(SYNC_MAX_ENTRIES)
+        .map(|c| format!("{MVOX_COMMAND} {}", to_hex(&osync_body(layer, map, c))))
+        .collect()
+}
+
 /// The hex payload of a `MONKEYVOXEL` addon whisper (`prefix TAB hex`), else `None`.
 pub fn server_payload(text: &str) -> Option<&str> {
     text.strip_prefix(SERVER_PREFIX)?.strip_prefix('\t')
@@ -171,6 +249,10 @@ pub fn decode_records(hex: &str) -> (Vec<ServerRecord>, Option<WireError>) {
             b'X' => 9,
             b'R' => 4,
             b'e' => EDIT3_RECORD_LEN,
+            b'L' => LIQUID_RECORD_LEN,
+            b'A' => AREA_RECORD_LEN,
+            b'O' => OVERLAY_DONE_LEN,
+            b'Z' => OVERLAY_RESET_LEN,
             other => return (out, Some(WireError::UnknownType(other))),
         };
         if o + len > b.len() {
@@ -224,6 +306,60 @@ pub fn decode_records(hex: &str) -> (Vec<ServerRecord>, Option<WireError>) {
                 ry: i16_at(o + 5),
                 epoch: u16_at(o + 7),
             },
+            b'L' => {
+                let level = f32::from_bits(u32_at(o + 14));
+                if !level.is_finite() {
+                    return (out, Some(WireError::BadOverlay));
+                }
+                ServerRecord::Liquid {
+                    seq: u32_at(o + 1),
+                    stroke: u16_at(o + 5),
+                    map: u16_at(o + 7),
+                    cx: i16_at(o + 9),
+                    cy: i16_at(o + 11),
+                    cell: crate::overlay::LiquidCell {
+                        kind: b[o + 13],
+                        level,
+                        flags: b[o + 18],
+                        fade: b[o + 19],
+                    },
+                    actor: u32_at(o + 20),
+                }
+            }
+            b'A' => ServerRecord::Area {
+                seq: u32_at(o + 1),
+                stroke: u16_at(o + 5),
+                map: u16_at(o + 7),
+                ax: i16_at(o + 9),
+                ay: i16_at(o + 11),
+                area_id: u16_at(o + 13),
+                actor: u32_at(o + 15),
+            },
+            b'O' | b'Z' => {
+                let layer = b[o + 1];
+                if layer != crate::overlay::LAYER_LIQUID && layer != crate::overlay::LAYER_AREA {
+                    return (out, Some(WireError::BadOverlay));
+                }
+                if t == b'O' {
+                    ServerRecord::OverlayDone {
+                        layer,
+                        map: u16_at(o + 2),
+                        rx: i16_at(o + 4),
+                        ry: i16_at(o + 6),
+                        epoch: u16_at(o + 8),
+                        last_seq: u32_at(o + 10),
+                        more: b[o + 14] != 0,
+                    }
+                } else {
+                    ServerRecord::OverlayReset {
+                        layer,
+                        map: u16_at(o + 2),
+                        rx: i16_at(o + 4),
+                        ry: i16_at(o + 6),
+                        epoch: u16_at(o + 8),
+                    }
+                }
+            }
             _ => ServerRecord::Reject {
                 nonce: u16_at(o + 1),
                 reason: b[o + 3],
@@ -278,6 +414,77 @@ pub fn encode_record(r: &ServerRecord) -> Vec<u8> {
             b.push(b'R');
             b.extend_from_slice(&nonce.to_le_bytes());
             b.push(reason);
+        }
+        ServerRecord::Liquid {
+            seq,
+            stroke,
+            map,
+            cx,
+            cy,
+            cell,
+            actor,
+        } => {
+            b.push(b'L');
+            b.extend_from_slice(&seq.to_le_bytes());
+            b.extend_from_slice(&stroke.to_le_bytes());
+            b.extend_from_slice(&map.to_le_bytes());
+            b.extend_from_slice(&cx.to_le_bytes());
+            b.extend_from_slice(&cy.to_le_bytes());
+            b.push(cell.kind);
+            b.extend_from_slice(&cell.level.to_le_bytes());
+            b.push(cell.flags);
+            b.push(cell.fade);
+            b.extend_from_slice(&actor.to_le_bytes());
+        }
+        ServerRecord::Area {
+            seq,
+            stroke,
+            map,
+            ax,
+            ay,
+            area_id,
+            actor,
+        } => {
+            b.push(b'A');
+            b.extend_from_slice(&seq.to_le_bytes());
+            b.extend_from_slice(&stroke.to_le_bytes());
+            b.extend_from_slice(&map.to_le_bytes());
+            b.extend_from_slice(&ax.to_le_bytes());
+            b.extend_from_slice(&ay.to_le_bytes());
+            b.extend_from_slice(&area_id.to_le_bytes());
+            b.extend_from_slice(&actor.to_le_bytes());
+        }
+        ServerRecord::OverlayDone {
+            layer,
+            map,
+            rx,
+            ry,
+            epoch,
+            last_seq,
+            more,
+        } => {
+            b.push(b'O');
+            b.push(layer);
+            b.extend_from_slice(&map.to_le_bytes());
+            b.extend_from_slice(&rx.to_le_bytes());
+            b.extend_from_slice(&ry.to_le_bytes());
+            b.extend_from_slice(&epoch.to_le_bytes());
+            b.extend_from_slice(&last_seq.to_le_bytes());
+            b.push(more as u8);
+        }
+        ServerRecord::OverlayReset {
+            layer,
+            map,
+            rx,
+            ry,
+            epoch,
+        } => {
+            b.push(b'Z');
+            b.push(layer);
+            b.extend_from_slice(&map.to_le_bytes());
+            b.extend_from_slice(&rx.to_le_bytes());
+            b.extend_from_slice(&ry.to_le_bytes());
+            b.extend_from_slice(&epoch.to_le_bytes());
         }
     }
     b
@@ -445,7 +652,8 @@ mod tests {
         assert_eq!(err, Some(WireError::Truncated));
         assert_eq!(part.len(), 4);
         assert_eq!(decode_records("zz").1, Some(WireError::BadHex));
-        assert_eq!(decode_records("4100").1, Some(WireError::UnknownType(b'A')));
+        assert_eq!(decode_records("7100").1, Some(WireError::UnknownType(b'q')));
+        assert_eq!(decode_records("4100").1, Some(WireError::Truncated), "A = v3 area record");
     }
 
     #[test]
@@ -524,5 +732,108 @@ mod tests {
         let mut relayed = p;
         relayed.local = false; // not our prediction
         assert!(!is_echo_of(&s, &relayed));
+    }
+
+    /// MONKEY (EME): the CONTRACT §11.3 overlay vectors, byte for byte.
+    #[test]
+    fn overlay_records_match_the_contract_vectors() {
+        use crate::overlay::{LiquidCell, LAYER_AREA, LAYER_LIQUID};
+        // Copied verbatim from CONTRACT §11.3.
+        let l = "4c 05000000 0300 0000 6400 ecff 01 00004841 00 28 2a000000".replace(' ', "");
+        assert_eq!(l.len(), LIQUID_RECORD_LEN * 2);
+        let want_l = ServerRecord::Liquid {
+            seq: 5,
+            stroke: 3,
+            map: 0,
+            cx: 100,
+            cy: -20,
+            cell: LiquidCell {
+                kind: 1,
+                level: 12.5,
+                flags: 0,
+                fade: 40,
+            },
+            actor: 42,
+        };
+        let a = "41 06000000 0300 0000 0a00 f6ff 4a00 2a000000".replace(' ', "");
+        assert_eq!(a.len(), AREA_RECORD_LEN * 2);
+        let want_a = ServerRecord::Area {
+            seq: 6,
+            stroke: 3,
+            map: 0,
+            ax: 10,
+            ay: -10,
+            area_id: 74,
+            actor: 42,
+        };
+        let (r, err) = decode_records(&format!("{l}{a}"));
+        assert_eq!(err, None);
+        assert_eq!(r, vec![want_l, want_a]);
+        assert_eq!(encode_records_hex(&r), format!("{l}{a}"));
+        // O / Z mixed with voxel records round-trip.
+        let recs = [
+            ServerRecord::OverlayReset {
+                layer: LAYER_LIQUID,
+                map: 0,
+                rx: -141,
+                ry: -2,
+                epoch: 1,
+            },
+            want_l,
+            ServerRecord::OverlayDone {
+                layer: LAYER_AREA,
+                map: 1,
+                rx: -140,
+                ry: -2,
+                epoch: 0,
+                last_seq: 1,
+                more: true,
+            },
+            ServerRecord::Hello { version: 3 },
+        ];
+        let hex = encode_records_hex(&recs);
+        assert_eq!(hex.len(), 2 * (10 + 24 + 15 + 2));
+        let (back, err) = decode_records(&hex);
+        assert_eq!(err, None);
+        assert_eq!(back, recs.to_vec());
+        // The Lua RecOverlayDone shape: O layer 2, map 0, (-140, -2), epoch 0, last 1, more 0.
+        let (r, _) = decode_records("4f02000074fffeff00000100000000");
+        assert_eq!(
+            r,
+            vec![ServerRecord::OverlayDone {
+                layer: 2,
+                map: 0,
+                rx: -140,
+                ry: -2,
+                epoch: 0,
+                last_seq: 1,
+                more: false
+            }]
+        );
+        // A NaN level / an unknown layer are bad records (the ones before them survive).
+        let nan = "4c 05000000 0300 0000 6400 ecff 01 0000c07f 00 28 2a000000".replace(' ', "");
+        assert_eq!(decode_records(&nan).1, Some(WireError::BadOverlay));
+        let (r, err) = decode_records("48035a070000000000000000");
+        assert_eq!(r, vec![ServerRecord::Hello { version: 3 }]);
+        assert_eq!(err, Some(WireError::BadOverlay));
+    }
+
+    /// MONKEY (EME): the CONTRACT §9.1 OSYNC example and batching.
+    #[test]
+    fn osync_matches_the_contract_vector() {
+        let e = SyncEntry {
+            rx: -141,
+            ry: -2,
+            epoch: 0,
+            after_seq: 0,
+        };
+        let want = "12 01 0000 01 73ff feff 0000 00000000".replace(' ', "");
+        assert_eq!(to_hex(&osync_body(1, 0, &[e])), want);
+        assert_eq!(osync_commands(1, 0, &[e]), vec![format!(".mvox {want}")]);
+        let many: Vec<SyncEntry> = (0..13).map(|i| SyncEntry { rx: i, ..e }).collect();
+        let cmds = osync_commands(2, 1, &many);
+        assert_eq!(cmds.len(), 2);
+        assert!(cmds[0].starts_with(".mvox 120201000c"), "{}", cmds[0]);
+        assert!(cmds[1].starts_with(".mvox 1202010001"), "{}", cmds[1]);
     }
 }

@@ -18,6 +18,8 @@
 
 // MONKEY (voxel): the v2 world voxel layer (sparse world-aligned chunks, seed, journal v2).
 pub mod wire;
+// MONKEY (EME): the v3 overlay layers (liquid + area cells, CONTRACT §11).
+pub mod overlay;
 pub mod world;
 
 use fast_surface_nets::ndshape::{ConstShape, ConstShape3u32};
