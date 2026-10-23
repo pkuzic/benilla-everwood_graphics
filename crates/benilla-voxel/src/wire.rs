@@ -215,10 +215,16 @@ pub fn osync_body(layer: u8, map: u16, entries: &[SyncEntry]) -> Vec<u8> {
     b
 }
 
-/// MONKEY (EME): the `.mvox 12…` commands for any number of entries of one layer, ≤ 12 each.
+/// MONKEY (EME): OSYNC entries per command. CONTRACT §9.1 allows 12, but 12 entries are
+/// 5 + 120 = 125 bytes = `.mvox ` + 250 hex = 256 chars, ONE over the 255-char chat line the core
+/// accepts (`sent a chatmessage with an invalid link`, dropped): 11 keeps it at 236.
+pub const OSYNC_MAX_ENTRIES: usize = 11;
+
+/// MONKEY (EME): the `.mvox 12…` commands for any number of entries of one layer, ≤
+/// [`OSYNC_MAX_ENTRIES`] each.
 pub fn osync_commands(layer: u8, map: u16, entries: &[SyncEntry]) -> Vec<String> {
     entries
-        .chunks(SYNC_MAX_ENTRIES)
+        .chunks(OSYNC_MAX_ENTRIES)
         .map(|c| format!("{MVOX_COMMAND} {}", to_hex(&osync_body(layer, map, c))))
         .collect()
 }
@@ -833,7 +839,10 @@ mod tests {
         let many: Vec<SyncEntry> = (0..13).map(|i| SyncEntry { rx: i, ..e }).collect();
         let cmds = osync_commands(2, 1, &many);
         assert_eq!(cmds.len(), 2);
-        assert!(cmds[0].starts_with(".mvox 120201000c"), "{}", cmds[0]);
-        assert!(cmds[1].starts_with(".mvox 1202010001"), "{}", cmds[1]);
+        assert!(cmds[0].starts_with(".mvox 120201000b"), "{}", cmds[0]);
+        assert!(cmds[1].starts_with(".mvox 1202010002"), "{}", cmds[1]);
+        // Every line fits the core's 255-char chat limit (12 entries would be 256).
+        assert!(cmds.iter().all(|c| c.len() <= 255));
+        assert_eq!(cmds[0].len(), 6 + 2 * (5 + 10 * 11));
     }
 }

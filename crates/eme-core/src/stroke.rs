@@ -106,6 +106,16 @@ impl EmeStrokeIds {
         prev.max(1)
     }
 
+    /// MONKEY (EME): make the next id come after `last` (the newest own stroke id the server knows,
+    /// from a `strokes` reply after a relog); never moves the counter backwards. The server refuses a
+    /// closed id of an earlier session (`R 6` / `err:"stroke"`, CONTRACT §9.4).
+    pub fn ensure_after(&self, last: u16) {
+        let want = if last == u16::MAX { 1 } else { last + 1 };
+        let _ = self
+            .0
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |s| (s < want).then_some(want));
+    }
+
     /// The id the next call returns.
     pub fn peek(&self) -> u16 {
         self.0.load(Ordering::Relaxed).max(1)

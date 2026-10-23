@@ -110,6 +110,32 @@ fn pump(
         info!("EME: link {link:?}");
     }
     for r in &out.replies {
+        // MONKEY (EME): seed the stroke ids past this character's newest server-side stroke, so a
+        // relogged editor never reuses a closed id (the server refuses it: `R 6` / `err:"stroke"`).
+        if r.op == "strokes" && r.tool.is_none() && host.strokes_seeded == 1 {
+            host.strokes_seeded = 2;
+            let newest = r
+                .reply
+                .extra
+                .get("rows")
+                .and_then(|v| v.as_array())
+                .and_then(|rows| {
+                    rows.iter()
+                        .filter_map(|row| row.get("stroke")?.as_u64())
+                        .filter(|&n| (1..=u64::from(u16::MAX)).contains(&n))
+                        .map(|n| n as u16)
+                        .max()
+                });
+            if let Some(last) = newest {
+                host.stroke_ids.ensure_after(last);
+            }
+            info!(
+                "EME: stroke ids seeded past {newest:?} (next {})",
+                host.stroke_ids.peek()
+            );
+        } else if r.op != "caps" && !r.reply.ok {
+            info!("EME: {} refused: {:?}", r.op, r.reply.err);
+        }
         if r.op == "caps" {
             match host.dispatcher.caps() {
                 Some(c) if r.reply.ok => info!(
@@ -123,12 +149,35 @@ fn pump(
     host.replies = out.replies;
     if wire.link.is_usable() && !host.caps_asked {
         host.caps_asked = host.dispatcher.request_caps(now, &mut *wire).is_ok();
+        host.strokes_seeded = 0;
+    }
+    // MONKEY (EME): once an editing rank is known, ask for the newest own stroke (seeds the ids).
+    if host.strokes_seeded == 0
+        && !wire.offline
+        && host.dispatcher.permissions().has(EmeCapability::Edit)
+    {
+        let req = EmeServiceRequest::Strokes {
+            scope: Some(eme_core::service::EmeStrokeScope::Mine),
+            radius: Some(500.0),
+            minutes: Some(10_080),
+            limit: Some(25),
+            before_sid: None,
+        };
+        if host.dispatcher.request(now, &mut *wire, None, req).is_ok() {
+            host.strokes_seeded = 1;
+        }
     }
     if active.0 && !host.dispatcher.permissions().can_open() {
         active.0 = false;
         info!("EME: closed — the server's rank no longer allows it");
     }
     for e in host.dispatcher.drain_events() {
+        if matches!(
+            e,
+            eme_core::EmeEvent::EntryDiscarded { .. } | eme_core::EmeEvent::RequestFailed { .. }
+        ) {
+            info!("EME: {e:?}");
+        }
         events.write(EmeEventMsg(e));
     }
 }

@@ -283,14 +283,15 @@ fn is_overlay_record(r: &ServerRecord) -> bool {
 }
 
 /// MONKEY (EME overlay): the OSYNC entries of one layer to send now (re-asks first, then unsynced
-/// regions near the player, nearest first, ≤ 12) — [`monkey_voxel_sync_batch`] for an overlay.
+/// regions near the player, nearest first, ≤ 11 so the line fits 255 chars) — [`monkey_voxel_sync_batch`] for an
+/// overlay.
 fn monkey_overlay_sync_batch(
     ol: &mut MonkeyOverlayLink,
     near: &[((i16, i16), f32)],
     sync_point: impl Fn((i16, i16)) -> RegionSync,
 ) -> Vec<SyncEntry> {
     let mut regs: Vec<(i16, i16)> = Vec::new();
-    while regs.len() < wire::SYNC_MAX_ENTRIES {
+    while regs.len() < wire::OSYNC_MAX_ENTRIES {
         let Some(r) = ol.again.pop_front() else {
             break;
         };
@@ -299,7 +300,7 @@ fn monkey_overlay_sync_batch(
         }
     }
     for (r, _) in near {
-        if regs.len() >= wire::SYNC_MAX_ENTRIES {
+        if regs.len() >= wire::OSYNC_MAX_ENTRIES {
             break;
         }
         if !ol.synced.contains(r) && !ol.inflight.contains_key(r) && !regs.contains(r) {
@@ -354,6 +355,7 @@ fn monkey_overlay_sync_slot(
             after.join(" ")
         );
         for c in wire::osync_commands(layer, map, &entries) {
+            debug_assert!(c.len() <= 255, "a chat line the core would refuse");
             say(commands, c);
         }
         return true;

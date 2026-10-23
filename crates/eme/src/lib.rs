@@ -88,6 +88,9 @@ pub struct EmeHost {
     /// Messages for the UI's notice line (locale key, args, is-error); drained by `ui`.
     pub(crate) notices: Vec<(String, Vec<String>, bool)>,
     pub(crate) caps_asked: bool,
+    /// MONKEY (EME): the `strokes` (mine) request that seeds [`Self::stroke_ids`] after a relog
+    /// is in flight / done.
+    pub(crate) strokes_seeded: u8,
 }
 
 impl Default for EmeHost {
@@ -100,6 +103,7 @@ impl Default for EmeHost {
             errors: Vec::new(),
             notices: Vec::new(),
             caps_asked: false,
+            strokes_seeded: 0,
         }
     }
 }
