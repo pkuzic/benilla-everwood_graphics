@@ -51,6 +51,17 @@ pub enum MonkeyVoxelEvent {
     /// `X` REGION-RESET: the region's journal was dropped and is being re-synced (an undo, a
     /// revert).
     RegionReset { map: u16, rx: i16, ry: i16, epoch: u16 },
+    /// A LIVE stroke edit by ANOTHER character (`actor` = their low GUID), arriving as it
+    /// happens (never a SYNC replay). EME lists these as read-only history rows.
+    Remote {
+        map: u16,
+        actor: u32,
+        stroke: u16,
+        mode: u8,
+        pos: [f32; 3],
+        radius: f32,
+        seq: u32,
+    },
 }
 
 /// A surface hit of [`MonkeyVoxelApi::aim`].

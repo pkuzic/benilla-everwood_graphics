@@ -128,6 +128,9 @@ pub enum MonkeyVoxelNetEvent {
     /// Drop our prediction `nonce` on `map` (an `R` reject, or a stale one the server never got).
     /// MONKEY (EME seam): `reason` = the `R` code, 0 = dropped client-side (stale / unsendable).
     DropLocal { map: u16, nonce: u16, reason: u8 },
+    /// MONKEY (EME): a live `e` by another character (`actor` = low GUID), announced after its
+    /// [`Self::Edit`]; becomes a [`MonkeyVoxelEvent::Remote`].
+    Remote { edit: VoxelEditOp, actor: u32 },
 }
 
 /// MONKEY (EME seam): an editor (EME) owns the brush input while this is set - the dev key brush
@@ -1194,6 +1197,7 @@ fn monkey_voxel_tile_materials(
                 layers: s.layers,
                 alpha: s.alpha,
                 shadow: s.shadow,
+                wall: material::monkey_voxel_wall_pick(&adt.layer_names, s.layers),
             }
         };
         let mut grid = [shade(any); 256];
@@ -1230,6 +1234,20 @@ fn monkey_voxel_tile_materials(
             );
             mats.real.insert(tile);
             info!("MONKEY (voxel): tile {tile:?} voxel material now wears the tile's real tileset.");
+            // Which layer each chunk's pit walls wear (by texture name; "(saturation)" = no
+            // earth-like layer, the shader's fallback rule).
+            let mut walls: std::collections::BTreeMap<String, u32> = Default::default();
+            for c in grid.iter() {
+                let n = usize::try_from(c.wall)
+                    .ok()
+                    .and_then(|i| adt.layer_names.get(i).cloned())
+                    .unwrap_or_else(|| "(saturation)".to_owned());
+                *walls.entry(n).or_default() += 1;
+            }
+            info!(
+                "MONKEY (voxel): tile {tile:?} layers {:?}; pit walls by chunk: {walls:?}",
+                adt.layer_names
+            );
         }
     }
 }
@@ -1706,6 +1724,17 @@ fn monkey_voxel_apply_inbox(
                 epoch,
                 last_seq,
             } => world.region_done(map, rx, ry, epoch, last_seq),
+            MonkeyVoxelNetEvent::Remote { edit, actor } => {
+                out.write(MonkeyVoxelEvent::Remote {
+                    map: edit.map,
+                    actor,
+                    stroke: edit.stroke,
+                    mode: edit.mode,
+                    pos: edit.pos,
+                    radius: edit.radius,
+                    seq: edit.seq.unwrap_or(0),
+                });
+            }
             MonkeyVoxelNetEvent::DropLocal { map, nonce, reason } => {
                 if let Some(e) = world.drop_local(map, nonce) {
                     out.write(MonkeyVoxelEvent::Dropped {

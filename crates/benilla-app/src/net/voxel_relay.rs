@@ -190,19 +190,21 @@ fn monkey_voxel_route(
             ServerRecord::Edit(_) | ServerRecord::Edit3 { .. } => {
                 // MONKEY (voxel): `E` (v2) confirms on the body; `e` (v3) also on stroke, param
                 // and the actor being this character.
-                let (e, own) = match r {
+                let (e, own, actor) = match r {
                     ServerRecord::Edit3 { edit, actor } => (
                         edit,
                         pending.iter().find(|p| {
                             !confirmed_now.contains(&p.nonce)
                                 && wire::is_echo_of3(&edit, actor, me, p)
                         }),
+                        Some(actor),
                     ),
                     ServerRecord::Edit(edit) => (
                         edit,
                         pending.iter().find(|p| {
                             !confirmed_now.contains(&p.nonce) && wire::is_echo_of(&edit, p)
                         }),
+                        None,
                     ),
                     _ => unreachable!(),
                 };
@@ -235,6 +237,13 @@ fn monkey_voxel_route(
                     }
                 } else if link.inflight.contains_key(&reg) {
                     link.sync_edits += 1;
+                }
+                // MONKEY (EME): a LIVE stroke edit by another character (not a SYNC replay) is
+                // announced, so an editor can list other GMs' strokes read-only.
+                if let (None, Some(actor)) = (own, actor) {
+                    if actor != me && e.stroke != 0 && !link.inflight.contains_key(&reg) {
+                        events.push(MonkeyVoxelNetEvent::Remote { edit: e, actor });
+                    }
                 }
             }
             ServerRecord::Done {
@@ -706,8 +715,13 @@ mod tests {
             matches!(ev[0], MonkeyVoxelNetEvent::Edit(e) if e.seq == Some(50) && e.stroke == 4),
             "the same body from another character = a remote edit"
         );
-        assert_eq!(
+        // The other character's live stroke edit is announced right after its `Edit`.
+        assert!(matches!(
             ev[1],
+            MonkeyVoxelNetEvent::Remote { actor: 78, edit } if edit.stroke == 4
+        ));
+        assert_eq!(
+            ev[2],
             MonkeyVoxelNetEvent::Confirm {
                 map: 0,
                 nonce: 7,
