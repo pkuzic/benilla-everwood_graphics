@@ -1,0 +1,17 @@
+[package]
+name = "eme-ui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Everwood ME (EME) UI shell: egui tool strip, option / history / restore / log panels, theme, i18n and layout persistence"
+
+[lints]
+workspace = true
+
+[dependencies]
+eme-core = { path = "../eme-core" }
+bevy = { workspace = true }
+bevy_egui = "0.39"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
