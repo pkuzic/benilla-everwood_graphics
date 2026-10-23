@@ -27,6 +27,9 @@ use crate::terrain::{
 pub struct AdtTile {
     /// The array indices of each entry of `chunks`; a hole-emptied chunk carries the default.
     pub shading: Vec<ChunkShading>,
+    /// The normalised texture path of each layer-array index (`[0]` = the fallback, empty), so a
+    /// consumer can choose among a chunk's layers by what they are (the voxel layer's wall pick).
+    pub layer_names: Vec<String>,
     /// `texture_2d_array` of the tile's ground textures, authored mips verbatim.
     pub layer_array: Handle<Image>,
     /// `texture_2d_array` of per-chunk alpha (blend-weight) maps.
@@ -216,6 +219,12 @@ impl AssetLoader for AdtLoader {
         }
 
         let layer_count = layers.len() as u32 + 1;
+        let mut layer_names = vec![String::new(); layer_count as usize];
+        for (name, &i) in &layer_index {
+            if let Some(slot) = layer_names.get_mut(i as usize) {
+                *slot = name.clone();
+            }
+        }
         let packed = pack_layers([107, 133, 82, 0], layers);
         // Per tile, so a log shows which tiles fell back to the decoded format.
         debug!(
@@ -230,6 +239,7 @@ impl AssetLoader for AdtLoader {
 
         Ok(AdtTile {
             shading,
+            layer_names,
             layer_array: ctx.add_labeled_asset("layer_array".to_string(), layer_array),
             alpha_array: ctx.add_labeled_asset("alpha_array".to_string(), alpha_array),
             shadow_array: ctx.add_labeled_asset("shadow_array".to_string(), shadow_array),

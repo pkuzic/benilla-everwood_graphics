@@ -117,7 +117,7 @@ pub fn monkey_voxel_create_material(
             shadow_array: alpha_array.clone(),
             params: MonkeyVoxelParams {
                 layers: [Vec4::new(1.0, 2.0, 3.0, 0.0); MONKEY_VOXEL_CELLS],
-                aux: [Vec4::new(0.0, -1.0, 0.0, 0.0); MONKEY_VOXEL_CELLS],
+                aux: [Vec4::new(0.0, -1.0, -1.0, 0.0); MONKEY_VOXEL_CELLS],
                 grid: Vec4::new(
                     0.0,
                     0.0,
@@ -151,6 +151,45 @@ pub(super) struct MonkeyVoxelChunkShade {
     pub layers: [u32; 4],
     pub alpha: u32,
     pub shadow: f32,
+    /// The chunk's wall / pit-wall layer chosen by texture NAME ([`monkey_voxel_wall_pick`]);
+    /// `-1` = no opinion (the shader falls back to its least-saturated rule).
+    pub wall: i32,
+}
+
+/// How earth-like a ground texture is, from its path: rock / cliff / stone 3, dirt / mud / gravel
+/// 2, sand 1, neutral 0, vegetation / water -1. A pit wall wants rock or dirt; a grass or swamp
+/// tileset read as dark teal in Westfall (the least-saturated rule alone picked it).
+pub(super) fn monkey_voxel_wall_score(path: &str) -> i32 {
+    let p = path.to_ascii_lowercase();
+    let file = p.rsplit(['\\', '/']).next().unwrap_or(&p);
+    let has = |keys: &[&str]| keys.iter().any(|k| file.contains(k) || p.contains(k));
+    if has(&["grass", "moss", "leaf", "leaves", "fern", "flower", "swamp", "water", "lava"]) {
+        -1
+    } else if has(&["rock", "cliff", "stone", "slate", "granite", "boulder", "cobble"]) {
+        3
+    } else if has(&["dirt", "mud", "earth", "soil", "gravel", "clay", "pebble", "path", "road"]) {
+        2
+    } else if has(&["sand", "desert"]) {
+        1
+    } else {
+        0
+    }
+}
+
+/// The layer-array index a chunk's pit walls should wear: the best-scoring (rock > dirt > sand)
+/// of its four layers by [`monkey_voxel_wall_score`], the earlier slot winning ties; `-1` when no
+/// layer is earth-like (the shader then keeps its saturation rule over the non-vegetation layers).
+pub(super) fn monkey_voxel_wall_pick(names: &[String], layers: [u32; 4]) -> i32 {
+    let mut best = (0, -1i32);
+    for l in layers {
+        let score = names
+            .get(l as usize)
+            .map_or(0, |n| monkey_voxel_wall_score(n));
+        if score > best.0 {
+            best = (score, l as i32);
+        }
+    }
+    best.1
 }
 
 /// Point a tile material at the real tileset: the tile's own arrays, its 16×16 chunk table
@@ -174,7 +213,7 @@ pub(super) fn monkey_voxel_apply_real(
             c.layers[2] as f32,
             c.layers[3] as f32,
         );
-        ext.params.aux[i] = Vec4::new(c.alpha as f32, c.shadow, 0.0, 0.0);
+        ext.params.aux[i] = Vec4::new(c.alpha as f32, c.shadow, c.wall as f32, 0.0);
     }
     ext.params.grid = Vec4::new(
         grid_nw[0],
@@ -293,4 +332,36 @@ fn monkey_voxel_dummy_alpha() -> Image {
         ..default()
     });
     image
+}
+
+#[cfg(test)]
+mod wall_pick_tests {
+    use super::*;
+
+    fn names(list: &[&str]) -> Vec<String> {
+        std::iter::once(String::new())
+            .chain(list.iter().map(|s| (*s).to_owned()))
+            .collect()
+    }
+
+    #[test]
+    fn walls_prefer_rock_then_dirt_by_name_and_never_vegetation() {
+        let n = names(&[
+            "tileset/westfall/westfallgrassbase.blp",
+            "tileset/westfall/westfalldirtbase.blp",
+            "tileset/westfall/westfallrockcliff.blp",
+            "tileset/westfall/westfallmossy.blp",
+        ]);
+        // Grass + dirt: dirt. Dirt + rock: rock. Grass + moss: nothing earth-like (-1).
+        assert_eq!(monkey_voxel_wall_pick(&n, [1, 2, 1, 1]), 2);
+        assert_eq!(monkey_voxel_wall_pick(&n, [2, 3, 2, 2]), 3);
+        assert_eq!(monkey_voxel_wall_pick(&n, [1, 4, 1, 1]), -1);
+        // The earlier slot wins a tie.
+        let n = names(&["a/dirt1.blp", "a/dirt2.blp"]);
+        assert_eq!(monkey_voxel_wall_pick(&n, [2, 1, 2, 2]), 2);
+        // Unknown / out-of-range layers have no opinion.
+        assert_eq!(monkey_voxel_wall_pick(&n, [9, 9, 9, 9]), -1);
+        assert_eq!(monkey_voxel_wall_score("Tileset/Elwynn/ElwynnRockBase.blp"), 3);
+        assert_eq!(monkey_voxel_wall_score("Tileset/Elwynn/ElwynnGrassDirt.blp"), -1);
+    }
 }

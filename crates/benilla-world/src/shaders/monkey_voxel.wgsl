@@ -187,8 +187,13 @@ fn monkey_voxel_wall_tap_grad(layer: i32, uv: vec2<f32>, ddx: vec2<f32>, ddy: ve
     return mix(a, b, 0.35);
 }
 
-// MONKEY (voxel): a chunk's wall layer — its most rock/dirt-like (least saturated) layer.
-fn monkey_voxel_wall_layer(li: vec4<i32>) -> i32 {
+// MONKEY (voxel): a chunk's wall layer. The CPU picks it by texture NAME (rock / cliff / stone >
+// dirt / mud / gravel > sand; `aux.z`, < 0 = no earth-like layer); without one, the most
+// rock/dirt-like (least saturated) layer.
+fn monkey_voxel_wall_layer(li: vec4<i32>, named: f32) -> i32 {
+    if (named >= 0.0) {
+        return i32(round(named));
+    }
     let level = f32(textureNumLevels(layer_array) - 1u);
     let q0 = monkey_voxel_saturation(li.x, level);
     let q1 = monkey_voxel_saturation(li.y, level);
@@ -296,7 +301,8 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
             let o = vec2<f32>(f32(j & 1u), f32(j >> 1u));
             let cw = mix(1.0 - fr.x, fr.x, o.x) * mix(1.0 - fr.y, fr.y, o.y);
             let cc = clamp(c0 + o, vec2<f32>(0.0), vec2<f32>(15.0));
-            let wl = monkey_voxel_wall_layer(vec4<i32>(round(vp.layers[i32(cc.y) * 16 + i32(cc.x)])));
+            let ci2 = i32(cc.y) * 16 + i32(cc.x);
+            let wl = monkey_voxel_wall_layer(vec4<i32>(round(vp.layers[ci2])), vp.aux[ci2].z);
             // Equal layers merge, so a uniform neighbourhood costs one set of taps.
             for (var s = 0u; s < 4u; s = s + 1u) {
                 if (wls[s] == wl || wls[s] < 0) {
@@ -395,6 +401,14 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
             vec3<f32>(1.0),
         );
     }
+
+    // MONKEY (EME): a DUG / BUILT face (`edited`) reads as earth in every zone. The albedo is the
+    // chunk's own dirt / rock (golden brown in Westfall), but a pit wall faces away from the sun, so
+    // its ONLY light is the zone's ambient, a saturated sky colour (strong blue in Westfall), and
+    // golden dirt under blue light came out dark teal. Pull the light on edited faces mostly to
+    // grey, keeping its brightness (untouched ground: edited = 0, unchanged).
+    let primary_luma = dot(primary, vec3<f32>(0.299, 0.587, 0.114));
+    primary = mix(primary, vec3<f32>(primary_luma), 0.85 * edited);
 
     let world_shadow_lane = wow_light.sh_c16.w > 0.5;
     let mcsh_suppress = select(0.0, sun_shadow_strength, world_shadow_lane);
