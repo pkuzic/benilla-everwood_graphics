@@ -36,6 +36,24 @@ does not offer, is not shown at all.
 Everything visible goes through `EmeI18n` (`locales/enUS.json`, `locales/ruRU.json`, keys
 `MONKEY_EME_*`). Extra keys: `EmeI18n::extend_json(lang, json)`.
 
+## Panels the host fills (restore points, log, notices, other GMs)
+
+* `EmeRestorePoints { rows, selected }`: the Restore tab lists `rows`; clicking a row writes
+  `EmeUiCommand::SelectRestore(id)` and the host outlines that point's radius on the ground (the
+  `eme` plugin does: `EmeRestoreOutline`). "Go to" = `SelectRestore` + `ShowInWorld`. "Revert" does
+  NOT send anything: it opens a confirmation (`EmeShell::pending`), and only its "Revert" button
+  writes `Service(Revert)`.
+* Log tab: the filter fields (`EmeShell::filter`, turned into an `EmeLogQuery` by
+  `EmeLogFilterUi::query`) emit `EmeUiCommand::LogQuery(q)`; the host sends page 1 of `q` and keeps
+  `q` for paging. Clicking a row's name fills the player filter; "Undo this player's edits" (rank 4)
+  confirms, then writes `Service(UndoPlayer { name, minutes, radius })`. A row's "Go to" writes
+  `ShowInWorld { x, y, z }` (the host jumps the camera and marks the spot).
+* `EmeNotice { key, args, error }`: one line under the top strip (a refused service call shows
+  the server's reason; a revert shows how many rows it undid). The host sets it, the user's
+  "Dismiss" writes `DismissNotice`, the host expires it.
+* `EmeOthersHistory`: strokes other GMs made (from the live `e` records), shown read-only under the
+  History tab, each with a "Go to".
+
 ## Contributing a tool's options panel
 
 You do not write egui. Implement `EmeTool::options_ui_model()` returning `EmeOptionField`s

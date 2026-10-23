@@ -86,6 +86,8 @@ struct World {
     status: EmeStatus,
     restore: EmeRestorePoints,
     log: EmeLogTable,
+    notice: eme_ui::EmeNotice,
+    others: eme_ui::EmeOthersHistory,
     i18n: EmeI18n,
     theme: EmeTheme,
     lang: EmeLang,
@@ -100,6 +102,8 @@ impl World {
             status: EmeStatus::default(),
             restore: EmeRestorePoints::default(),
             log: EmeLogTable::default(),
+            notice: Default::default(),
+            others: Default::default(),
             i18n: EmeI18n::builtin(),
             theme: EmeTheme::default(),
             lang: EmeLang::EnUs,
@@ -121,6 +125,8 @@ impl World {
             status: &self.status,
             restore: &self.restore,
             log: &self.log,
+            notice: &self.notice,
+            others: &self.others,
             tr: self.i18n.tr(self.lang),
             theme: &self.theme,
         }
@@ -269,7 +275,10 @@ fn server_caps_can_hide_a_tool() {
     let mut shell = probing_shell();
     let out = settle(&ctx, &mut shell, &w);
     assert!(entry(&out, "tool:sculpt").enabled);
-    assert!(!drawn(&out, "tool:water"), "a tool the server does not offer is not shown");
+    assert!(
+        !drawn(&out, "tool:water"),
+        "a tool the server does not offer is not shown"
+    );
 }
 
 #[test]
@@ -362,13 +371,21 @@ fn restore_tab_create_and_revert_gates() {
             "rank {rank}"
         );
         if rank == 4 {
+            // Revert asks first: nothing is sent until the modal's "yes".
             let cmds = click(&ctx, &mut shell, &w, "restore:revert:0");
+            assert!(cmds.is_empty(), "{cmds:?}");
+            assert!(shell.pending.is_some());
+            let no = click(&ctx, &mut shell, &w, "pending:no");
+            assert!(no.is_empty() && shell.pending.is_none());
+            click(&ctx, &mut shell, &w, "restore:revert:0");
+            let cmds = click(&ctx, &mut shell, &w, "pending:yes");
             assert_eq!(
                 cmds,
                 vec![EmeUiCommand::Service(EmeServiceRequest::Revert {
                     snapshot: 7
                 })]
             );
+            assert!(shell.pending.is_none());
         }
         if rank == 3 {
             let cmds = click(&ctx, &mut shell, &w, "restore:create");
@@ -523,4 +540,215 @@ fn panels_track_resized_width_into_layout() {
     settle(&ctx, &mut shell, &w);
     assert!(shell.layout.left_width >= eme_ui::layout::PANEL_MIN);
     assert!(shell.layout.right_width <= eme_ui::layout::PANEL_MAX);
+}
+
+fn log_row(name: &str, mode: u8) -> eme_core::service::EmeLogRow {
+    eme_core::service::EmeLogRow {
+        layer: eme_core::service::EmeLayer::Voxel,
+        seq: 100,
+        t: 1_700_000_000,
+        guid: 5,
+        name: name.into(),
+        account: 1,
+        mode: Some(mode),
+        radius: Some(4.0),
+        x: -9540.0,
+        y: -300.0,
+        z: 55.0,
+        stroke: Some(3),
+        reverted: false,
+    }
+}
+
+#[test]
+fn log_filters_build_the_query_and_apply() {
+    let mut w = World::new(3);
+    w.log.rows = vec![log_row("Geoff", 0)];
+    let ctx = egui::Context::default();
+    let mut shell = probing_shell();
+    shell.layout.right_tab = EmeRightTab::Log;
+    shell.filter = eme_ui::shell::EmeLogFilterUi {
+        player: " Geoff ".into(),
+        radius: "80".into(),
+        minutes: "15".into(),
+        mode: 4, // flatten
+        layer: 1,
+    };
+    let out = settle(&ctx, &mut shell, &w);
+    for id in [
+        "log:filter:player",
+        "log:filter:radius",
+        "log:filter:minutes",
+        "log:filter:tool",
+        "log:filter:layer",
+        "log:apply",
+    ] {
+        assert!(drawn(&out, id), "{id}");
+    }
+    let cmds = click(&ctx, &mut shell, &w, "log:apply");
+    let [EmeUiCommand::LogQuery(q)] = cmds.as_slice() else {
+        panic!("{cmds:?}")
+    };
+    assert_eq!(q.player.as_deref(), Some("Geoff"));
+    assert_eq!(q.radius, Some(80.0));
+    assert_eq!(q.minutes, Some(15));
+    assert_eq!(q.mode, Some(3));
+    assert_eq!(q.layer, Some(eme_core::service::EmeLayerFilter::Voxel));
+    // Clear resets the fields and re-queries unfiltered.
+    let cmds = click(&ctx, &mut shell, &w, "log:clear");
+    assert_eq!(
+        cmds,
+        vec![EmeUiCommand::LogQuery(
+            eme_core::service::EmeLogQuery::default()
+        )]
+    );
+    assert_eq!(shell.filter, Default::default());
+}
+
+#[test]
+fn log_row_buttons_show_in_world_and_pick_the_player() {
+    let mut w = World::new(4);
+    w.log.rows = vec![log_row("Geoff", 1)];
+    let ctx = egui::Context::default();
+    let mut shell = probing_shell();
+    shell.layout.right_tab = EmeRightTab::Log;
+    assert_eq!(
+        click(&ctx, &mut shell, &w, "log:show:0"),
+        vec![EmeUiCommand::ShowInWorld {
+            x: -9540.0,
+            y: -300.0,
+            z: Some(55.0)
+        }]
+    );
+    // Undo-player needs a name: disabled until one is picked.
+    let out = settle(&ctx, &mut shell, &w);
+    assert!(!entry(&out, "log:undo_player").enabled);
+    assert!(click(&ctx, &mut shell, &w, "log:who:0").is_empty());
+    assert_eq!(shell.filter.player, "Geoff");
+    assert!(entry(&settle(&ctx, &mut shell, &w), "log:undo_player").enabled);
+}
+
+#[test]
+fn undo_player_needs_rank_four_and_a_confirmation() {
+    for rank in [2u8, 3, 4] {
+        let mut w = World::new(rank);
+        w.log.rows = vec![log_row("Geoff", 0)];
+        let ctx = egui::Context::default();
+        let mut shell = probing_shell();
+        shell.layout.right_tab = EmeRightTab::Log;
+        shell.filter.player = "Geoff".into();
+        shell.filter.minutes = "20".into();
+        let out = settle(&ctx, &mut shell, &w);
+        assert_eq!(
+            entry(&out, "log:undo_player").enabled,
+            rank == 4,
+            "rank {rank}"
+        );
+        if rank == 4 {
+            assert!(click(&ctx, &mut shell, &w, "log:undo_player").is_empty());
+            assert!(matches!(
+                shell.pending,
+                Some(eme_ui::shell::EmePending::UndoPlayer { .. })
+            ));
+            let cmds = click(&ctx, &mut shell, &w, "pending:yes");
+            assert_eq!(
+                cmds,
+                vec![EmeUiCommand::Service(EmeServiceRequest::UndoPlayer {
+                    name: "Geoff".into(),
+                    minutes: Some(20),
+                    radius: None
+                })]
+            );
+        }
+    }
+}
+
+#[test]
+fn restore_rows_select_and_show_in_world() {
+    use eme_core::service::EmeSnapshotRow;
+    let mut w = World::new(3);
+    w.restore.rows = vec![EmeSnapshotRow {
+        snapshot: 7,
+        label: "pre".into(),
+        name: "Geoff".into(),
+        t: 1,
+        map: 0,
+        x: -9500.0,
+        y: -310.0,
+        radius: 60.0,
+        at_seq: Default::default(),
+    }];
+    let ctx = egui::Context::default();
+    let mut shell = probing_shell();
+    shell.layout.right_tab = EmeRightTab::Restore;
+    assert_eq!(
+        click(&ctx, &mut shell, &w, "restore:select:0"),
+        vec![EmeUiCommand::SelectRestore(Some(7))]
+    );
+    w.restore.selected = Some(7);
+    assert_eq!(
+        click(&ctx, &mut shell, &w, "restore:select:0"),
+        vec![EmeUiCommand::SelectRestore(None)]
+    );
+    assert_eq!(
+        click(&ctx, &mut shell, &w, "restore:show:0"),
+        vec![
+            EmeUiCommand::SelectRestore(Some(7)),
+            EmeUiCommand::ShowInWorld {
+                x: -9500.0,
+                y: -310.0,
+                z: None
+            }
+        ]
+    );
+}
+
+#[test]
+fn notice_shows_and_dismisses_in_both_languages() {
+    let mut w = World::new(3);
+    let ctx = egui::Context::default();
+    let mut shell = probing_shell();
+    assert!(!drawn(&settle(&ctx, &mut shell, &w), "notice:dismiss"));
+    w.notice.set("MONKEY_EME_ERR_RANK", vec![], true);
+    assert!(drawn(&settle(&ctx, &mut shell, &w), "notice:dismiss"));
+    assert_eq!(
+        click(&ctx, &mut shell, &w, "notice:dismiss"),
+        vec![EmeUiCommand::DismissNotice]
+    );
+    w.lang = EmeLang::RuRu;
+    w.notice.set(
+        "MONKEY_EME_NOTICE_REVERT_OK",
+        vec!["1".into(), "2".into(), "3".into()],
+        false,
+    );
+    assert!(drawn(&settle(&ctx, &mut shell, &w), "notice:dismiss"));
+}
+
+#[test]
+fn other_gms_strokes_are_listed_read_only() {
+    let mut w = World::new(3);
+    w.others.now_ms = 10_000;
+    w.others.rows = vec![eme_ui::EmeOtherStroke {
+        actor: 9,
+        name: "Zara".into(),
+        stroke: 4,
+        edits: 6,
+        mode: 1,
+        pos: [-9500.0, -300.0, 60.0],
+        seen_ms: 7_000,
+    }];
+    let ctx = egui::Context::default();
+    let mut shell = probing_shell();
+    shell.layout.right_tab = EmeRightTab::History;
+    let out = settle(&ctx, &mut shell, &w);
+    // No undo / redo control for someone else's stroke: only "go to".
+    assert!(drawn(&out, "others:show:0"));
+    assert_eq!(
+        click(&ctx, &mut shell, &w, "others:show:0"),
+        vec![EmeUiCommand::ShowInWorld {
+            x: -9500.0,
+            y: -300.0,
+            z: Some(60.0)
+        }]
+    );
 }

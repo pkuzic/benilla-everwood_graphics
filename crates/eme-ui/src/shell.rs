@@ -4,7 +4,7 @@
 
 use bevy::prelude::Resource;
 use bevy_egui::egui::{self, Align, Layout, RichText, Ui};
-use eme_core::service::EmeLayer;
+use eme_core::service::{EmeLayer, EmeLayerFilter, EmeLogQuery};
 use eme_core::{
     EmeCapability, EmeEntryState, EmeOptionField, EmeOptionKind, EmeOptionValue, EmeServiceRequest,
     EmeToolId, EmeToolRegistry, EmeUndoEntry, EmeUndoStack,
@@ -12,7 +12,9 @@ use eme_core::{
 
 use crate::i18n::Tr;
 use crate::layout::{EmeLayout, EmeRightTab, PANEL_MAX, PANEL_MIN};
-use crate::state::{EmeLogTable, EmeRestorePoints, EmeSession, EmeStatus, EmeUiCommand};
+use crate::state::{
+    EmeLogTable, EmeNotice, EmeOthersHistory, EmeRestorePoints, EmeSession, EmeStatus, EmeUiCommand,
+};
 use crate::theme::EmeTheme;
 
 /// Read-only inputs of one shell frame.
@@ -29,6 +31,10 @@ pub struct EmeShellModel<'a> {
     pub restore: &'a EmeRestorePoints,
     /// Log page.
     pub log: &'a EmeLogTable,
+    /// The message under the top strip (an error or a result).
+    pub notice: &'a EmeNotice,
+    /// Strokes by other GMs (read-only History rows).
+    pub others: &'a EmeOthersHistory,
     /// Language-bound strings.
     pub tr: Tr<'a>,
     /// Palette.
@@ -67,6 +73,85 @@ pub struct EmeShellOutput {
     pub confirm_modal: bool,
 }
 
+/// The log browser's filter fields as typed (text), turned into an [`EmeLogQuery`] by
+/// [`EmeLogFilterUi::query`].
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct EmeLogFilterUi {
+    /// Character name (empty = everyone).
+    pub player: String,
+    /// Radius around the caller's character, yards (empty = server default).
+    pub radius: String,
+    /// Look-back, minutes (empty = server default).
+    pub minutes: String,
+    /// 0 = any tool, 1..=4 = dig / build / smooth / flatten.
+    pub mode: usize,
+    /// 0 = all layers, 1 = terrain, 2 = water, 3 = area.
+    pub layer: usize,
+}
+
+impl EmeLogFilterUi {
+    /// The radius field as yards (1..500), if it parses.
+    pub fn radius_value(&self) -> Option<f32> {
+        self.radius
+            .trim()
+            .parse::<f32>()
+            .ok()
+            .filter(|r| r.is_finite())
+            .map(|r| r.clamp(1.0, 500.0))
+    }
+
+    /// The minutes field (1..10080), if it parses.
+    pub fn minutes_value(&self) -> Option<u32> {
+        self.minutes
+            .trim()
+            .parse::<u32>()
+            .ok()
+            .map(|m| m.clamp(1, 10_080))
+    }
+
+    /// The query these fields describe (paging and the row limit are the host's).
+    pub fn query(&self) -> EmeLogQuery {
+        let player = self.player.trim();
+        EmeLogQuery {
+            radius: self.radius_value(),
+            minutes: self.minutes_value(),
+            player: (!player.is_empty()).then(|| player.to_owned()),
+            mode: self.mode.checked_sub(1).map(|m| m as u8),
+            layer: match self.layer {
+                1 => Some(EmeLayerFilter::Voxel),
+                2 => Some(EmeLayerFilter::Liquid),
+                3 => Some(EmeLayerFilter::Area),
+                _ => None,
+            },
+            limit: None,
+            before_seq: None,
+        }
+    }
+}
+
+/// A destructive admin action waiting for the user's "yes".
+#[derive(Debug, Clone, PartialEq)]
+pub enum EmePending {
+    /// Revert everything in a restore point's circle.
+    Revert {
+        /// Snapshot id.
+        snapshot: u32,
+        /// Its label.
+        label: String,
+        /// Its radius, yards.
+        radius: f32,
+    },
+    /// Undo one player's recent work near the caller's character.
+    UndoPlayer {
+        /// Character name.
+        name: String,
+        /// Look-back (server default 30 when `None`).
+        minutes: Option<u32>,
+        /// Radius (server default 200 when `None`).
+        radius: Option<f32>,
+    },
+}
+
 /// The shell: persistent UI state (layout, text fields). Draw it with [`EmeShell::show`].
 #[derive(Resource, Debug, Clone, Default)]
 pub struct EmeShell {
@@ -74,6 +159,10 @@ pub struct EmeShell {
     pub layout: EmeLayout,
     /// The restore-point label being typed.
     pub snapshot_label: String,
+    /// The log filter fields.
+    pub filter: EmeLogFilterUi,
+    /// A revert / undo-player waiting for confirmation.
+    pub pending: Option<EmePending>,
     /// Collect an [`EmeProbeEntry`] per control (tests).
     pub probe: bool,
 }
@@ -168,6 +257,7 @@ impl EmeShell {
         let read_only = perms.can_open() && !can_edit;
         egui::TopBottomPanel::top("eme_top").show(ctx, |ui| {
             top_strip(ui, &mut f, &mut self.layout);
+            notice_line(ui, &mut f);
             if read_only {
                 f.out.read_only_banner = true;
                 egui::Frame::new()
@@ -210,16 +300,21 @@ impl EmeShell {
         if self.layout.right_open {
             let tab = &mut self.layout.right_tab;
             let label = &mut self.snapshot_label;
+            let filter = &mut self.filter;
+            let pending = &mut self.pending;
             let r = egui::SidePanel::right("eme_right")
                 .resizable(true)
                 .default_width(self.layout.right_width)
                 .width_range(PANEL_MIN..=PANEL_MAX)
-                .show(ctx, |ui| right_panel(ui, &mut f, tab, label));
+                .show(ctx, |ui| {
+                    right_panel(ui, &mut f, tab, label, filter, pending)
+                });
             self.layout.right_width = r.response.rect.width().clamp(PANEL_MIN, PANEL_MAX);
         }
 
         // Needs-confirmation modal (Q4: warn, then confirm with force).
         confirm_modal(ctx, &mut f);
+        pending_modal(ctx, &mut f, &mut self.pending);
 
         let (over, kb) = (
             ctx.is_pointer_over_area() || ctx.wants_pointer_input(),
@@ -312,6 +407,35 @@ fn top_strip(ui: &mut Ui, f: &mut Frame, layout: &mut EmeLayout) {
             ui.toggle_value(&mut layout.right_open, tr.t("MONKEY_EME_TOGGLE_RIGHT"));
             ui.toggle_value(&mut layout.left_open, tr.t("MONKEY_EME_TOGGLE_LEFT"));
         });
+    });
+}
+
+/// The error / result line under the strip, with a dismiss button.
+fn notice_line(ui: &mut Ui, f: &mut Frame) {
+    let m = f.m;
+    let n = m.notice;
+    if n.key.is_empty() {
+        return;
+    }
+    let args: Vec<&str> = n.args.iter().map(String::as_str).collect();
+    let text = m.tr.f(&n.key, &args);
+    let (glyph, colour) = if n.error {
+        ("✖", m.theme.error)
+    } else {
+        ("✔", m.theme.ok)
+    };
+    ui.horizontal_wrapped(|ui| {
+        ui.label(RichText::new(format!("{glyph} {text}")).color(colour));
+        if f.button(
+            ui,
+            "notice:dismiss".into(),
+            m.tr.t("MONKEY_EME_DISMISS").to_owned(),
+            true,
+            false,
+            None,
+        ) {
+            f.push(EmeUiCommand::DismissNotice);
+        }
     });
 }
 
@@ -502,7 +626,14 @@ fn option_field(
     }
 }
 
-fn right_panel(ui: &mut Ui, f: &mut Frame, tab: &mut EmeRightTab, label: &mut String) {
+fn right_panel(
+    ui: &mut Ui,
+    f: &mut Frame,
+    tab: &mut EmeRightTab,
+    label: &mut String,
+    filter: &mut EmeLogFilterUi,
+    pending: &mut Option<EmePending>,
+) {
     let tr = f.m.tr;
     ui.horizontal(|ui| {
         for (t, key, name) in [
@@ -525,8 +656,8 @@ fn right_panel(ui: &mut Ui, f: &mut Frame, tab: &mut EmeRightTab, label: &mut St
     ui.separator();
     match *tab {
         EmeRightTab::History => history_tab(ui, f),
-        EmeRightTab::Restore => restore_tab(ui, f, label),
-        EmeRightTab::Log => log_tab(ui, f),
+        EmeRightTab::Restore => restore_tab(ui, f, label, pending),
+        EmeRightTab::Log => log_tab(ui, f, filter, pending),
     }
 }
 
@@ -543,14 +674,29 @@ fn state_view(s: &EmeEntryState) -> (&'static str, &'static str) {
     }
 }
 
+/// The localized name of a voxel mode (`MONKEY_EME_MODE_*`), or a dash.
+fn mode_name(tr: crate::i18n::Tr, mode: Option<u8>) -> String {
+    let key = match mode {
+        Some(0) => "MONKEY_EME_MODE_DIG",
+        Some(1) => "MONKEY_EME_MODE_BUILD",
+        Some(2) => "MONKEY_EME_MODE_SMOOTH",
+        Some(3) => "MONKEY_EME_MODE_FLATTEN",
+        _ => return "-".to_owned(),
+    };
+    tr.t(key).to_owned()
+}
+
 fn history_tab(ui: &mut Ui, f: &mut Frame) {
     let m = f.m;
     let tr = m.tr;
-    if m.undo.entries().is_empty() {
+    if m.undo.entries().is_empty() && m.others.rows.is_empty() {
         ui.label(tr.t("MONKEY_EME_HISTORY_EMPTY"));
         return;
     }
     egui::ScrollArea::vertical().show(ui, |ui| {
+        if m.undo.entries().is_empty() {
+            ui.label(tr.t("MONKEY_EME_HISTORY_EMPTY"));
+        }
         for e in m.undo.entries().iter().rev() {
             let (glyph, key) = state_view(e.state());
             let colour = match e.state() {
@@ -565,10 +711,52 @@ fn history_tab(ui: &mut Ui, f: &mut Frame) {
             }
             ui.label(RichText::new(line).color(colour));
         }
+        // Other GMs' strokes: theirs to undo (or an admin's, from the Log tab); shown read-only.
+        ui.separator();
+        ui.label(RichText::new(tr.t("MONKEY_EME_OTHERS_TITLE")).strong());
+        if m.others.rows.is_empty() {
+            ui.label(RichText::new(tr.t("MONKEY_EME_OTHERS_NONE")).color(m.theme.text_dim));
+        }
+        for (n, r) in m.others.rows.iter().enumerate() {
+            let who = if r.name.is_empty() {
+                format!("#{}", r.actor)
+            } else {
+                r.name.clone()
+            };
+            let ago = m.others.now_ms.saturating_sub(r.seen_ms) / 1000;
+            ui.horizontal_wrapped(|ui| {
+                ui.label(
+                    RichText::new(tr.f(
+                        "MONKEY_EME_OTHERS_ROW",
+                        &[
+                            &who,
+                            &mode_name(tr, Some(r.mode)),
+                            &r.edits.to_string(),
+                            &ago.to_string(),
+                        ],
+                    ))
+                    .color(m.theme.text_dim),
+                );
+                if f.button(
+                    ui,
+                    format!("others:show:{n}"),
+                    tr.t("MONKEY_EME_SHOW").to_owned(),
+                    true,
+                    false,
+                    None,
+                ) {
+                    f.push(EmeUiCommand::ShowInWorld {
+                        x: r.pos[0],
+                        y: r.pos[1],
+                        z: Some(r.pos[2]),
+                    });
+                }
+            });
+        }
     });
 }
 
-fn restore_tab(ui: &mut Ui, f: &mut Frame, label: &mut String) {
+fn restore_tab(ui: &mut Ui, f: &mut Frame, label: &mut String, pending: &mut Option<EmePending>) {
     let m = f.m;
     let tr = m.tr;
     ui.horizontal(|ui| {
@@ -602,25 +790,55 @@ fn restore_tab(ui: &mut Ui, f: &mut Frame, label: &mut String) {
     let can_revert = m.session.perms.has(EmeCapability::RevertOthers);
     egui::ScrollArea::vertical().show(ui, |ui| {
         for (n, row) in m.restore.rows.iter().enumerate() {
-            ui.horizontal_wrapped(|ui| {
-                ui.label(tr.f(
+            let selected = m.restore.selected == Some(row.snapshot);
+            // The row's text on its own line, its buttons under it (a narrow panel wraps nothing).
+            ui.vertical(|ui| {
+                let text = tr.f(
                     "MONKEY_EME_RESTORE_ROW",
                     &[&row.label, &row.name, &format!("{:.0}", row.radius)],
-                ));
-                let tip = (!can_revert).then(|| tr.t("MONKEY_EME_RESTORE_REVERT_RANK").to_owned());
-                if f.button(
-                    ui,
-                    format!("restore:revert:{n}"),
-                    tr.t("MONKEY_EME_RESTORE_REVERT").to_owned(),
-                    can_revert,
-                    false,
-                    tip,
-                ) {
-                    f.push(EmeUiCommand::Service(EmeServiceRequest::Revert {
-                        snapshot: row.snapshot,
-                    }));
+                );
+                let resp = ui.selectable_label(selected, text);
+                f.rec(format!("restore:select:{n}"), &resp, true, None);
+                if resp.clicked() {
+                    f.push(EmeUiCommand::SelectRestore(
+                        (!selected).then_some(row.snapshot),
+                    ));
                 }
+                ui.horizontal(|ui| {
+                    if f.button(
+                        ui,
+                        format!("restore:show:{n}"),
+                        tr.t("MONKEY_EME_SHOW").to_owned(),
+                        true,
+                        false,
+                        None,
+                    ) {
+                        f.push(EmeUiCommand::SelectRestore(Some(row.snapshot)));
+                        f.push(EmeUiCommand::ShowInWorld {
+                            x: row.x,
+                            y: row.y,
+                            z: None,
+                        });
+                    }
+                    let tip =
+                        (!can_revert).then(|| tr.t("MONKEY_EME_RESTORE_REVERT_RANK").to_owned());
+                    if f.button(
+                        ui,
+                        format!("restore:revert:{n}"),
+                        tr.t("MONKEY_EME_RESTORE_REVERT").to_owned(),
+                        can_revert,
+                        false,
+                        tip,
+                    ) {
+                        *pending = Some(EmePending::Revert {
+                            snapshot: row.snapshot,
+                            label: row.label.clone(),
+                            radius: row.radius,
+                        });
+                    }
+                });
             });
+            ui.add_space(2.0);
         }
     });
 }
@@ -630,10 +848,150 @@ fn hms(t: u64) -> String {
     format!("{:02}:{:02}:{:02}", s / 3600, (s / 60) % 60, s % 60)
 }
 
-fn log_tab(ui: &mut Ui, f: &mut Frame) {
+/// A one-line text field with a label; records `id` for tests. True when Enter was pressed in it.
+fn text_field(
+    ui: &mut Ui,
+    f: &mut Frame,
+    id: &str,
+    label: &str,
+    text: &mut String,
+    width: f32,
+) -> bool {
+    ui.label(label);
+    let r = ui.add(egui::TextEdit::singleline(text).desired_width(width));
+    f.rec(id.to_owned(), &r, true, None);
+    r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))
+}
+
+fn log_filters(
+    ui: &mut Ui,
+    f: &mut Frame,
+    filter: &mut EmeLogFilterUi,
+    pending: &mut Option<EmePending>,
+) {
+    let tr = f.m.tr;
+    let mut apply = false;
+    ui.horizontal_wrapped(|ui| {
+        apply |= text_field(
+            ui,
+            f,
+            "log:filter:player",
+            tr.t("MONKEY_EME_LOG_FILTER_PLAYER"),
+            &mut filter.player,
+            90.0,
+        );
+        apply |= text_field(
+            ui,
+            f,
+            "log:filter:radius",
+            tr.t("MONKEY_EME_LOG_FILTER_RADIUS"),
+            &mut filter.radius,
+            40.0,
+        );
+        apply |= text_field(
+            ui,
+            f,
+            "log:filter:minutes",
+            tr.t("MONKEY_EME_LOG_FILTER_MINUTES"),
+            &mut filter.minutes,
+            40.0,
+        );
+    });
+    ui.horizontal_wrapped(|ui| {
+        let modes = [
+            "MONKEY_EME_LOG_FILTER_ANY",
+            "MONKEY_EME_MODE_DIG",
+            "MONKEY_EME_MODE_BUILD",
+            "MONKEY_EME_MODE_SMOOTH",
+            "MONKEY_EME_MODE_FLATTEN",
+        ];
+        ui.label(tr.t("MONKEY_EME_LOG_FILTER_TOOL"));
+        let c = egui::ComboBox::from_id_salt("eme_log_mode")
+            .selected_text(tr.t(modes[filter.mode.min(4)]))
+            .show_ui(ui, |ui| {
+                for (n, k) in modes.iter().enumerate() {
+                    ui.selectable_value(&mut filter.mode, n, tr.t(k));
+                }
+            });
+        f.rec("log:filter:tool".into(), &c.response, true, None);
+        let layers = [
+            "MONKEY_EME_LOG_FILTER_ALL",
+            "MONKEY_EME_LAYER_VOXEL",
+            "MONKEY_EME_LAYER_LIQUID",
+            "MONKEY_EME_LAYER_AREA",
+        ];
+        ui.label(tr.t("MONKEY_EME_LOG_FILTER_LAYER"));
+        let c = egui::ComboBox::from_id_salt("eme_log_layer")
+            .selected_text(tr.t(layers[filter.layer.min(3)]))
+            .show_ui(ui, |ui| {
+                for (n, k) in layers.iter().enumerate() {
+                    ui.selectable_value(&mut filter.layer, n, tr.t(k));
+                }
+            });
+        f.rec("log:filter:layer".into(), &c.response, true, None);
+    });
+    ui.horizontal_wrapped(|ui| {
+        if f.button(
+            ui,
+            "log:apply".into(),
+            tr.t("MONKEY_EME_LOG_APPLY").to_owned(),
+            true,
+            false,
+            None,
+        ) {
+            apply = true;
+        }
+        if f.button(
+            ui,
+            "log:clear".into(),
+            tr.t("MONKEY_EME_LOG_CLEAR").to_owned(),
+            true,
+            false,
+            None,
+        ) {
+            *filter = EmeLogFilterUi::default();
+            apply = true;
+        }
+        let can_revert = f.m.session.perms.has(EmeCapability::RevertOthers);
+        let name = filter.player.trim().to_owned();
+        let tip = if !can_revert {
+            Some(tr.t("MONKEY_EME_RESTORE_REVERT_RANK").to_owned())
+        } else if name.is_empty() {
+            Some(tr.t("MONKEY_EME_LOG_UNDO_PLAYER_HINT").to_owned())
+        } else {
+            None
+        };
+        if f.button(
+            ui,
+            "log:undo_player".into(),
+            tr.t("MONKEY_EME_LOG_UNDO_PLAYER").to_owned(),
+            can_revert && !name.is_empty(),
+            false,
+            tip,
+        ) {
+            *pending = Some(EmePending::UndoPlayer {
+                name,
+                minutes: filter.minutes_value(),
+                radius: filter.radius_value(),
+            });
+        }
+    });
+    if apply {
+        f.push(EmeUiCommand::LogQuery(filter.query()));
+    }
+}
+
+fn log_tab(
+    ui: &mut Ui,
+    f: &mut Frame,
+    filter: &mut EmeLogFilterUi,
+    pending: &mut Option<EmePending>,
+) {
     let m = f.m;
     let tr = m.tr;
     let log = m.log;
+    log_filters(ui, f, filter, pending);
+    ui.separator();
     if log.rows.is_empty() {
         ui.label(tr.t("MONKEY_EME_LOG_EMPTY"));
     } else {
@@ -646,13 +1004,15 @@ fn log_tab(ui: &mut Ui, f: &mut Frame) {
                         for k in [
                             "MONKEY_EME_LOG_COL_TIME",
                             "MONKEY_EME_LOG_COL_PLAYER",
+                            "MONKEY_EME_LOG_COL_TOOL",
                             "MONKEY_EME_LOG_COL_LAYER",
                             "MONKEY_EME_LOG_COL_WHERE",
                         ] {
                             ui.label(RichText::new(tr.t(k)).strong());
                         }
+                        ui.label("");
                         ui.end_row();
-                        for r in &log.rows {
+                        for (n, r) in log.rows.iter().enumerate() {
                             let dim = r.reverted;
                             let col = if dim { m.theme.text_dim } else { m.theme.text };
                             ui.label(RichText::new(hms(r.t)).color(col));
@@ -660,7 +1020,18 @@ fn log_tab(ui: &mut Ui, f: &mut Frame) {
                             if dim {
                                 who.push_str(&format!(" ({})", tr.t("MONKEY_EME_LOG_REVERTED")));
                             }
-                            ui.label(RichText::new(who).color(col));
+                            // Clicking a name fills the player filter (then "Undo this player").
+                            let resp = ui
+                                .add(
+                                    egui::Label::new(RichText::new(who).color(col))
+                                        .sense(egui::Sense::click()),
+                                )
+                                .on_hover_text(tr.t("MONKEY_EME_LOG_PICK_PLAYER"));
+                            f.rec(format!("log:who:{n}"), &resp, true, None);
+                            if resp.clicked() {
+                                filter.player = r.name.clone();
+                            }
+                            ui.label(RichText::new(mode_name(tr, r.mode)).color(col));
                             let lk = match r.layer {
                                 EmeLayer::Voxel => "MONKEY_EME_LAYER_VOXEL",
                                 EmeLayer::Liquid => "MONKEY_EME_LAYER_LIQUID",
@@ -671,6 +1042,20 @@ fn log_tab(ui: &mut Ui, f: &mut Frame) {
                                 RichText::new(format!("{:.0}, {:.0}, {:.0}", r.x, r.y, r.z))
                                     .color(col),
                             );
+                            if f.button(
+                                ui,
+                                format!("log:show:{n}"),
+                                tr.t("MONKEY_EME_SHOW").to_owned(),
+                                true,
+                                false,
+                                None,
+                            ) {
+                                f.push(EmeUiCommand::ShowInWorld {
+                                    x: r.x,
+                                    y: r.y,
+                                    z: Some(r.z),
+                                });
+                            }
                             ui.end_row();
                         }
                     });
@@ -703,6 +1088,75 @@ fn log_tab(ui: &mut Ui, f: &mut Frame) {
             &[&(log.page + 1).to_string(), &log.count.to_string()],
         ));
     });
+}
+
+/// The yes/no for a revert / undo-player (destructive, rank 4): says exactly what will happen.
+fn pending_modal(ctx: &egui::Context, f: &mut Frame, pending: &mut Option<EmePending>) {
+    let Some(p) = pending.clone() else { return };
+    let tr = f.m.tr;
+    let (body, yes) = match &p {
+        EmePending::Revert { label, radius, .. } => (
+            tr.f("MONKEY_EME_REVERT_BODY", &[label, &format!("{radius:.0}")]),
+            tr.t("MONKEY_EME_REVERT_YES").to_owned(),
+        ),
+        EmePending::UndoPlayer {
+            name,
+            minutes,
+            radius,
+        } => (
+            tr.f(
+                "MONKEY_EME_UNDOPLAYER_BODY",
+                &[
+                    name,
+                    &minutes.unwrap_or(30).to_string(),
+                    &format!("{:.0}", radius.unwrap_or(200.0)),
+                ],
+            ),
+            tr.t("MONKEY_EME_UNDOPLAYER_YES").to_owned(),
+        ),
+    };
+    let can = f.m.session.perms.has(EmeCapability::RevertOthers);
+    let mut done = false;
+    egui::Modal::new(egui::Id::new("eme_pending")).show(ctx, |ui| {
+        ui.set_max_width(400.0);
+        ui.heading(format!("⚠ {}", tr.t("MONKEY_EME_PENDING_TITLE")));
+        ui.add_space(6.0);
+        ui.label(body);
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            if f.button(ui, "pending:yes".into(), yes, can, false, None) {
+                let req = match &p {
+                    EmePending::Revert { snapshot, .. } => EmeServiceRequest::Revert {
+                        snapshot: *snapshot,
+                    },
+                    EmePending::UndoPlayer {
+                        name,
+                        minutes,
+                        radius,
+                    } => EmeServiceRequest::UndoPlayer {
+                        name: name.clone(),
+                        minutes: *minutes,
+                        radius: *radius,
+                    },
+                };
+                f.push(EmeUiCommand::Service(req));
+                done = true;
+            }
+            if f.button(
+                ui,
+                "pending:no".into(),
+                tr.t("MONKEY_EME_CONFIRM_NO").to_owned(),
+                true,
+                false,
+                None,
+            ) {
+                done = true;
+            }
+        });
+    });
+    if done {
+        *pending = None;
+    }
 }
 
 fn confirm_modal(ctx: &egui::Context, f: &mut Frame) {

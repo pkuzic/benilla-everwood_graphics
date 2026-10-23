@@ -4,7 +4,7 @@
 //! resources current, and applies the [`EmeUiCommand`]s the shell writes.
 
 use bevy::prelude::{Message, Resource};
-use eme_core::service::{EmeLogRow, EmeSnapshotRow};
+use eme_core::service::{EmeLogQuery, EmeLogRow, EmeSnapshotRow};
 use eme_core::{
     EmeCaps, EmeEntryId, EmeLink, EmeOptionValue, EmePermissions, EmeServiceRequest, EmeToolId,
     EmeToolRegistry, EmeUndoStack,
@@ -73,6 +73,70 @@ pub struct EmeStatus {
 pub struct EmeRestorePoints {
     /// Rows, newest first.
     pub rows: Vec<EmeSnapshotRow>,
+    /// The restore point selected in the list (the host outlines its radius in the world).
+    pub selected: Option<u32>,
+}
+
+/// A one-line message under the top strip: a server error, or the result of a revert. The host
+/// sets it (`key` is a locale key, `args` fill its `{0}`, `{1}`…); the shell shows it until the
+/// user dismisses it ([`EmeUiCommand::DismissNotice`]) or the host clears it. An empty `key`
+/// means no message.
+#[derive(Resource, Debug, Clone, Default, PartialEq)]
+pub struct EmeNotice {
+    /// Locale key; empty = nothing to show.
+    pub key: String,
+    /// Substitutions.
+    pub args: Vec<String>,
+    /// An error (red) rather than a result (green).
+    pub error: bool,
+    /// Bumped by the host on every new message (so the same text twice re-appears).
+    pub seq: u32,
+}
+
+impl EmeNotice {
+    /// Shows `key` (an error or a result).
+    pub fn set(&mut self, key: impl Into<String>, args: Vec<String>, error: bool) {
+        self.key = key.into();
+        self.args = args;
+        self.error = error;
+        self.seq = self.seq.wrapping_add(1);
+    }
+
+    /// Hides the message.
+    pub fn clear(&mut self) {
+        if !self.key.is_empty() {
+            self.key.clear();
+            self.args.clear();
+        }
+    }
+}
+
+/// One stroke another GM made, learned from the live `e` records (read-only History rows).
+#[derive(Debug, Clone, PartialEq)]
+pub struct EmeOtherStroke {
+    /// The editing character's low GUID.
+    pub actor: u32,
+    /// Their name, when the log told us (else the shell shows `#<guid>`).
+    pub name: String,
+    /// The stroke id (per character).
+    pub stroke: u16,
+    /// Edits seen so far.
+    pub edits: u32,
+    /// Voxel mode of the first edit.
+    pub mode: u8,
+    /// Where (WoW yards) of the latest edit.
+    pub pos: [f32; 3],
+    /// Game-clock ms of the latest edit.
+    pub seen_ms: u64,
+}
+
+/// Strokes by other GMs, newest first (read-only: they are theirs to undo, or an admin's).
+#[derive(Resource, Debug, Clone, Default, PartialEq)]
+pub struct EmeOthersHistory {
+    /// Game-clock ms now (for the "N s ago" text).
+    pub now_ms: u64,
+    /// Rows, newest first.
+    pub rows: Vec<EmeOtherStroke>,
 }
 
 /// The current page of the audit log (`log` reply).
@@ -113,6 +177,21 @@ pub enum EmeUiCommand {
     },
     /// A cold-path request (create / revert a restore point).
     Service(EmeServiceRequest),
+    /// Apply the log filters: fetch page 1 of this query.
+    LogQuery(EmeLogQuery),
+    /// A restore-point row was (de)selected.
+    SelectRestore(Option<u32>),
+    /// "Show in world": jump the camera to this spot and mark it. `z` is looked up when `None`.
+    ShowInWorld {
+        /// WoW x.
+        x: f32,
+        /// WoW y.
+        y: f32,
+        /// WoW z, if known.
+        z: Option<f32>,
+    },
+    /// The notice's dismiss button.
+    DismissNotice,
     /// The log's paging buttons.
     LogPage {
         /// True = older page, false = newer.
