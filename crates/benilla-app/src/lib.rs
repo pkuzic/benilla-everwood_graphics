@@ -92,6 +92,9 @@ mod npc_text;
 mod perf;
 mod pipe_warm;
 mod player;
+// MONKEY (EME): the in-game GM map editor host glue, behind the `eme` feature.
+#[cfg(feature = "eme")]
+mod eme_host;
 mod poi_marker;
 mod portrait;
 #[cfg(feature = "dev")]
@@ -454,6 +457,10 @@ fn launch(build: BuildId, extend: Option<Extension<'_>>) -> AppExit {
         connect: !capturing,
         start: run_mode::start_state(),
     });
+
+    // MONKEY (EME): the GM map editor (F9 for server rank >= 2; inert for everyone else).
+    #[cfg(feature = "eme")]
+    app.add_plugins(eme_host::EmeHostPlugin);
 
     // benilla-assets' loaders go into the live `AssetServer`, so they register after `AssetPlugin`.
     benilla_assets::register_asset_loaders(&mut app);

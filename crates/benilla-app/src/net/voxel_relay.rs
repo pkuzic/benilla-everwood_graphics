@@ -280,6 +280,7 @@ fn monkey_voxel_route(
                         events.push(MonkeyVoxelNetEvent::DropLocal {
                             map,
                             nonce: p.nonce,
+                            reason: 0,
                         });
                     }
                 }
@@ -316,7 +317,7 @@ fn monkey_voxel_route(
                      {}) — dropping the local prediction",
                     wire::reject_reason(reason)
                 );
-                events.push(MonkeyVoxelNetEvent::DropLocal { map, nonce });
+                events.push(MonkeyVoxelNetEvent::DropLocal { map, nonce, reason });
             }
         }
     }
@@ -549,6 +550,7 @@ fn monkey_voxel_drain_outbox(
                         net.events.push(MonkeyVoxelNetEvent::DropLocal {
                             map: edit.map,
                             nonce: edit.nonce,
+                            reason: 0,
                         });
                     }
                 }
@@ -561,6 +563,7 @@ fn monkey_voxel_drain_outbox(
                     net.events.push(MonkeyVoxelNetEvent::DropLocal {
                         map: edit.map,
                         nonce: edit.nonce,
+                        reason: 0,
                     });
                     continue;
                 }
@@ -672,7 +675,7 @@ mod tests {
             }
         );
         assert!(matches!(ev[1], MonkeyVoxelNetEvent::Edit(e) if e.seq == Some(42)));
-        assert_eq!(ev[2], MonkeyVoxelNetEvent::DropLocal { map: 0, nonce: 9 });
+        assert_eq!(ev[2], MonkeyVoxelNetEvent::DropLocal { map: 0, nonce: 9, reason: 1 });
     }
 
     /// MONKEY (voxel): v3 `e` records confirm only with our actor + stroke + param; the uplink
@@ -753,7 +756,7 @@ mod tests {
                 ..
             }
         ));
-        assert_eq!(ev[3], MonkeyVoxelNetEvent::DropLocal { map: 0, nonce: 99 });
+        assert_eq!(ev[3], MonkeyVoxelNetEvent::DropLocal { map: 0, nonce: 99, reason: 0 });
         assert!(link.synced.contains(&(0, 0)));
         assert!(link.again.is_empty(), "the X arrived inside the SYNC reply: no extra re-ask");
         // A live E in the now-synced region moves its sync point.

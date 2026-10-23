@@ -10,10 +10,14 @@ workspace = true
 
 [features]
 # The dev/player seam: `cargo build -p benilla --no-default-features` is the player build.
-default = ["dev"]
+default = ["dev", "eme"]
 dev = ["benilla-app/dev"]
 # MONKEY (voxel): forwards the P0 voxel-render feature down to benilla-app. OFF by default.
 voxel = ["benilla-app/voxel"]
+# MONKEY (EME): the in-game GM map editor (F9 for GM rank 2+, inert for everyone else); pulls
+# `voxel`. Default ON for the Everwood client build (owner decision); a fork compiles it out with
+# `--no-default-features --features dev`.
+eme = ["benilla-app/eme"]
 # Profiling switches, forwarded so `cargo run -p benilla --features tracy` works.
 tracy = ["benilla-app/tracy"]
 trace_chrome = ["benilla-app/trace_chrome"]

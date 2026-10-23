@@ -30,6 +30,9 @@ mod session;
 // `voxel` feature (off by default), so the shipped player build is byte-unchanged.
 #[cfg(feature = "voxel")]
 pub(crate) mod voxel_relay;
+// MONKEY (EME): the editor's chat transport (`.mveme` service frames; edits ride the voxel relay).
+#[cfg(feature = "eme")]
+pub(crate) mod eme_relay;
 mod world;
 
 pub(crate) use apply::apply_net_updates;
@@ -87,6 +90,8 @@ impl Plugin for NetPlugin {
         // MONKEY (voxel): the P1b terrain-edit relay (join channel, send outbox, decode inbox).
         #[cfg(feature = "voxel")]
         voxel_relay::register(app);
+        #[cfg(feature = "eme")]
+        eme_relay::register(app);
         app.insert_resource(NetEvents(handles.events))
             .insert_resource(NetCommands(handles.commands))
             .insert_resource(CharPick(handles.pick))

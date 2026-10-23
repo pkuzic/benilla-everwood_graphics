@@ -11,3 +11,10 @@ workspace = true
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+# `bevy` derives `Resource` / `Message` on the shared host types (`host`); off by default, so the
+# core stays engine-free and its tests build no engine.
+bevy_ecs = { version = "0.18.1", default-features = false, features = ["std"], optional = true }
+
+[features]
+bevy = ["dep:bevy_ecs"]

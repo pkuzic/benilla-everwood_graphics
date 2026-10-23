@@ -14,7 +14,11 @@ default = ["dev"]
 # The asset, format and world crates default `dev` on, so they come in without it, forwarded here.
 dev = ["benilla-assets/dev", "benilla-formats/dev", "benilla-world/dev", "dep:bevy_egui"]
 # MONKEY (voxel): forwards the P0 voxel-render feature down to benilla-world. OFF by default.
-voxel = ["benilla-world/voxel"]
+voxel = ["benilla-world/voxel", "benilla-world/voxel_dev_brush"]
+# MONKEY (EME): the in-game GM map editor (DESIGN-EME.md): the `eme` plugin (F9, free camera,
+# picking, brush preview, stroke dispatcher) + the chat transport (`net/eme_relay.rs`). Pulls the
+# voxel layer and bevy_egui (for the UI shell). OFF here; the Everwood launcher turns it on.
+eme = ["voxel", "dep:eme", "dep:eme-core", "dep:bevy_egui"]
 tracy = ["bevy/trace_tracy"]
 # Writes every system's per-run span to `trace-<ts>.json` in the cwd.
 trace_chrome = ["bevy/trace_chrome"]
@@ -30,6 +34,9 @@ benilla-ui = { path = "../benilla-ui" }
 bevy.workspace = true
 wgpu.workspace = true
 bevy_egui = { version = "0.39", optional = true }
+# MONKEY (EME): the editor plugin and its engine-free core, behind the `eme` feature.
+eme = { path = "../eme", optional = true }
+eme-core = { path = "../eme-core", optional = true, features = ["bevy"] }
 bytemuck = { version = "1", features = ["derive"] }
 # `f16` decode for the `WOW_BOOTH_DUMP` dump of the `Rgba16Float` booth targets.
 half = "2"

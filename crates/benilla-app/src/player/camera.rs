@@ -704,6 +704,8 @@ pub(super) fn latch_world_mouse(
     window: Single<&Window, With<PrimaryWindow>>,
     mut script: Option<NonSendMut<benilla_ui::script::UiScript>>,
     cover: Option<Res<crate::loading_screen::LoadingScreen>>,
+    // MONKEY (EME): while the editor is open the left button is the brush's, not the world's.
+    #[cfg(feature = "eme")] eme_active: Option<Res<eme_core::EmeActive>>,
 ) {
     let calls = script
         .as_mut()
@@ -716,6 +718,13 @@ pub(super) fn latch_world_mouse(
     let world_press = rig.look.is_some() || (cursor_in_viewport(&window, camera) && !over_ui);
     let wm = &mut rig.world_mouse;
     wm.update(&buttons, world_press);
+    // MONKEY (EME): no orbit drag and no click-targeting from the left button while EME is open.
+    #[cfg(feature = "eme")]
+    if eme_active.is_some_and(|a| a.0) {
+        let l = LookButton::Left as usize;
+        wm.held[l] = false;
+        wm.down[l] = false;
+    }
     // The script's calls, made since the last latch, before this frame's release.
     for on in calls {
         wm.mouselook(on);

@@ -1,0 +1,178 @@
+//! # eme — the Everwood ME (EME) Bevy plugin
+//!
+//! EME is benilla's in-game, server-authoritative GM map editor (DESIGN-EME.md). This crate is the
+//! Bevy side of it, built on the engine-free [`eme_core`] and the voxel seam
+//! [`benilla_world::voxel::MonkeyVoxelApi`]; it never touches the network itself (a host plugs a
+//! transport into [`EmeWire`], e.g. benilla-app's chat transport `net/eme_relay.rs`).
+//!
+//! | Module | What |
+//! |---|---|
+//! | [`wire`] | [`EmeWire`]: the queue-backed [`eme_core::EmeTransport`] a host transport drains / fills |
+//! | [`camera`] | the free camera (WASD + RMB look, Shift fast, Ctrl slow, wheel speed, Tab back) |
+//! | [`viewport`] | cursor ray → [`EmeAim`] (voxel or ground hit + normal), the brush ring preview |
+//! | [`dispatch`] | the frame loop: pump → tool → dispatcher → `MonkeyVoxelApi::submit`; F9 / undo / redo |
+//! | [`offline`] | an emulated server for offline runs (local-only undo) |
+//! | [`script`] | `WOW_EME_SCRIPT=<json>`: drives the same code paths headlessly (capture mode) |
+//! | [`tools`] | the built-in tools (`sculpt`: dig / build / smooth / flatten) |
+//!
+//! ## Host contract
+//! - Shared names live in [`eme_core::host`]: [`EmeActive`] (resource), [`EmeToggleRequested`]
+//!   (message), [`EmePointerOverUi`] (written by the UI shell), [`EmeHostInput`] (written by the
+//!   host client: typing / pointer over its own UI).
+//! - The host holds the character still while [`EmeActive`] is on and keeps the world streaming
+//!   around the camera (benilla-app: `player.detached`).
+//! - A transport fills [`EmeWire::link`] and [`EmeWire::inbound`] and drains
+//!   [`EmeWire::take_services`]; voxel edits travel through the voxel layer's own outbox.
+//! - UI panels send [`EmeRequest`] messages (undo, redo, select tool, set option) and read
+//!   [`EmeHost`] (registry, dispatcher, undo stack) and [`EmeEventMsg`].
+
+pub mod camera;
+pub mod dispatch;
+pub mod offline;
+pub mod script;
+pub mod tools;
+pub mod viewport;
+pub mod wire;
+
+use bevy::prelude::*;
+use eme_core::{
+    EmeDispatchError, EmeDispatcher, EmeEvent, EmeOptionValue, EmeStrokeIds, EmeTool,
+    EmeToolRegistry, EmeToolReply,
+};
+
+pub use camera::EmeFreeCam;
+pub use eme_core::{EmeActive, EmeHostInput, EmePointerOverUi, EmeToggleRequested};
+pub use viewport::{EmeAim, EmeBrushPreviewState, EmeCursor, EmeGizmos};
+pub use wire::EmeWire;
+
+/// The EME system sets, in frame order. `Input` → `Frame` run in `Update` before the voxel layer
+/// (so a stroke's edits are ingested and meshed the same frame); `Camera` runs in `PostUpdate`
+/// before transform propagation, after anything in `Update` that seats the camera.
+#[derive(SystemSet, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum EmeSet {
+    /// Toggle, script, cursor ray / aim.
+    Input,
+    /// Pump the transport, feed the tool, dispatch, submit edits, preview.
+    Frame,
+    /// Write the free camera's pose (PostUpdate).
+    Camera,
+}
+
+/// EME's state: the tool registry, the command dispatcher (undo stack + service client) and the
+/// shared stroke-id counter. UI panels read it (toolbar = `registry.visible(...)`, history =
+/// `dispatcher.undo_stack()`).
+#[derive(Resource)]
+pub struct EmeHost {
+    /// Every registered tool and the active one.
+    pub registry: EmeToolRegistry,
+    /// Gates, sends, records history, routes replies.
+    pub dispatcher: EmeDispatcher,
+    /// The character's stroke-id sequence, shared by every stroke-opening tool.
+    pub stroke_ids: EmeStrokeIds,
+    /// Replies for tools / panels from the last pump (overwritten each frame).
+    pub replies: Vec<EmeToolReply>,
+    /// Commands the dispatcher refused on the last dispatch.
+    pub errors: Vec<EmeDispatchError>,
+    pub(crate) caps_asked: bool,
+}
+
+impl Default for EmeHost {
+    fn default() -> Self {
+        Self {
+            registry: EmeToolRegistry::new(),
+            dispatcher: EmeDispatcher::default(),
+            stroke_ids: EmeStrokeIds::default(),
+            replies: Vec::new(),
+            errors: Vec::new(),
+            caps_asked: false,
+        }
+    }
+}
+
+/// A request from a UI panel, a script or a host (honoured only while EME is active and the
+/// caller's rank allows it).
+#[derive(Message, Debug, Clone, PartialEq)]
+pub enum EmeRequest {
+    /// Ctrl+Z.
+    Undo,
+    /// Ctrl+Y.
+    Redo,
+    /// "Undo anyway" after an `UndoNeedsConfirm` event.
+    ConfirmUndo(eme_core::EmeEntryId),
+    /// Activate a tool by id.
+    SelectTool(String),
+    /// Set an option of the active tool.
+    SetOption {
+        /// Option key.
+        key: String,
+        /// New value.
+        value: EmeOptionValue,
+    },
+}
+
+/// An [`EmeEvent`] re-emitted as a Bevy message (entry pushed / committed / undone / redone /
+/// discarded, undo-needs-confirm, …).
+#[derive(Message, Debug, Clone, PartialEq)]
+pub struct EmeEventMsg(pub EmeEvent);
+
+/// `app.register_eme_tool(tool)`: add a tool (registration order = toolbar order).
+pub trait EmeAppExt {
+    /// Register `tool` with EME. Panics on a duplicate id (a programming error).
+    fn register_eme_tool(&mut self, tool: impl EmeTool) -> &mut Self;
+}
+
+impl EmeAppExt for App {
+    fn register_eme_tool(&mut self, tool: impl EmeTool) -> &mut Self {
+        self.init_resource::<EmeHost>();
+        let mut host = self.world_mut().resource_mut::<EmeHost>();
+        host.registry
+            .register(Box::new(tool))
+            .expect("EME tool ids are unique");
+        self
+    }
+}
+
+/// The EME plugin. Inert for anyone whose server rank (`caps`) is below 2: F9 does nothing, no
+/// camera, no brush, no preview.
+pub struct EmePlugin;
+
+impl Plugin for EmePlugin {
+    fn build(&self, app: &mut App) {
+        app.init_resource::<EmeHost>()
+            .init_resource::<EmeActive>()
+            .init_resource::<EmePointerOverUi>()
+            .init_resource::<EmeHostInput>()
+            .init_resource::<EmeWire>()
+            .add_message::<EmeToggleRequested>()
+            .add_message::<EmeRequest>()
+            .add_message::<EmeEventMsg>();
+        let ids = app.world().resource::<EmeHost>().stroke_ids.clone();
+        app.register_eme_tool(tools::sculpt::EmeSculptTool::new(ids));
+        app.configure_sets(
+            Update,
+            (EmeSet::Input, EmeSet::Frame)
+                .chain()
+                .before(benilla_world::voxel::MonkeyVoxelSet)
+                .run_if(world_live),
+        );
+        app.configure_sets(
+            PostUpdate,
+            EmeSet::Camera.before(bevy::transform::TransformSystems::Propagate),
+        );
+        camera::register(app);
+        viewport::register(app);
+        dispatch::register(app);
+        offline::register(app);
+        script::register(app);
+    }
+}
+
+/// The world is live (benilla-world's flag; EME has nothing to do on the glue screens).
+fn world_live(live: Option<Res<benilla_world::schedule::WorldLive>>) -> bool {
+    live.is_some_and(|l| l.0)
+}
+
+/// Milliseconds of game time, EME's clock (frozen-clock captures stay deterministic).
+pub(crate) fn now_ms(time: &Time) -> u64 {
+    time.elapsed().as_millis() as u64
+}

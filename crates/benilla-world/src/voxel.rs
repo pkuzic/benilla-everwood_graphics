@@ -32,6 +32,12 @@ pub use material::MonkeyVoxelMaterial;
 use material::MonkeyVoxelMaterialHandle;
 
 mod terrain_hide;
+// MONKEY (voxel / EME seam): the public editor API (`MonkeyVoxelApi`) and its events.
+mod api;
+pub use api::{
+    MonkeyVoxelApi, MonkeyVoxelBrushPreview, MonkeyVoxelEvent, MonkeyVoxelHit,
+    MonkeyVoxelRegionState, MonkeyVoxelSubmit,
+};
 use terrain_hide::{monkey_voxel_hide_terrain, MonkeyVoxelHideState, CARVE_INSET};
 
 use crate::terrain_stream::voxel_clip::VoxelCarve;
@@ -120,8 +126,20 @@ pub enum MonkeyVoxelNetEvent {
     /// The region's persisted sync point (a `D`, or a live edit in a synced region).
     SyncPoint { map: u16, rx: i16, ry: i16, epoch: u16, last_seq: u32 },
     /// Drop our prediction `nonce` on `map` (an `R` reject, or a stale one the server never got).
-    DropLocal { map: u16, nonce: u16 },
+    /// MONKEY (EME seam): `reason` = the `R` code, 0 = dropped client-side (stale / unsendable).
+    DropLocal { map: u16, nonce: u16, reason: u8 },
 }
+
+/// MONKEY (EME seam): an editor (EME) owns the brush input while this is set - the dev key brush
+/// (`voxel_dev_brush`) then stays inert, so two brushes never fight. Set through
+/// [`MonkeyVoxelApi::claim_input`].
+#[derive(Resource, Default)]
+pub struct MonkeyVoxelInputClaimed(pub bool);
+
+/// MONKEY (EME seam): the voxel layer's chained per-frame systems. An editor that submits edits
+/// orders itself `.before(MonkeyVoxelSet)` so they are ingested and meshed the same frame.
+#[derive(SystemSet, Debug, Clone, PartialEq, Eq, Hash)]
+pub struct MonkeyVoxelSet;
 
 /// Whether the local player is a GM (`PLAYER_FLAGS & 0x8`, i.e. `.gm on`). benilla-world can't read
 /// the network descriptor, so benilla-app fills this each frame from the self player's flags. Gates
@@ -806,17 +824,27 @@ impl MonkeyVoxelWorld {
     }
 
     /// A LOCAL edit (brush / AUTOEDIT): stamps map + nonce, ingests it, queues it for the uplink.
-    fn local_edit(&mut self, net: &mut MonkeyVoxelNet, mut e: VoxelEditOp) {
-        let Some(map) = self.current_map_u16() else {
-            return;
-        };
+    fn local_edit(&mut self, net: &mut MonkeyVoxelNet, e: VoxelEditOp) {
+        self.local_edit_nonce(net, e, None);
+    }
+
+    /// MONKEY (EME seam): [`Self::local_edit`] with an optional caller-owned nonce (EME's stroke
+    /// builder numbers its edits; the layer's own counter then continues after it). Returns the
+    /// nonce used, `None` when no map is loaded or the edit is invalid.
+    fn local_edit_nonce(
+        &mut self,
+        net: &mut MonkeyVoxelNet,
+        mut e: VoxelEditOp,
+        nonce: Option<u16>,
+    ) -> Option<u16> {
+        let map = self.current_map_u16()?;
         e.map = map;
         e.seq = None;
         e.local = true;
-        e.nonce = self.next_nonce;
-        self.next_nonce = self.next_nonce.wrapping_add(1);
+        e.nonce = nonce.unwrap_or(self.next_nonce);
+        self.next_nonce = e.nonce.wrapping_add(1);
         if !e.is_valid() {
-            return;
+            return None;
         }
         if e.mode == 0 {
             self.last_dig = Some(e.pos);
@@ -825,19 +853,37 @@ impl MonkeyVoxelWorld {
         self.ingest(e, true);
         self.perf.push((e.radius, t0.elapsed().as_secs_f32() * 1000.0));
         net.outbox.push(e);
+        Some(e.nonce)
+    }
+
+    /// MONKEY (EME seam): OFFLINE undo - drop every still-pending local prediction of `stroke` on
+    /// `map` (oldest first) and rebuild what they touched. Stroke 0 ("no stroke") drops nothing.
+    fn drop_stroke_local(&mut self, map: u16, stroke: u16) -> Vec<VoxelEditOp> {
+        if stroke == 0 {
+            return Vec::new();
+        }
+        let nonces: Vec<u16> = self
+            .pending_local(map)
+            .into_iter()
+            .filter(|e| e.stroke == stroke)
+            .map(|e| e.nonce)
+            .collect();
+        nonces
+            .into_iter()
+            .filter_map(|n| self.drop_local(map, n))
+            .collect()
     }
 
     /// SERVER LANE: our prediction `nonce` came back as `seq` — confirm it (no re-apply).
-    pub fn confirm(&mut self, map: u16, nonce: u16, seq: u32) {
-        let Some(j) = self.journal.maps.get_mut(&map) else {
-            return;
-        };
-        if let Some((e, how)) = j.confirm(nonce, seq) {
-            self.journal_dirty = true;
-            if how == JournalInsert::OutOfOrder && self.current_map_u16() == Some(map) {
-                self.requeue(&e.touched_chunks());
-            }
+    /// MONKEY (EME seam): returns the confirmed edit's stroke id (`None` = no such prediction).
+    pub fn confirm(&mut self, map: u16, nonce: u16, seq: u32) -> Option<u16> {
+        let j = self.journal.maps.get_mut(&map)?;
+        let (e, how) = j.confirm(nonce, seq)?;
+        self.journal_dirty = true;
+        if how == JournalInsert::OutOfOrder && self.current_map_u16() == Some(map) {
+            self.requeue(&e.touched_chunks());
         }
+        Some(e.stroke)
     }
 
     /// SERVER LANE: REGION-RESET — drop the region's journal, adopt `epoch`, rebuild its chunks.
@@ -1199,11 +1245,16 @@ impl Plugin for MonkeyVoxelPlugin {
         app.init_resource::<MonkeyVoxelWorld>();
         app.init_resource::<MonkeyVoxelTileMaterials>();
         app.init_resource::<MonkeyVoxelPerf>();
+        // MONKEY (EME seam): the editor claim + the edit-outcome messages.
+        app.init_resource::<MonkeyVoxelInputClaimed>();
+        app.add_message::<MonkeyVoxelEvent>();
         app.add_systems(
             Update,
             (
                 monkey_voxel_clock_start,
                 monkey_voxel_map_watch,
+                // MONKEY (EME seam): the dev key brush only with `voxel_dev_brush`.
+                #[cfg(feature = "voxel_dev_brush")]
                 monkey_voxel_brush_edit,
                 monkey_voxel_autoedit,
                 monkey_voxel_synth,
@@ -1219,6 +1270,7 @@ impl Plugin for MonkeyVoxelPlugin {
                 monkey_voxel_clock_end,
             )
                 .chain()
+                .in_set(MonkeyVoxelSet)
                 .run_if(crate::schedule::world_is_live),
         );
     }
@@ -1284,15 +1336,20 @@ fn monkey_voxel_aim_density(
     }
 }
 
+/// MONKEY (EME seam): the DEV key brush, compiled only with the `voxel_dev_brush` feature and
+/// inert while an editor claims the input ([`MonkeyVoxelInputClaimed`]).
+///
 /// P1 brush (GM only). Hold **`[`** dig · **`]`** build · **`\`** smooth, aimed along the view ray at
 /// whatever is under the crosshair — the real ADT ground or an existing voxel surface; **`-`/`=`**
 /// change the brush size (0.5 yd steps). Edits are emitted at ≤ 8/s (when the brush centre moved
 /// ≥ radius/2 or 125 ms passed — CONTRACT §3's uplink cadence), and EXACTLY the emitted edits are
 /// applied locally, journalled and uplinked, so every client converges on the same shape.
 #[allow(clippy::too_many_arguments)]
+#[cfg(feature = "voxel_dev_brush")]
 fn monkey_voxel_brush_edit(
     keys: Res<ButtonInput<KeyCode>>,
     gm: Res<MonkeyLocalGm>,
+    claimed: Res<MonkeyVoxelInputClaimed>,
     time: Res<Time>,
     mut radius: ResMut<MonkeyVoxelBrushRadius>,
     camera: Query<&GlobalTransform, With<WorldCamera>>,
@@ -1302,7 +1359,8 @@ fn monkey_voxel_brush_edit(
     mut net: ResMut<MonkeyVoxelNet>,
     mut last: Local<Option<([f32; 3], f32)>>,
 ) {
-    if !gm.0 {
+    if !gm.0 || claimed.0 {
+        *last = None;
         return;
     }
     if keys.just_pressed(KeyCode::Minus) {
@@ -1546,7 +1604,11 @@ fn monkey_voxel_autoedit_stroke(
 /// [`LIVE_APPLY_MS`]) is applied LIVE (incremental + hot remesh, like our own brush); a burst (a
 /// SYNC reply, a resync after `X`) goes BULK — journalled and its chunks rebuilt off-thread — so the
 /// frame never replays hundreds of edits inline.
-fn monkey_voxel_apply_inbox(mut net: ResMut<MonkeyVoxelNet>, mut world: ResMut<MonkeyVoxelWorld>) {
+fn monkey_voxel_apply_inbox(
+    mut net: ResMut<MonkeyVoxelNet>,
+    mut world: ResMut<MonkeyVoxelWorld>,
+    mut out: MessageWriter<MonkeyVoxelEvent>,
+) {
     if world.map.is_none() {
         return; // keep buffering until the first world entry
     }
@@ -1574,7 +1636,14 @@ fn monkey_voxel_apply_inbox(mut net: ResMut<MonkeyVoxelNet>, mut world: ResMut<M
     }
     for (nonce, seq) in std::mem::take(&mut net.confirms) {
         if let Some(map) = world.current_map_u16() {
-            world.confirm(map, nonce, seq);
+            if let Some(stroke) = world.confirm(map, nonce, seq) {
+                out.write(MonkeyVoxelEvent::Confirmed {
+                    map,
+                    nonce,
+                    seq,
+                    stroke,
+                });
+            }
         }
     }
     for (map, rx, ry, epoch) in std::mem::take(&mut net.resets) {
@@ -1606,11 +1675,19 @@ fn monkey_voxel_apply_inbox(mut net: ResMut<MonkeyVoxelNet>, mut world: ResMut<M
                 }
             }
             MonkeyVoxelNetEvent::Confirm { map, nonce, seq } => {
-                world.confirm(map, nonce, seq);
+                if let Some(stroke) = world.confirm(map, nonce, seq) {
+                    out.write(MonkeyVoxelEvent::Confirmed {
+                        map,
+                        nonce,
+                        seq,
+                        stroke,
+                    });
+                }
                 confirmed.push(seq);
             }
             MonkeyVoxelNetEvent::Reset { map, rx, ry, epoch } => {
                 world.reset_region(map, rx, ry, epoch);
+                out.write(MonkeyVoxelEvent::RegionReset { map, rx, ry, epoch });
                 // MONKEY (voxel): one summary line below — a log line per region measured ~1 ms
                 // each on a redirected console (a 9-region resync was a 16 ms frame).
                 resets.push((map, rx, ry, epoch));
@@ -1622,8 +1699,14 @@ fn monkey_voxel_apply_inbox(mut net: ResMut<MonkeyVoxelNet>, mut world: ResMut<M
                 epoch,
                 last_seq,
             } => world.region_done(map, rx, ry, epoch, last_seq),
-            MonkeyVoxelNetEvent::DropLocal { map, nonce } => {
+            MonkeyVoxelNetEvent::DropLocal { map, nonce, reason } => {
                 if let Some(e) = world.drop_local(map, nonce) {
+                    out.write(MonkeyVoxelEvent::Dropped {
+                        map,
+                        nonce,
+                        stroke: e.stroke,
+                        reason,
+                    });
                     info!(
                         "MONKEY (voxel): dropped local prediction nonce {nonce} at WoW ({:.1}, \
                          {:.1}, {:.1}) r={} — chunks rebuilding",
@@ -3166,5 +3249,40 @@ mod tests {
         let nonce = net.outbox[0].nonce;
         world.confirm(0, nonce, 77);
         assert!(world.pending_local(0).is_empty());
+    }
+
+    /// MONKEY (EME seam): a pinned nonce is kept (and the layer's counter continues after it), a
+    /// confirm reports the stroke, and the offline undo drops exactly one stroke's predictions.
+    #[test]
+    fn seam_pins_nonces_and_drops_one_stroke_locally() {
+        let mut world = MonkeyVoxelWorld {
+            map: Some(0),
+            ..Default::default()
+        };
+        let mut net = MonkeyVoxelNet::default();
+        let edit = |x: f32, stroke: u16| VoxelEditOp {
+            pos: [x, 56.0, 40.0],
+            radius: 2.0,
+            mode: 0,
+            strength: 255,
+            stroke,
+            ..Default::default()
+        };
+        assert_eq!(world.local_edit_nonce(&mut net, edit(40.0, 5), Some(1000)), Some(1000));
+        assert_eq!(world.local_edit_nonce(&mut net, edit(41.0, 5), Some(1001)), Some(1001));
+        assert_eq!(world.local_edit_nonce(&mut net, edit(42.0, 6), None), Some(1002));
+        assert_eq!(
+            world.local_edit_nonce(&mut net, VoxelEditOp { radius: 40.0, ..edit(0.0, 6) }, None),
+            None,
+            "invalid radius refused"
+        );
+        assert_eq!(net.outbox.len(), 3);
+        assert!(net.outbox.iter().all(|e| e.local && e.map == 0));
+        assert_eq!(world.confirm(0, 1002, 9), Some(6));
+        let dropped = world.drop_stroke_local(0, 5);
+        assert_eq!(dropped.iter().map(|e| e.nonce).collect::<Vec<_>>(), vec![1000, 1001]);
+        assert!(world.pending_local(0).is_empty());
+        assert_eq!(world.journal.maps[&0].edits().len(), 1, "the confirmed stroke-6 edit stays");
+        assert!(world.drop_stroke_local(0, 0).is_empty());
     }
 }

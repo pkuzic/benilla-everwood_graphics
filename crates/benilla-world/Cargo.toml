@@ -19,6 +19,10 @@ dev = ["benilla-formats/dev", "benilla-assets/dev", "bevy/debug"]
 # OFF by default — the shipped player build stays byte-unchanged; `dep:benilla-voxel` keeps the
 # optional dependency from also minting an implicit same-named feature.
 voxel = ["dep:benilla-voxel"]
+# MONKEY (EME seam): the DEV key brush (`[` dig, `]` build, `\` smooth, `-`/`=` size). The editor
+# (EME, feature `eme` on benilla-app) replaces it; kept ON in benilla-app's `voxel` set for now so
+# nothing regresses, and inert while EME claims the input.
+voxel_dev_brush = ["voxel"]
 
 [dependencies]
 avian3d = "0.6"

@@ -18,6 +18,7 @@
 //! | [`service`] | `.mveme` JSON: requests, replies, pushes, typed rows |
 //! | [`perm`] | ranks and capabilities |
 //! | [`api`] | public integration surface: [`EmeEvent`], [`EmeHistoryHook`], [`EmeServiceClient`] |
+//! | [`host`] | names every EME crate shares: [`EmeActive`], [`EmeToggleRequested`], [`EmePointerOverUi`] (Bevy types with feature `bevy`) |
 //!
 //! See the crate README for how to add a tool.
 
@@ -26,6 +27,7 @@
 pub mod api;
 pub mod bus;
 pub mod command;
+pub mod host;
 mod lenient;
 pub mod perm;
 pub mod service;
@@ -39,6 +41,7 @@ pub use api::{
     EmeServiceClient,
 };
 pub use bus::{EmeDispatchError, EmeDispatcher, EmePumpOutput, EmeRoute, EmeToolReply};
+pub use host::{EmeActive, EmeHostInput, EmePointerOverUi, EmeToggleRequested};
 pub use command::{EmeCommand, EmeCommandSink, EmeIssued, EmeObjectRequest, EmeStrokeMark};
 pub use perm::{EmeCapability, EmePermissions, EmeRank};
 pub use service::{
@@ -51,7 +54,7 @@ pub use tool::{
     EmeToolId, EmeToolRegistry,
 };
 pub use transport::{
-    EmeInbound, EmeLink, EmeLoopbackTransport, EmeRejectReason, EmeTransport, EmeVoxelEdit,
+    EmeInbound, EmeLink, EmeLoopbackTransport, EmeRequestIdAlloc, EmeRejectReason, EmeTransport, EmeVoxelEdit,
 };
 pub use undo::{
     EmeEntryId, EmeEntryState, EmeHistoryRequest, EmeHistoryTicket, EmeUndoBackend, EmeUndoEntry,

@@ -522,6 +522,8 @@ dependencies = [
  "cosmic-text",
  "cpal 0.17.1",
  "crossbeam-channel",
+ "eme",
+ "eme-core",
  "fontdb",
  "half",
  "image",
@@ -3028,9 +3030,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "eme"
+version = "0.2.0"
+dependencies = [
+ "benilla-assets",
+ "benilla-world",
+ "bevy",
+ "eme-core",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "eme-core"
 version = "0.2.0"
 dependencies = [
+ "bevy_ecs",
  "serde",
  "serde_json",
 ]

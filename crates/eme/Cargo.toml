@@ -1,0 +1,18 @@
+[package]
+name = "eme"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Everwood ME (EME) Bevy plugin: F9 toggle, free camera, viewport picking, brush preview, the stroke dispatcher over the voxel seam, the offline emulated server and the WOW_EME_SCRIPT capture hook"
+
+[lints]
+workspace = true
+
+[dependencies]
+eme-core = { path = "../eme-core", features = ["bevy"] }
+# The voxel seam (`MonkeyVoxelApi`); `default-features = false` keeps `dev` out of a player build.
+benilla-world = { path = "../benilla-world", default-features = false, features = ["voxel"] }
+benilla-assets = { path = "../benilla-assets", default-features = false }
+bevy.workspace = true
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
