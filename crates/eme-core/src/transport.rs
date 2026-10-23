@@ -51,8 +51,37 @@ pub mod mode {
     pub const ROUGHEN: u8 = 5;
 
     /// Whether re-applying the same edit at the same place changes nothing (CSG union/subtract).
+    /// Mode only: a SOFT dig / build ([`is_soft`]) is not idempotent — use [`is_idempotent_edit`].
     pub const fn is_idempotent(mode: u8) -> bool {
         matches!(mode, DIG | BUILD | PAINT)
+    }
+
+    /// CONTRACT v3.3: `param` bit 15 on modes 0 / 1 / 2 = a SOFT brush (lower / raise / smooth
+    /// with a radial falloff; `benilla_voxel::world::SoftBrush`).
+    pub const SOFT: u16 = 0x8000;
+    /// Soft falloff (`param` bits 0-1): smoothstep from the inner (hardness) disc to the rim.
+    pub const FALLOFF_SMOOTH: u8 = 0;
+    /// Soft falloff: linear to the rim.
+    pub const FALLOFF_LINEAR: u8 = 1;
+    /// Soft falloff: none (full amount up to the rim).
+    pub const FALLOFF_FLAT: u8 = 2;
+
+    /// Whether `(mode, param)` is a soft brush.
+    pub const fn is_soft(mode: u8, param: u16) -> bool {
+        matches!(mode, DIG | BUILD | SMOOTH) && param & SOFT != 0
+    }
+
+    /// The soft-brush `param`: bit 15, falloff in bits 0-1, hardness percent (0..=100) in 2-8.
+    pub const fn soft_param(falloff: u8, hardness: u8) -> u16 {
+        let f = if falloff > 2 { 0 } else { falloff };
+        let h = if hardness > 100 { 100 } else { hardness };
+        SOFT | f as u16 | (h as u16) << 2
+    }
+
+    /// [`is_idempotent`] for a whole edit: a soft dig / build accumulates (holding it still keeps
+    /// raising / lowering), so it keeps the stroke builder's time trigger.
+    pub const fn is_idempotent_edit(mode: u8, param: u16) -> bool {
+        is_idempotent(mode) && !is_soft(mode, param)
     }
 }
 

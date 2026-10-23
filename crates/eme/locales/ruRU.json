@@ -1,11 +1,17 @@
 {
   "MONKEY_EME_SCULPT_MODE": "Режим",
-  "MONKEY_EME_SCULPT_MODE_DIG": "Копать",
-  "MONKEY_EME_SCULPT_MODE_BUILD": "Насыпать",
+  "MONKEY_EME_SCULPT_MODE_DIG": "Опустить / копать",
+  "MONKEY_EME_SCULPT_MODE_BUILD": "Поднять / насыпать",
   "MONKEY_EME_SCULPT_MODE_SMOOTH": "Сгладить",
   "MONKEY_EME_SCULPT_RADIUS": "Радиус, ярд.",
-  "MONKEY_EME_SCULPT_STRENGTH": "Сила",
+  "MONKEY_EME_SCULPT_STRENGTH": "Сила, %",
   "MONKEY_EME_FLATTEN_RADIUS": "Радиус, ярд.",
-  "MONKEY_EME_FLATTEN_STRENGTH": "Сила",
-  "MONKEY_EME_FLATTEN_OFFSET": "Смещение высоты, ярд."
+  "MONKEY_EME_FLATTEN_STRENGTH": "Сила, %",
+  "MONKEY_EME_FLATTEN_OFFSET": "Смещение высоты, ярд.",
+  "MONKEY_EME_SCULPT_FALLOFF": "Спад",
+  "MONKEY_EME_SCULPT_FALLOFF_SMOOTH": "Плавный",
+  "MONKEY_EME_SCULPT_FALLOFF_LINEAR": "Линейный",
+  "MONKEY_EME_SCULPT_FALLOFF_FLAT": "Ровный",
+  "MONKEY_EME_SCULPT_HARDNESS": "Жёсткость, %",
+  "MONKEY_EME_SCULPT_HARD": "Жёсткая кисть (сферы)"
 }

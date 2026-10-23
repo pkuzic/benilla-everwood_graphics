@@ -225,7 +225,7 @@ impl EmeStrokeBuilder {
             return true;
         }
         // The time trigger (≥ min interval, already required by the rate check).
-        !(mode::is_idempotent(s.mode) && d < self.config.stationary_fraction * r)
+        !(mode::is_idempotent_edit(s.mode, s.param) && d < self.config.stationary_fraction * r)
     }
 
     /// Try to send the trailing release edit of an ended stroke.

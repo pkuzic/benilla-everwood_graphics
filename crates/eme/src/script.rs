@@ -123,8 +123,8 @@ fn mode_value(v: &Json) -> Option<EmeOptionValue> {
     let m = match v {
         Json::Number(n) => n.as_u64()? as usize,
         Json::String(s) => match s.as_str() {
-            "dig" => 0,
-            "build" => 1,
+            "dig" | "lower" => 0,
+            "build" | "raise" => 1,
             "smooth" => 2,
             _ => return None,
         },
