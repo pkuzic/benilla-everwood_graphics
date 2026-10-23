@@ -12,16 +12,22 @@
 //! The host owns the egui camera / context (and `EguiPlugin`, added before [`crate::EmePlugin`]
 //! when it wants its own overlay camera) and sets [`EmeLanguage`].
 
+use std::collections::HashMap;
+
 use bevy::prelude::*;
-use eme_core::service::{EmeLogPage, EmeLogQuery, EmeLogRow, EmeSnapshotRow};
-use eme_core::{EmeServiceRequest, EmeToolRegistry, EmeUndoStack};
+use eme_core::service::{
+    EmeLogPage, EmeLogQuery, EmeLogRow, EmeRevertResult, EmeServiceError, EmeSnapshotRow,
+};
+use eme_core::{EmeServiceRequest, EmeToolId, EmeToolRegistry, EmeUndoStack};
 use eme_ui::{
-    EmeI18n, EmeLang, EmeLogTable, EmeRestorePoints, EmeRightTab, EmeSession, EmeShell,
-    EmeShellSource, EmeStatus, EmeUiCommand, EmeUiPlugin,
+    EmeI18n, EmeLang, EmeLogTable, EmeNotice, EmeOtherStroke, EmeOthersHistory,
+    EmeRestorePoints, EmeRightTab, EmeSession, EmeShell, EmeShellSource, EmeStatus, EmeUiCommand,
+    EmeUiPlugin,
 };
 
 use crate::camera::EmeFreeCam;
-use crate::{EmeActive, EmeHost, EmeRequest, EmeSet, EmeWire};
+use crate::viewport::{EmeMarker, MARKER_MS};
+use crate::{now_ms, EmeActive, EmeHost, EmeRequest, EmeSet, EmeWire};
 use benilla_assets::coords::bevy_to_wow;
 use benilla_world::voxel::MonkeyVoxelApi;
 
@@ -43,22 +49,82 @@ impl EmeShellSource for EmeHost {
 /// (`None` = the newest page).
 #[derive(Resource, Debug, Default)]
 pub struct EmeLogPaging {
+    /// The filters in force (the log tab's Apply).
+    query: EmeLogQuery,
     before: Vec<Option<u32>>,
     /// The page the last request asked for (applied when its reply lands).
     asked: u32,
 }
 
+/// The pseudo-tool the character-name lookups are filed under (their replies are not the log
+/// table's).
+const NAMES: EmeToolId = EmeToolId("names");
+/// Most other-GM stroke rows kept.
+const OTHERS_MAX: usize = 30;
+/// A stroke row keeps absorbing edits of the same (actor, stroke) for this long, ms.
+const OTHERS_MERGE_MS: u64 = 60_000;
+/// Notices fade after this long, ms.
+const NOTICE_MS: u64 = 20_000;
+
+/// Low GUID → character name, learned from log rows.
+#[derive(Resource, Debug, Default)]
+pub struct EmeNames {
+    names: HashMap<u32, String>,
+    asked_ms: u64,
+}
+
 pub(crate) fn register(app: &mut App) {
     app.add_plugins(EmeUiPlugin::<EmeHost>::default())
         .init_resource::<EmeLogPaging>()
+        .init_resource::<EmeNames>()
         .add_systems(Startup, extend_locales)
         .add_systems(Update, ui_commands.in_set(EmeSet::Input))
         .add_systems(
             Update,
-            (ui_replies, ui_status, refresh_on_open)
+            (
+                ui_replies,
+                ui_status,
+                refresh_on_open,
+                others_names,
+                notice_expiry,
+            )
                 .chain()
                 .after(EmeSet::Frame),
         );
+}
+
+/// A live stroke edit by another character: add it to the read-only History rows.
+pub(crate) fn note_remote(
+    others: &mut EmeOthersHistory,
+    actor: u32,
+    stroke: u16,
+    mode: u8,
+    pos: [f32; 3],
+    now: u64,
+) {
+    if let Some(i) = others.rows.iter().position(|r| {
+        r.actor == actor && r.stroke == stroke && now.saturating_sub(r.seen_ms) < OTHERS_MERGE_MS
+    }) {
+        let mut r = others.rows.remove(i);
+        r.edits += 1;
+        r.pos = pos;
+        r.seen_ms = now;
+        others.rows.insert(0, r);
+    } else {
+        others.rows.insert(
+            0,
+            EmeOtherStroke {
+                actor,
+                name: String::new(),
+                stroke,
+                edits: 1,
+                mode,
+                pos,
+                seen_ms: now,
+            },
+        );
+        others.rows.truncate(OTHERS_MAX);
+    }
 }
 
 /// The built-in tools' option labels (`MONKEY_EME_SCULPT_*`), both languages.
@@ -73,12 +139,12 @@ fn extend_locales(mut i18n: ResMut<EmeI18n>) {
     }
 }
 
-/// The request for a log page.
-fn log_request(before_seq: Option<u32>) -> EmeServiceRequest {
+/// The request for a log page of `query` (the filters), `before_seq` = the paging cursor.
+fn log_request(query: &EmeLogQuery, before_seq: Option<u32>) -> EmeServiceRequest {
     EmeServiceRequest::Log(EmeLogQuery {
         limit: Some(LOG_PAGE_ROWS),
         before_seq,
-        ..Default::default()
+        ..query.clone()
     })
 }
 
@@ -90,15 +156,42 @@ fn snapshot_list() -> EmeServiceRequest {
 }
 
 /// Shell commands → EME requests.
+#[allow(clippy::too_many_arguments)]
 fn ui_commands(
     mut cmds: MessageReader<EmeUiCommand>,
     mut out: MessageWriter<EmeRequest>,
     host: Res<EmeHost>,
     log: Res<EmeLogTable>,
     mut paging: ResMut<EmeLogPaging>,
+    mut restore: ResMut<EmeRestorePoints>,
+    mut notice: ResMut<EmeNotice>,
+    (mut cam, mut marker, time, api): (
+        ResMut<EmeFreeCam>,
+        ResMut<EmeMarker>,
+        Res<Time>,
+        MonkeyVoxelApi,
+    ),
 ) {
     for c in cmds.read() {
         let req = match c {
+            EmeUiCommand::LogQuery(q) => {
+                paging.query = q.clone();
+                paging.before = vec![None];
+                paging.asked = 0;
+                EmeRequest::Service(log_request(&paging.query, None))
+            }
+            EmeUiCommand::SelectRestore(id) => {
+                restore.selected = *id;
+                continue;
+            }
+            EmeUiCommand::DismissNotice => {
+                notice.clear();
+                continue;
+            }
+            EmeUiCommand::ShowInWorld { x, y, z } => {
+                show_in_world(&mut cam, &mut marker, &api, now_ms(&time), [*x, *y], *z);
+                continue;
+            }
             EmeUiCommand::ActivateTool(id) => EmeRequest::SelectTool(id.as_str().to_owned()),
             EmeUiCommand::Undo => EmeRequest::Undo,
             EmeUiCommand::Redo => EmeRequest::Redo,
@@ -130,13 +223,13 @@ fn ui_commands(
                     continue;
                 };
                 paging.asked = want;
-                EmeRequest::Service(log_request(before))
+                EmeRequest::Service(log_request(&paging.query, before))
             }
             EmeUiCommand::TabOpened(EmeRightTab::Restore) => EmeRequest::Service(snapshot_list()),
             EmeUiCommand::TabOpened(EmeRightTab::Log) => {
                 paging.before = vec![None];
                 paging.asked = 0;
-                EmeRequest::Service(log_request(None))
+                EmeRequest::Service(log_request(&paging.query, None))
             }
             EmeUiCommand::TabOpened(EmeRightTab::History) => continue,
         };
@@ -144,22 +237,82 @@ fn ui_commands(
     }
 }
 
+/// The notice for a refused service reply: the server's `msg` key if the client knows it, else
+/// the code's own key, else the generic "refused: <code>".
+fn error_notice(i18n: &EmeI18n, reply: &eme_core::EmeServiceReply) -> (String, Vec<String>) {
+    let code = reply.err.clone().unwrap_or_else(|| "internal".to_owned());
+    let err = EmeServiceError::parse(&code);
+    let known = |k: &str| i18n.has(EmeLang::EnUs, k) && i18n.has(EmeLang::RuRu, k);
+    let key = reply
+        .msg
+        .clone()
+        .filter(|k| known(k))
+        .unwrap_or_else(|| err.locale_key());
+    if known(&key) && !matches!(err, EmeServiceError::Other(_)) {
+        (key, Vec::new())
+    } else {
+        ("MONKEY_EME_ERR_OTHER".to_owned(), vec![code])
+    }
+}
+
 /// Service replies for the panels.
+#[allow(clippy::too_many_arguments)]
 fn ui_replies(
-    host: Res<EmeHost>,
+    mut host: ResMut<EmeHost>,
     mut restore: ResMut<EmeRestorePoints>,
     mut log: ResMut<EmeLogTable>,
     paging: Res<EmeLogPaging>,
+    mut names: ResMut<EmeNames>,
+    mut notice: ResMut<EmeNotice>,
+    i18n: Res<EmeI18n>,
     mut out: MessageWriter<EmeRequest>,
+    mut seen_errors: Local<Vec<eme_core::EmeDispatchError>>,
 ) {
-    for r in host.replies.iter().filter(|r| r.tool.is_none()) {
+    // Local refusals (link down, not permitted) and host-queued messages.
+    if host.errors != *seen_errors {
+        *seen_errors = host.errors.clone();
+        if seen_errors
+            .iter()
+            .any(|e| matches!(e.error, eme_core::EmeSendError::LinkDown))
+        {
+            notice.set("MONKEY_EME_NOTICE_NOT_SENT", Vec::new(), true);
+        }
+    }
+    for (key, args, error) in std::mem::take(&mut host.notices) {
+        notice.set(key, args, error);
+    }
+    for r in host.replies.iter() {
+        // Name lookups (filed under the pseudo-tool) feed the cache only.
+        if r.tool == Some(NAMES) {
+            if let (true, Ok(rows)) = (r.reply.ok, r.reply.rows_as::<EmeLogRow>()) {
+                for row in rows {
+                    names.names.insert(row.guid, row.name);
+                }
+            }
+            continue;
+        }
+        if r.tool.is_some() {
+            continue;
+        }
         if !r.reply.ok {
             info!("EME: {} refused: {:?}", r.op, r.reply.err);
+            if !matches!(r.op, "view" | "caps") {
+                let (key, args) = error_notice(&i18n, &r.reply);
+                notice.set(key, args, true);
+            }
             continue;
         }
         match r.op {
             "snapshot_list" => match r.reply.rows_as::<EmeSnapshotRow>() {
-                Ok(rows) => restore.rows = rows,
+                Ok(rows) => {
+                    restore.rows = rows;
+                    if restore
+                        .selected
+                        .is_some_and(|id| !restore.rows.iter().any(|r| r.snapshot == id))
+                    {
+                        restore.selected = None;
+                    }
+                }
                 Err(e) => warn!("EME: snapshot_list rows: {e}"),
             },
             "log" => {
@@ -167,6 +320,9 @@ fn ui_replies(
                 let page = r.reply.extra_as::<EmeLogPage>().unwrap_or_default();
                 match rows {
                     Ok(rows) => {
+                        for row in &rows {
+                            names.names.insert(row.guid, row.name.clone());
+                        }
                         *log = EmeLogTable {
                             count: page.count.max(rows.len() as u32),
                             more: page.more || r.reply.more(),
@@ -177,12 +333,100 @@ fn ui_replies(
                     Err(e) => warn!("EME: log rows: {e}"),
                 }
             }
-            // A new restore point or a revert changes the list.
-            "snapshot_create" | "revert" => {
+            "snapshot_create" => {
+                notice.set("MONKEY_EME_NOTICE_SNAPSHOT_OK", Vec::new(), false);
                 out.write(EmeRequest::Service(snapshot_list()));
+            }
+            // A revert changes the list and the log (its rows are now marked reverted).
+            "revert" | "undo_player" => {
+                let n = r.reply.extra_as::<EmeRevertResult>().unwrap_or_default();
+                let key = if r.op == "revert" {
+                    "MONKEY_EME_NOTICE_REVERT_OK"
+                } else {
+                    "MONKEY_EME_NOTICE_UNDOPLAYER_OK"
+                };
+                notice.set(
+                    key,
+                    vec![n.voxel.to_string(), n.liquid.to_string(), n.area.to_string()],
+                    false,
+                );
+                out.write(EmeRequest::Service(snapshot_list()));
+                out.write(EmeRequest::Service(log_request(&paging.query, None)));
             }
             _ => {}
         }
+    }
+}
+
+/// Jump the free camera to a spot and mark it. `z` is looked up from the ground when unknown.
+fn show_in_world(
+    cam: &mut EmeFreeCam,
+    marker: &mut EmeMarker,
+    api: &MonkeyVoxelApi,
+    now: u64,
+    xy: [f32; 2],
+    z: Option<f32>,
+) {
+    let eye_now = bevy_to_wow(cam.pos);
+    let z = z
+        .or_else(|| api.surface_z(xy[0], xy[1], eye_now[2], 400.0))
+        .unwrap_or(eye_now[2] - 10.0);
+    // Stand back south-west and above, looking at the spot.
+    let target = [xy[0], xy[1], z];
+    cam.look_at_wow([xy[0] - 14.0, xy[1] - 6.0, z + 11.0], target);
+    *marker = EmeMarker {
+        pos: target,
+        until_ms: now + MARKER_MS,
+    };
+}
+
+/// Give the other-GM rows their names (from the log cache), ask for unknown ones (rarely).
+fn others_names(
+    time: Res<Time>,
+    active: Res<EmeActive>,
+    mut host: ResMut<EmeHost>,
+    mut wire: ResMut<EmeWire>,
+    mut names: ResMut<EmeNames>,
+    mut others: ResMut<EmeOthersHistory>,
+) {
+    let now = now_ms(&time);
+    others.now_ms = now;
+    let mut unknown = false;
+    for r in others.rows.iter_mut().filter(|r| r.name.is_empty()) {
+        match names.names.get(&r.actor) {
+            Some(n) => r.name = n.clone(),
+            None => unknown = true,
+        }
+    }
+    if unknown && active.0 && wire.link.is_usable() && now.saturating_sub(names.asked_ms) > 5_000 {
+        names.asked_ms = now;
+        let req = EmeServiceRequest::Log(EmeLogQuery {
+            minutes: Some(10),
+            radius: Some(500.0),
+            limit: Some(25),
+            ..Default::default()
+        });
+        let host = &mut *host;
+        let _ = host.dispatcher.request(now, &mut *wire, Some(NAMES), req);
+    }
+}
+
+/// A notice fades after a while (results sooner than errors).
+fn notice_expiry(
+    time: Res<Time>,
+    mut notice: ResMut<EmeNotice>,
+    mut shown: Local<(u32, u64)>,
+) {
+    if notice.key.is_empty() {
+        return;
+    }
+    let now = now_ms(&time);
+    if shown.0 != notice.seq {
+        *shown = (notice.seq, now);
+    }
+    let life = if notice.error { NOTICE_MS } else { NOTICE_MS / 2 };
+    if now.saturating_sub(shown.1) > life {
+        notice.clear();
     }
 }
 
@@ -247,7 +491,7 @@ fn refresh_on_open(
             EmeRightTab::Log => {
                 paging.before = vec![None];
                 paging.asked = 0;
-                out.write(EmeRequest::Service(log_request(None)));
+                out.write(EmeRequest::Service(log_request(&paging.query, None)));
             }
             EmeRightTab::History => {}
         }
@@ -267,15 +511,22 @@ mod tests {
             .unwrap();
         i18n.extend_json(EmeLang::RuRu, include_str!("../locales/ruRU.json"))
             .unwrap();
-        let tool = crate::tools::sculpt::EmeSculptTool::new(eme_core::EmeStrokeIds::default());
+        let ids = eme_core::EmeStrokeIds::default();
+        let sculpt = crate::tools::sculpt::EmeSculptTool::new(ids.clone());
+        let flatten = crate::tools::flatten::EmeFlattenTool::new(ids);
         let mut keys: Vec<String> = Vec::new();
-        for f in eme_core::EmeTool::options_ui_model(&tool) {
-            keys.push(f.label.clone());
-            if let eme_core::EmeOptionKind::Choice(c) = &f.kind {
-                keys.extend(c.iter().cloned());
+        for tool in [
+            &sculpt as &dyn eme_core::EmeTool,
+            &flatten as &dyn eme_core::EmeTool,
+        ] {
+            for f in tool.options_ui_model() {
+                keys.push(f.label.clone());
+                if let eme_core::EmeOptionKind::Choice(c) = &f.kind {
+                    keys.extend(c.iter().cloned());
+                }
             }
+            keys.push(format!("{}NAME", tool.id().locale_prefix()));
         }
-        keys.push("MONKEY_EME_SCULPT_NAME".into());
         for lang in [EmeLang::EnUs, EmeLang::RuRu] {
             for k in &keys {
                 assert!(i18n.has(lang, k), "{lang:?}: missing {k}");
@@ -288,5 +539,25 @@ mod tests {
                 "{k}: RU equals EN"
             );
         }
+    }
+
+    /// Other GMs' strokes: one row per (actor, stroke), newest first, edits counted.
+    #[test]
+    fn remote_edits_group_into_stroke_rows() {
+        let mut o = EmeOthersHistory::default();
+        note_remote(&mut o, 9, 4, 1, [1.0, 2.0, 3.0], 1_000);
+        note_remote(&mut o, 9, 4, 1, [2.0, 2.0, 3.0], 1_200);
+        note_remote(&mut o, 7, 1, 0, [0.0, 0.0, 0.0], 1_500);
+        assert_eq!(o.rows.len(), 2);
+        assert_eq!((o.rows[0].actor, o.rows[0].edits), (7, 1));
+        assert_eq!((o.rows[1].actor, o.rows[1].edits), (9, 2));
+        assert_eq!(o.rows[1].pos, [2.0, 2.0, 3.0]);
+        // The same stroke id much later is a new stroke (ids restart per session).
+        note_remote(&mut o, 9, 4, 1, [0.0; 3], 1_200 + OTHERS_MERGE_MS + 1);
+        assert_eq!(o.rows.len(), 3);
+        for n in 0..(OTHERS_MAX as u16 + 5) {
+            note_remote(&mut o, 100, n, 0, [0.0; 3], 5_000_000);
+        }
+        assert_eq!(o.rows.len(), OTHERS_MAX);
     }
 }

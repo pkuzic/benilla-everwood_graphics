@@ -3,8 +3,9 @@
   "MONKEY_EME_SCULPT_MODE_DIG": "Копать",
   "MONKEY_EME_SCULPT_MODE_BUILD": "Насыпать",
   "MONKEY_EME_SCULPT_MODE_SMOOTH": "Сгладить",
-  "MONKEY_EME_SCULPT_MODE_FLATTEN": "Выровнять",
   "MONKEY_EME_SCULPT_RADIUS": "Радиус, ярд.",
   "MONKEY_EME_SCULPT_STRENGTH": "Сила",
-  "MONKEY_EME_SCULPT_OFFSET": "Смещение высоты, ярд."
+  "MONKEY_EME_FLATTEN_RADIUS": "Радиус, ярд.",
+  "MONKEY_EME_FLATTEN_STRENGTH": "Сила",
+  "MONKEY_EME_FLATTEN_OFFSET": "Смещение высоты, ярд."
 }

@@ -21,7 +21,12 @@
 //! ]}
 //! ```
 //! Other ops: `tool {id}`, `option {key, value}`, `redo`, `log {msg}`, `wait_active`,
-//! `tab {name: history|restore|log}` / `panels {left, right}` (the shell's side panels). Every wait
+//! `tab {name: history|restore|log}` / `panels {left, right}` (the shell's side panels),
+//! `svc {req}` (any service request as the host, e.g. `{"op":"snapshot_create","label":"x"}`),
+//! `revert_last` (revert the newest listed restore point, as the confirmed UI button would),
+//! `select_restore {idx}`, `show {x, y}` (camera jump + marker), `filter {player, radius,
+//! minutes, mode, layer}` (the log tab's Apply), `report` (log the restore list, log table,
+//! other-GM rows and notice) and `wait_caps` (the server's `caps` arrived). Every wait
 //! takes `max_s` (default 20) and logs a timeout instead of hanging. Each step logs an
 //! `EME script:` line with the voxel journal / chunk counts, so a run is checkable from its log.
 
@@ -121,7 +126,6 @@ fn mode_value(v: &Json) -> Option<EmeOptionValue> {
             "dig" => 0,
             "build" => 1,
             "smooth" => 2,
-            "flatten" => 3,
             _ => return None,
         },
         _ => return None,
@@ -157,6 +161,13 @@ fn run_script(
         ResMut<eme_ui::EmeShell>,
         MessageWriter<eme_ui::EmeUiCommand>,
     ),
+    (restore, log_table, others, notice, wire): (
+        Res<eme_ui::EmeRestorePoints>,
+        Res<eme_ui::EmeLogTable>,
+        Res<eme_ui::EmeOthersHistory>,
+        Res<eme_ui::EmeNotice>,
+        Res<EmeWire>,
+    ),
 ) {
     if script.done() {
         return;
@@ -173,8 +184,21 @@ fn run_script(
     let max_s = num(&step, "max_s").unwrap_or(20.0);
     let map = api.map().unwrap_or(0);
     let status = || {
+        // An FNV hash over the canonical journal: two clients that converged print the same one.
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for e in api.journal(map).iter().filter(|e| e.seq.is_some()) {
+            for v in [
+                u64::from(e.seq.unwrap_or(0)),
+                u64::from(e.mode),
+                (e.pos[0] * 100.0).round() as i64 as u64,
+                (e.pos[1] * 100.0).round() as i64 as u64,
+                (e.pos[2] * 100.0).round() as i64 as u64,
+            ] {
+                h = (h ^ v).wrapping_mul(0x0000_0100_0000_01b3);
+            }
+        }
         format!(
-            "map {map}, journal {} edit(s) ({} pending), {} active chunk(s), settled {}, hit {:?}",
+            "map {map}, journal {} edit(s) ({} pending), confirmed-hash {h:016x}, {} active chunk(s), settled {}, hit {:?}",
             api.journal(map).len(),
             api.pending_local(map).len(),
             api.active_chunks(),
@@ -240,11 +264,21 @@ fn run_script(
                 });
             let dur = num(&step, "s").unwrap_or(0.5).max(0.05);
             if first {
-                if let Some(m) = step.get("mode").and_then(mode_value) {
-                    requests.write(EmeRequest::SetOption {
-                        key: "mode".into(),
-                        value: m,
-                    });
+                // "flatten" is its own tool; dig / build / smooth are the sculpt tool's modes.
+                match step.get("mode") {
+                    Some(Json::String(m)) if m == "flatten" => {
+                        requests.write(EmeRequest::SelectTool("flatten".into()));
+                    }
+                    Some(m) => {
+                        if let Some(m) = mode_value(m) {
+                            requests.write(EmeRequest::SelectTool("sculpt".into()));
+                            requests.write(EmeRequest::SetOption {
+                                key: "mode".into(),
+                                value: m,
+                            });
+                        }
+                    }
+                    None => {}
                 }
                 if let Some(r) = num(&step, "radius") {
                     requests.write(EmeRequest::SetOption {
@@ -267,6 +301,101 @@ fn run_script(
         }
         "undo" => {
             requests.write(EmeRequest::Undo);
+        }
+        "wait_caps" => {
+            done = host.dispatcher.caps().is_some() || t > max_s;
+            if t > max_s {
+                warn!("EME script: wait_caps timed out (link {:?})", wire.link);
+            }
+        }
+        "svc" => match step
+            .get("req")
+            .cloned()
+            .and_then(|v| serde_json::from_value::<eme_core::EmeServiceRequest>(v).ok())
+        {
+            Some(req) => {
+                requests.write(EmeRequest::Service(req));
+            }
+            None => warn!("EME script: svc needs a valid service request in `req`"),
+        },
+        "revert_last" => match restore.rows.first() {
+            Some(row) => {
+                info!("EME script: reverting restore point {} ({:?})", row.snapshot, row.label);
+                ui_cmds.write(eme_ui::EmeUiCommand::Service(
+                    eme_core::EmeServiceRequest::Revert {
+                        snapshot: row.snapshot,
+                    },
+                ));
+            }
+            None => warn!("EME script: revert_last: no restore point listed"),
+        },
+        "select_restore" => {
+            let idx = num(&step, "idx").unwrap_or(0.0) as usize;
+            let id = restore.rows.get(idx).map(|r| r.snapshot);
+            ui_cmds.write(eme_ui::EmeUiCommand::SelectRestore(id));
+        }
+        "show" => {
+            ui_cmds.write(eme_ui::EmeUiCommand::ShowInWorld {
+                x: num(&step, "x").unwrap_or(0.0),
+                y: num(&step, "y").unwrap_or(0.0),
+                z: num(&step, "z"),
+            });
+        }
+        "filter" => {
+            let text = |k: &str| {
+                step.get(k).map_or(String::new(), |v| match v {
+                    Json::String(s) => s.clone(),
+                    other => other.to_string(),
+                })
+            };
+            shell.filter = eme_ui::EmeLogFilterUi {
+                player: text("player"),
+                radius: text("radius"),
+                minutes: text("minutes"),
+                mode: num(&step, "mode").unwrap_or(0.0) as usize,
+                layer: num(&step, "layer").unwrap_or(0.0) as usize,
+            };
+            shell.layout.right_open = true;
+            shell.layout.right_tab = eme_ui::EmeRightTab::Log;
+            ui_cmds.write(eme_ui::EmeUiCommand::LogQuery(shell.filter.query()));
+        }
+        "report" => {
+            info!(
+                "EME script: REPORT restore={:?} selected={:?}",
+                restore
+                    .rows
+                    .iter()
+                    .map(|r| (r.snapshot, r.label.clone(), r.radius))
+                    .collect::<Vec<_>>(),
+                restore.selected
+            );
+            info!(
+                "EME script: REPORT log count={} more={} page={} rows={:?}",
+                log_table.count,
+                log_table.more,
+                log_table.page,
+                log_table
+                    .rows
+                    .iter()
+                    .take(8)
+                    .map(|r| (r.seq, r.name.clone(), r.mode, r.stroke, r.reverted))
+                    .collect::<Vec<_>>()
+            );
+            info!(
+                "EME script: REPORT others={:?}",
+                others
+                    .rows
+                    .iter()
+                    .map(|r| (r.actor, r.name.clone(), r.stroke, r.edits))
+                    .collect::<Vec<_>>()
+            );
+            info!("EME script: REPORT notice={:?} error={}", notice.key, notice.error);
+            let undo = host.dispatcher.undo_stack();
+            info!(
+                "EME script: REPORT caps={:?} undo entries={}",
+                host.dispatcher.caps().map(|c| (c.rank.0, c.tools.clone())),
+                undo.entries().len()
+            );
         }
         "panels" => {
             if let Some(b) = step.get("left").and_then(Json::as_bool) {

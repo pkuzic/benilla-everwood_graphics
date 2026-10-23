@@ -70,14 +70,137 @@ pub struct EmeBrushPreviewState {
     pub color: [f32; 4],
 }
 
+/// The ground outline of the selected restore point's radius (cached; refreshed twice a second).
+#[derive(Resource, Debug, Clone, PartialEq, Default)]
+pub struct EmeRestoreOutline {
+    /// The snapshot the ring belongs to.
+    pub id: Option<u32>,
+    /// Centre, WoW yards.
+    pub center: [f32; 3],
+    /// Radius, yards.
+    pub radius: f32,
+    /// Rim points following the ground, WoW yards.
+    pub ring: Vec<[f32; 3]>,
+    /// Seconds since the ring was computed.
+    age: f32,
+}
+
+/// A "show in world" marker (a beam and a pulsing ring), drawn until `until_ms`.
+#[derive(Resource, Debug, Clone, Copy, PartialEq, Default)]
+pub struct EmeMarker {
+    /// Where, WoW yards.
+    pub pos: [f32; 3],
+    /// Game-clock ms it fades at (0 = none).
+    pub until_ms: u64,
+}
+
+/// How long a marker stays, ms.
+pub const MARKER_MS: u64 = 8_000;
+/// Rim points of a restore-point outline.
+const OUTLINE_SEGMENTS: usize = 128;
+
 pub(crate) fn register(app: &mut App) {
     app.init_resource::<EmeCursor>()
         .init_resource::<EmeAim>()
         .init_resource::<EmeBrushPreviewState>()
+        .init_resource::<EmeRestoreOutline>()
+        .init_resource::<EmeMarker>()
         .init_gizmo_group::<EmeGizmos>()
         .add_systems(Startup, configure_gizmos)
         .add_systems(Update, update_cursor_and_aim.in_set(EmeSet::Input))
-        .add_systems(Update, draw_preview.after(EmeSet::Frame));
+        .add_systems(Update, draw_preview.after(EmeSet::Frame))
+        .add_systems(
+            Update,
+            (update_restore_outline, draw_outline_and_marker)
+                .chain()
+                .after(EmeSet::Frame),
+        );
+}
+
+/// Refresh the selected restore point's rim (ground-following) a couple of times a second.
+fn update_restore_outline(
+    time: Res<Time<Real>>,
+    active: Res<EmeActive>,
+    restore: Res<eme_ui::EmeRestorePoints>,
+    cam: Res<crate::camera::EmeFreeCam>,
+    api: MonkeyVoxelApi,
+    mut out: ResMut<EmeRestoreOutline>,
+) {
+    let sel = restore
+        .selected
+        .filter(|_| active.0)
+        .and_then(|id| restore.rows.iter().find(|r| r.snapshot == id));
+    let Some(row) = sel else {
+        if out.id.is_some() {
+            *out = EmeRestoreOutline::default();
+        }
+        return;
+    };
+    out.age += time.delta_secs();
+    if out.id == Some(row.snapshot) && out.radius == row.radius && out.age < 0.5 {
+        return;
+    }
+    let eye = bevy_to_wow(cam.pos);
+    let near_z = api
+        .surface_z(row.x, row.y, eye[2], 400.0)
+        .unwrap_or(eye[2] - 10.0);
+    let n = OUTLINE_SEGMENTS;
+    let ring = (0..n)
+        .map(|i| {
+            let a = i as f32 / n as f32 * std::f32::consts::TAU;
+            let (x, y) = (row.x + row.radius * a.cos(), row.y + row.radius * a.sin());
+            let z = api.surface_z(x, y, near_z, 80.0).unwrap_or(near_z);
+            [x, y, z]
+        })
+        .collect();
+    *out = EmeRestoreOutline {
+        id: Some(row.snapshot),
+        center: [row.x, row.y, near_z],
+        radius: row.radius,
+        ring,
+        age: 0.0,
+    };
+}
+
+/// The selected restore point's outline (cyan, with posts every 16th point so a far rim reads)
+/// and the show-in-world marker.
+fn draw_outline_and_marker(
+    time: Res<Time>,
+    active: Res<EmeActive>,
+    outline: Res<EmeRestoreOutline>,
+    marker: Res<EmeMarker>,
+    mut gizmos: Gizmos<EmeGizmos>,
+) {
+    if !active.0 {
+        return;
+    }
+    let cyan = Color::srgba(0.2, 0.9, 1.0, 1.0);
+    if outline.id.is_some() && outline.ring.len() > 2 {
+        let lift = |p: [f32; 3], up: f32| wow_to_bevy([p[0], p[1], p[2] + up]);
+        gizmos.linestrip(
+            outline.ring.iter().chain(outline.ring.first()).map(|p| lift(*p, 0.3)),
+            cyan,
+        );
+        for p in outline.ring.iter().step_by(16) {
+            gizmos.line(lift(*p, 0.0), lift(*p, 6.0), cyan);
+        }
+    }
+    let now = crate::now_ms(&time);
+    if marker.until_ms > now {
+        let left = (marker.until_ms - now) as f32 / MARKER_MS as f32;
+        let pulse = ((now as f32 / 1000.0) * 3.0).sin() * 0.5 + 0.5;
+        let c = Color::srgba(1.0, 0.2, 0.9, left.clamp(0.2, 1.0));
+        let p = marker.pos;
+        gizmos.line(wow_to_bevy(p), wow_to_bevy([p[0], p[1], p[2] + 40.0]), c);
+        let r = 1.5 + 2.5 * pulse;
+        let ring: Vec<Vec3> = (0..=32)
+            .map(|i| {
+                let a = i as f32 / 32.0 * std::f32::consts::TAU;
+                wow_to_bevy([p[0] + r * a.cos(), p[1] + r * a.sin(), p[2] + 0.4])
+            })
+            .collect();
+        gizmos.linestrip(ring, c);
+    }
 }
 
 fn configure_gizmos(mut store: ResMut<GizmoConfigStore>) {
@@ -179,6 +302,9 @@ pub(crate) fn active_mode(host: &EmeHost) -> u8 {
     let Some(id) = host.registry.active_id() else {
         return 255;
     };
+    if id == crate::tools::flatten::FLATTEN {
+        return eme_core::transport::mode::FLATTEN;
+    }
     host.registry
         .get(id.as_str())
         .and_then(|t| {

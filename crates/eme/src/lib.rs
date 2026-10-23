@@ -13,7 +13,7 @@
 //! | [`dispatch`] | the frame loop: pump → tool → dispatcher → `MonkeyVoxelApi::submit`; F9 / undo / redo |
 //! | [`offline`] | an emulated server for offline runs (local-only undo) |
 //! | [`script`] | `WOW_EME_SCRIPT=<json>`: drives the same code paths headlessly (capture mode) |
-//! | [`tools`] | the built-in tools (`sculpt`: dig / build / smooth / flatten) |
+//! | [`tools`] | the built-in tools (`sculpt`: dig / build / smooth; `flatten`) |
 //! | [`ui`] | the `eme-ui` shell fed from [`EmeHost`] (toolbar, options, history, restore, log, status) |
 //!
 //! ## Host contract
@@ -50,7 +50,9 @@ pub use eme_core::{
     EmeActive, EmeHostInput, EmePointerOverUi, EmeToggleRequested, EmeUiWantsKeyboard,
 };
 pub use eme_ui;
-pub use viewport::{EmeAim, EmeBrushPreviewState, EmeCursor, EmeGizmos};
+pub use viewport::{
+    EmeAim, EmeBrushPreviewState, EmeCursor, EmeGizmos, EmeMarker, EmeRestoreOutline,
+};
 pub use wire::EmeWire;
 
 /// The EME system sets, in frame order. `Input` → `Frame` run in `Update` before the voxel layer
@@ -81,6 +83,8 @@ pub struct EmeHost {
     pub replies: Vec<EmeToolReply>,
     /// Commands the dispatcher refused on the last dispatch.
     pub errors: Vec<EmeDispatchError>,
+    /// Messages for the UI's notice line (locale key, args, is-error); drained by `ui`.
+    pub(crate) notices: Vec<(String, Vec<String>, bool)>,
     pub(crate) caps_asked: bool,
 }
 
@@ -92,6 +96,7 @@ impl Default for EmeHost {
             stroke_ids: EmeStrokeIds::default(),
             replies: Vec::new(),
             errors: Vec::new(),
+            notices: Vec::new(),
             caps_asked: false,
         }
     }
@@ -160,7 +165,8 @@ impl Plugin for EmePlugin {
             .add_message::<EmeRequest>()
             .add_message::<EmeEventMsg>();
         let ids = app.world().resource::<EmeHost>().stroke_ids.clone();
-        app.register_eme_tool(tools::sculpt::EmeSculptTool::new(ids));
+        app.register_eme_tool(tools::sculpt::EmeSculptTool::new(ids.clone()));
+        app.register_eme_tool(tools::flatten::EmeFlattenTool::new(ids));
         app.configure_sets(
             Update,
             (EmeSet::Input, EmeSet::Frame)

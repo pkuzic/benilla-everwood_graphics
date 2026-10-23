@@ -1,13 +1,14 @@
-//! `sculpt` (T1 + T2): the terrain brush — dig / build / smooth / flatten on the real ground or an
-//! existing voxel surface. LMB held = one stroke; the core [`EmeStrokeBuilder`] coalesces the held
+//! `sculpt` (T1 + T2): the terrain brush — dig / build / smooth on the real ground or an
+//! existing voxel surface. The same machinery with the mode locked to flatten is the separate
+//! `flatten` tool ([`super::flatten`]). LMB held = one stroke; the core [`EmeStrokeBuilder`] coalesces the held
 //! brush into ≤ 8 EDIT3/s (move ≥ r/2 or 125 ms), every edit tagged with the stroke id, so one
 //! Ctrl+Z undoes the whole stroke.
 //!
-//! Flatten (mode 3) samples its plane at the press: every edit of the stroke carries
+//! Flatten (mode 3, the `flatten` tool) samples its plane at the press: every edit of the stroke carries
 //! `param = (plane − z) · 100` (cm, i16), so the whole stroke levels toward the clicked height.
 //!
-//! Options: `mode` (choice dig / build / smooth / flatten), `radius` (0.5–16 yd), `strength`
-//! (smooth / flatten blend, 1–255), `offset` (flatten plane offset, yards).
+//! Options: `mode` (choice dig / build / smooth; sculpt only), `radius` (0.5–16 yd), `strength`
+//! (smooth / flatten blend, 1–255), `offset` (flatten plane offset, yards; flatten only).
 
 use eme_core::command::{EmeCommand, EmeCommandSink, EmeStrokeMark};
 use eme_core::stroke::{EmeBrushSample, EmeStrokeBuilder, EmeStrokeConfig, EmeStrokeIds};
@@ -20,18 +21,21 @@ use eme_core::transport::mode;
 /// The tool id (also the server's name for it in `caps.tools`).
 pub const SCULPT: EmeToolId = EmeToolId("sculpt");
 
-/// Choice labels of the `mode` option (locale keys), in mode order 0..=3.
-pub const MODE_LABELS: [&str; 4] = [
+/// Choice labels of the `mode` option (locale keys), in mode order 0..=2 (flatten is its own tool).
+pub const MODE_LABELS: [&str; 3] = [
     "MONKEY_EME_SCULPT_MODE_DIG",
     "MONKEY_EME_SCULPT_MODE_BUILD",
     "MONKEY_EME_SCULPT_MODE_SMOOTH",
-    "MONKEY_EME_SCULPT_MODE_FLATTEN",
 ];
 
 /// The terrain brush.
 #[derive(Debug)]
 pub struct EmeSculptTool {
     builder: EmeStrokeBuilder,
+    /// The tool's id (`sculpt`, or `flatten` for the locked variant).
+    tool: EmeToolId,
+    /// The mode is fixed (the `flatten` tool): no mode option.
+    locked: bool,
     /// Voxel mode 0..=3.
     pub mode: u8,
     /// Radius, yards.
@@ -50,6 +54,15 @@ impl EmeSculptTool {
     /// A sculpt tool numbering its strokes from the shared `ids` counter. Nonces start at a
     /// time-seeded value, so they do not collide with an earlier session's pending predictions.
     pub fn new(ids: EmeStrokeIds) -> Self {
+        Self::with_kind(ids, SCULPT, mode::DIG, false)
+    }
+
+    /// The brush with its mode locked to flatten (see [`super::flatten::EmeFlattenTool`]).
+    pub(crate) fn new_flatten(ids: EmeStrokeIds, id: EmeToolId) -> Self {
+        Self::with_kind(ids, id, mode::FLATTEN, true)
+    }
+
+    fn with_kind(ids: EmeStrokeIds, tool: EmeToolId, mode: u8, locked: bool) -> Self {
         let seed = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0x4d45, |d| (d.subsec_micros() as u16).rotate_left(5) ^ 0x4d45);
@@ -57,7 +70,9 @@ impl EmeSculptTool {
             builder: EmeStrokeBuilder::new(EmeStrokeConfig::default())
                 .with_start(ids.peek(), seed)
                 .with_ids(ids),
-            mode: mode::DIG,
+            tool,
+            locked,
+            mode,
             radius: 4.0,
             strength: 255,
             offset: 0.0,
@@ -107,7 +122,7 @@ impl EmeSculptTool {
 
 impl EmeTool for EmeSculptTool {
     fn id(&self) -> EmeToolId {
-        SCULPT
+        self.tool
     }
 
     fn min_rank(&self) -> u8 {
@@ -157,8 +172,8 @@ impl EmeTool for EmeSculptTool {
     }
 
     fn options_ui_model(&self) -> EmeOptions {
-        let p = SCULPT.locale_prefix();
-        vec![
+        let p = self.tool.locale_prefix();
+        let mut fields = vec![
             EmeOptionField {
                 key: "mode",
                 label: format!("{p}MODE"),
@@ -199,13 +214,20 @@ impl EmeTool for EmeSculptTool {
                 value: EmeOptionValue::Number(self.offset),
                 disabled: self.mode != mode::FLATTEN,
             },
-        ]
+        ];
+        if self.locked {
+            fields.retain(|f| f.key != "mode");
+        } else {
+            fields.retain(|f| f.key != "offset");
+        }
+        fields
     }
 
     fn set_option(&mut self, key: &str, value: EmeOptionValue) {
         match (key, value) {
-            ("mode", EmeOptionValue::Choice(i)) if i <= 3 => self.mode = i as u8,
-            ("mode", EmeOptionValue::Number(n)) if (0.0..=3.0).contains(&n) => self.mode = n as u8,
+            ("mode", _) if self.locked => {}
+            ("mode", EmeOptionValue::Choice(i)) if i <= 2 => self.mode = i as u8,
+            ("mode", EmeOptionValue::Number(n)) if (0.0..=2.0).contains(&n) => self.mode = n as u8,
             ("radius", EmeOptionValue::Number(r)) => self.radius = r.clamp(0.5, 16.0),
             ("strength", EmeOptionValue::Number(s)) => self.strength = s.clamp(1.0, 255.0) as u8,
             ("offset", EmeOptionValue::Number(o)) => self.offset = o.clamp(-16.0, 16.0),
@@ -310,8 +332,7 @@ mod tests {
 
     #[test]
     fn flatten_samples_its_plane_at_the_press() {
-        let mut t = EmeSculptTool::new(EmeStrokeIds::default());
-        t.set_option("mode", EmeOptionValue::Choice(3));
+        let mut t = EmeSculptTool::new_flatten(EmeStrokeIds::default(), super::super::flatten::FLATTEN);
         t.set_option("offset", EmeOptionValue::Number(0.5));
         let mut sink = EmeCommandSink::new();
         let press = EmeButton {

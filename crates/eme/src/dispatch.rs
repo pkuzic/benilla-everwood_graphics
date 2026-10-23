@@ -55,9 +55,21 @@ struct EmeViewAnchor {
 }
 
 /// Our edits' fate, from the voxel layer, into the transport's inbound queue.
-fn collect_voxel_events(mut events: MessageReader<MonkeyVoxelEvent>, mut wire: ResMut<EmeWire>) {
+fn collect_voxel_events(
+    mut events: MessageReader<MonkeyVoxelEvent>,
+    mut wire: ResMut<EmeWire>,
+    mut others: ResMut<eme_ui::EmeOthersHistory>,
+    time: Res<Time>,
+) {
     for ev in events.read() {
         match *ev {
+            MonkeyVoxelEvent::Remote {
+                actor,
+                stroke,
+                mode,
+                pos,
+                ..
+            } => crate::ui::note_remote(&mut others, actor, stroke, mode, pos, now_ms(&time)),
             MonkeyVoxelEvent::Confirmed {
                 nonce, seq, stroke, ..
             } => {
@@ -237,6 +249,8 @@ fn frame(
             EmeRequest::Service(req) => {
                 if let Err(e) = host.dispatcher.request(now, &mut *wire, None, req.clone()) {
                     info!("EME: {} not sent: {e:?}", req.op());
+                    host.notices
+                        .push(("MONKEY_EME_NOTICE_NOT_SENT".into(), Vec::new(), true));
                 }
             }
             EmeRequest::SelectTool(id) => {
@@ -388,5 +402,64 @@ fn log_undo<T: std::fmt::Debug, E: std::fmt::Debug>(r: Result<T, E>) {
     match r {
         Ok(v) => info!("EME: undo: {v:?}"),
         Err(e) => info!("EME: undo: {e:?}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use eme_core::{EmeLink, EmeServiceReply};
+
+    /// An app with just the toggle system, a link that is up and a `caps` reply of `rank`
+    /// (`None` = the reply never arrives).
+    fn app_with_rank(rank: Option<u8>) -> App {
+        let mut app = App::new();
+        app.init_resource::<Time>()
+            .init_resource::<EmeHost>()
+            .init_resource::<EmeActive>()
+            .init_resource::<EmeWire>()
+            .init_resource::<EmeHostInput>()
+            .init_resource::<EmeUiWantsKeyboard>()
+            .init_resource::<ButtonInput<KeyCode>>()
+            .add_message::<EmeToggleRequested>()
+            .add_systems(Update, toggle);
+        if let Some(rank) = rank {
+            let mut wire = EmeWire::default();
+            wire.set_link(EmeLink::Up { server_version: 3 });
+            let mut host = EmeHost::default();
+            host.dispatcher.request_caps(0, &mut wire).unwrap();
+            let id = wire.take_services()[0].id;
+            wire.inbound.push(EmeInbound::Reply(
+                EmeServiceReply::ok(id)
+                    .with("rank", rank)
+                    .with("wire", 3)
+                    .with("tools", ["sculpt", "flatten"]),
+            ));
+            host.dispatcher.pump(0, &mut wire);
+            app.insert_resource(wire).insert_resource(host);
+        }
+        app
+    }
+
+    fn press_f9(app: &mut App) {
+        app.world_mut()
+            .resource_mut::<ButtonInput<KeyCode>>()
+            .press(KeyCode::F9);
+        app.update();
+    }
+
+    /// F9 does nothing for anyone below rank 2 (and before the server has answered `caps`).
+    #[test]
+    fn f9_is_inert_below_rank_two_and_opens_from_rank_two() {
+        for (rank, opens) in [(None, false), (Some(0), false), (Some(1), false), (Some(2), true), (Some(3), true), (Some(4), true)] {
+            let mut app = app_with_rank(rank);
+            press_f9(&mut app);
+            assert_eq!(app.world().resource::<EmeActive>().0, opens, "rank {rank:?}");
+            // A toggle request (the host's own path, a script's `open`) obeys the same gate.
+            let mut app = app_with_rank(rank);
+            app.world_mut().write_message(EmeToggleRequested { to: Some(true) });
+            app.update();
+            assert_eq!(app.world().resource::<EmeActive>().0, opens, "request, rank {rank:?}");
+        }
     }
 }
