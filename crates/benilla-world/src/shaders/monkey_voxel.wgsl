@@ -1,14 +1,14 @@
 // MONKEY (voxel): the world voxel layer surface. It wears the REAL ADT tileset of the ground it replaces and
 // is lit by the SAME shared global light as `terrain.wgsl`, so a voxel top pixel-matches the real
 // ground beside it at any time of day:
-//   · TOPS (slope up to ~45°) use the terrain's own planar mapping: layer UV = chunk UV × 8 (u east,
+//   · UNEDITED faces (any slope) and EDITED tops use the terrain's own planar mapping: layer UV = chunk UV × 8 (u east,
 //     v south, phase locked to the MCNK grid), the per-chunk alpha map at the chunk UV with the same
 //     half-texel inset, the same `mix` chain, the same MCSH bake, the same sampler (one repeating
 //     sampler for layers + alpha + shadow, exactly as terrain binds 105).
 //   · MONKEY (voxel): one material per ADT TILE (the world voxel layer's chunks wear the tile under
 //     them); the MCNK chunk is chosen PER FRAGMENT from the tile's full 16×16 table, clamped to the
 //     tile (across a tile border the nearest in-tile chunk is used — a known limit).
-//   · WALLS / cliffs use a sharp triplanar (|n|^6) of the chunk's most rock/dirt-like layer (lowest
+//   · EDITED walls (dug / built faces only) use a sharp triplanar (|n|^6) of the chunk's most rock/dirt-like layer (lowest
 //     saturation of the layer's mean colour) with a macro-scale second tap + a low-frequency tone
 //     variation so a big wall does not read as a stamp; overhang UNDERSIDES use the same layer
 //     projected from below.
@@ -217,6 +217,20 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
         }
     }
 
+    // MONKEY (voxel): `edited` (vertex colour r, 0 = the seeded real ground, 1 = a dug / built
+    // face, `benilla_voxel::world::edited_weights`) and the carve-band distance (colour g, yd, > 0
+    // outside the carve region, `carve_band`).
+    var edited = 0.0;
+#ifdef VERTEX_COLORS
+    edited = clamp(in.color.r, 0.0, 1.0);
+    // MONKEY (voxel fix, owner "borders feel lifted"): outside the carve the REAL ground is drawn
+    // (it is clipped only inside); an untouched voxel surface there would double it — drop it.
+    // The first 0.1 yd past the region keeps both (BAND_DISCARD), so no crack can open.
+    if (in.color.g > 0.1 && edited < 0.5) {
+        discard;
+    }
+#endif
+
     let n = normalize(in.world_normal);
     let p = in.world_position.xyz;
     let an = abs(n);
@@ -224,16 +238,14 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     // Mapping weights. Tops up to ~45° take the ground's own planar mapping (as the real terrain,
     // which never triplanars); steeper faces go to a SHARP triplanar so no projection ghosts over
     // another; faces pointing down use the wall layer projected from below.
-    // MONKEY (voxel): `edited` (vertex colour r, 0 = the seeded real ground, 1 = a dug / built
-    // face, `benilla_voxel::world::edited_weights`). Untouched slopes keep the ground's thresholds
-    // (a seeded hillside matches the real ground beside it); an EDITED face is a top only when it
-    // is nearly level (≥ ~0.86 up, ≤ ~30°), so a 45° pit wall reads as earth, not stretched grass.
-    var edited = 0.0;
-#ifdef VERTEX_COLORS
-    edited = clamp(in.color.r, 0.0, 1.0);
-#endif
-    let top_w = smoothstep(mix(0.5, 0.86, edited), mix(0.7, 0.95, edited), n.y);
-    let under_w = smoothstep(0.5, 0.7, -n.y);
+    // MONKEY (voxel fix, owner's cliff "smooth fucked up the textures"): an UNTOUCHED surface
+    // (edited = 0) is drawn EXACTLY like the real ground at any slope — the ADT's own planar mapping
+    // + alpha blend, never the wall triplanar (the real terrain never triplanars; a 70° seeded cliff
+    // keeps its grass / moss / rock blend). Only EDITED faces slide to the slope rule: a top only
+    // when nearly level (≥ ~0.86 up, ≤ ~30°), so a 45° pit wall reads as earth, not stretched grass.
+    let top_edited = smoothstep(mix(0.5, 0.86, edited), mix(0.7, 0.95, edited), n.y);
+    let top_w = mix(1.0, top_edited, edited);
+    let under_w = smoothstep(0.5, 0.7, -n.y) * edited;
     let side_w = max(1.0 - top_w - under_w, 0.0);
     let sx = pow(an.x, 6.0);
     let sz = pow(an.z, 6.0);

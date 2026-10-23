@@ -230,7 +230,14 @@ pub struct MonkeyVoxelWorld {
     /// ([`monkey_voxel_clutter`]) redoes only the MCNKs whose columns / carve changed.
     clutter_col_gen: HashMap<ColumnKey, u64>,
     clutter_epoch: u64,
+    /// MONKEY (voxel fix, owner "revert didn't fix the textures"): when to drop the chunks no live
+    /// edit needs any more ([`Self::prune_unedited`]) — set [`PRUNE_DELAY`] after a revert / undo /
+    /// refused prediction, so a region reset's resync can re-file its surviving edits first.
+    prune_at: Option<Instant>,
 }
+
+/// MONKEY (voxel fix): how long after a reset / dropped prediction the unneeded chunks are pruned.
+const PRUNE_DELAY: std::time::Duration = std::time::Duration::from_millis(1500);
 
 impl Default for MonkeyVoxelWorld {
     fn default() -> Self {
@@ -278,6 +285,7 @@ impl Default for MonkeyVoxelWorld {
             hot_hold: 0,
             clutter_col_gen: HashMap::new(),
             clutter_epoch: 0,
+            prune_at: None,
         }
     }
 }
@@ -590,8 +598,33 @@ impl MonkeyVoxelWorld {
             window: self.data.window_i8(k),
             skirts: self.skirt_sides(k),
             seed_h: self.data.window_seed_heights(k),
-            origin_z: benilla_voxel::world::window_origin(k)[2],
+            carved: self.carved_around(k),
         }
+    }
+
+    /// MONKEY (voxel fix): whether column `col` is (or is becoming) carved — all its seeded
+    /// surface chunks are wanted ([`Self::surface_columns`] for one column).
+    fn is_surface_column(&self, col: ColumnKey) -> bool {
+        let Some((lo, hi)) = self.data.seeds.get(&col).and_then(|s| s.surface_chunks()) else {
+            return false;
+        };
+        self.wanted
+            .get(&col)
+            .is_some_and(|kzs| (lo..=hi).all(|kz| kzs.contains(&kz)))
+    }
+
+    /// MONKEY (voxel fix): the carved-column flags of the 5×5 columns around chunk `k`'s column
+    /// (`[(dx + 2) + 5 (dy + 2)]`) — the mesh job's carve-band distance
+    /// ([`benilla_voxel::world::carve_band`]).
+    fn carved_around(&self, k: ChunkKey) -> [bool; 25] {
+        let mut out = [false; 25];
+        for dy in -2..=2i32 {
+            for dx in -2..=2i32 {
+                out[((dx + 2) + 5 * (dy + 2)) as usize] =
+                    self.is_surface_column([k[0] + dx, k[1] + dy]);
+            }
+        }
+        out
     }
 
     /// MONKEY (voxel): the horizontal sides (−x, +x, −y, +y) of chunk `k` where the voxel layer
@@ -896,6 +929,91 @@ impl MonkeyVoxelWorld {
         Some(e.stroke)
     }
 
+    /// MONKEY (voxel fix): schedule [`Self::prune_unedited`].
+    fn schedule_prune(&mut self) {
+        self.prune_at = Some(Instant::now() + PRUNE_DELAY);
+    }
+
+    /// MONKEY (voxel fix, owner 2026-10-23: "revert didn't fix them"): DEACTIVATE every chunk no
+    /// live edit needs any more. The wanted set is recomputed exactly as entering the map computes
+    /// it (every chunk an indexed journal edit touches + the surface-column expansion + the
+    /// concave-corner fill); a chunk wanted before but not now is dropped completely — density,
+    /// entity, mesh / build bookkeeping — so its column leaves the carve and the REAL ADT comes
+    /// back (render cells, tile collider, height query, clutter): a full revert is identical to
+    /// never having edited. Neighbours remesh (their skirts / band change). Returns the dropped
+    /// chunks with their entity (the caller despawns). Waits (returns nothing, keeps the schedule)
+    /// while a build is in flight.
+    fn prune_unedited(&mut self) -> Vec<(ChunkKey, Option<Entity>)> {
+        let Some(map) = self.current_map_u16() else {
+            self.prune_at = None;
+            return Vec::new();
+        };
+        if !self.builds.is_empty() || !self.building.is_empty() {
+            return Vec::new();
+        }
+        self.prune_at = None;
+        let old = std::mem::take(&mut self.wanted);
+        self.wanted_count = 0;
+        self.need_seed.clear();
+        let cap_warned = self.cap_warned;
+        let keys: Vec<ChunkKey> = self
+            .journal
+            .maps
+            .get(&map)
+            .map_or_else(Vec::new, |j| j.indexed_chunks().collect());
+        for k in keys {
+            self.want(k);
+        }
+        self.fill_concave_corners();
+        self.cap_warned = cap_warned;
+        let mut removed: Vec<ChunkKey> = old
+            .iter()
+            .flat_map(|(col, kzs)| kzs.iter().map(move |kz| [col[0], col[1], *kz]))
+            .filter(|k| {
+                !self
+                    .wanted
+                    .get(&[k[0], k[1]])
+                    .is_some_and(|s| s.contains(&k[2]))
+            })
+            .collect();
+        removed.sort();
+        let mut out = Vec::with_capacity(removed.len());
+        for k in &removed {
+            self.data.chunks.remove(k);
+            self.meshed.remove(k);
+            self.shown_gen.remove(k);
+            self.dirty.remove(k);
+            self.hot.remove(k);
+            self.rebuild.remove(k);
+            self.hot_build.remove(k);
+            self.hot_wait.remove(k);
+            self.mesh_ready.remove(k);
+            *self.edit_gen.entry(*k).or_default() += 1;
+            *self.clutter_col_gen.entry([k[0], k[1]]).or_default() += 1;
+            out.push((*k, self.entities.remove(k)));
+        }
+        if !removed.is_empty() {
+            self.dirty_around(&removed, false);
+            self.carve_dirty = true;
+            self.clutter_epoch += 1;
+        }
+        out
+    }
+
+    /// MONKEY (voxel): the carve's columns = the surface columns whose surface chunks are all
+    /// wanted AND meshed (a column joins the carve once the voxel ground covering it is drawn).
+    fn carve_columns(&self) -> BTreeSet<ColumnKey> {
+        self.wanted
+            .iter()
+            .filter_map(|(col, kzs)| {
+                let (lo, hi) = self.data.seeds.get(col)?.surface_chunks()?;
+                let surface = (lo..=hi)
+                    .all(|kz| kzs.contains(&kz) && self.meshed.contains(&[col[0], col[1], kz]));
+                surface.then_some(*col)
+            })
+            .collect()
+    }
+
     /// SERVER LANE: REGION-RESET — drop the region's journal, adopt `epoch`, rebuild its chunks.
     pub fn reset_region(&mut self, map: u16, rx: i16, ry: i16, epoch: u16) {
         let dropped = self
@@ -908,6 +1026,9 @@ impl MonkeyVoxelWorld {
         if self.current_map_u16() == Some(map) {
             let keys: HashSet<ChunkKey> = dropped.iter().flat_map(|e| e.touched_chunks()).collect();
             self.requeue(&keys.into_iter().collect::<Vec<_>>());
+            if !dropped.is_empty() {
+                self.schedule_prune();
+            }
         }
     }
 
@@ -917,6 +1038,7 @@ impl MonkeyVoxelWorld {
         self.journal_dirty = true;
         if self.current_map_u16() == Some(map) {
             self.requeue(&e.touched_chunks());
+            self.schedule_prune();
         }
         Some(e)
     }
@@ -960,6 +1082,7 @@ impl MonkeyVoxelWorld {
         self.hot_wait.clear();
         self.clutter_col_gen.clear();
         self.clutter_epoch += 1;
+        self.prune_at = None;
     }
 }
 
@@ -1051,6 +1174,16 @@ fn monkey_voxel_journal_save(j: &VoxelJournal) {
 #[inline]
 fn wow_vec_to_bevy(p: [f32; 3]) -> [f32; 3] {
     [-p[1], p[2], -p[0]]
+}
+
+/// MONKEY (voxel fix, owner "borders feel lifted"): the WoW position a chunk ENTITY sits at — its
+/// mesh window origin [`benilla_voxel::world::RENDER_DROP`] lower, so the unedited voxel surface
+/// (seeded `SEED_LIFT` above the ADT) is drawn on the real ground, not 0.15 yd above it. The
+/// collider rides the same entity (the player stands on what is drawn). Density, edits and aim stay
+/// in density space.
+pub fn monkey_voxel_render_origin(k: ChunkKey) -> [f32; 3] {
+    let o = window_origin(k);
+    [o[0], o[1], o[2] - benilla_voxel::world::RENDER_DROP]
 }
 
 /// A chunk's engine-neutral mesh (WoW axes, window-local yards) as a Bevy [`Mesh`] in the chunk
@@ -1807,10 +1940,11 @@ struct MonkeyMeshDispatch {
     window: Vec<i8>,
     /// MONKEY (voxel): the sides that get a skirt ([`MonkeyVoxelWorld::skirt_sides`]).
     skirts: [bool; 4],
-    /// MONKEY (voxel): the window's seeded ground heights + its origin z (the per-vertex "edited"
-    /// weight, [`benilla_voxel::world::edited_weights`]).
+    /// MONKEY (voxel): the window's seeded ground heights (the per-vertex "edited" weight,
+    /// [`benilla_voxel::world::edited_weights`]).
     seed_h: Vec<f32>,
-    origin_z: f32,
+    /// MONKEY (voxel fix): the carved columns around ([`MonkeyVoxelWorld::carved_around`]).
+    carved: [bool; 25],
 }
 
 /// MONKEY (voxel): what a mesh task hands back: the Bevy mesh + its AABB + the trimesh collider
@@ -1842,14 +1976,26 @@ fn monkey_voxel_mesh_job(
     window: &[i8],
     skirts: [bool; 4],
     seed_h: &[f32],
-    origin_z: f32,
+    key: ChunkKey,
+    carved: [bool; 25],
 ) -> MonkeyMeshOut {
+    let origin = window_origin(key);
     let mut vm = benilla_voxel::world::mesh_window(window);
-    // MONKEY (voxel): edited weights for the surface; the skirt's vertices (appended below) are
-    // ground-coloured lips (0).
-    let mut edited = benilla_voxel::world::edited_weights(&vm, seed_h, origin_z);
-    benilla_voxel::world::add_skirts(&mut vm, skirts, SKIRT_DEPTH);
-    edited.resize(vm.positions.len(), 0.0);
+    // MONKEY (voxel): edited weights for the surface; each skirt vertex (appended below) takes
+    // its lip's weight.
+    let mut edited = benilla_voxel::world::edited_weights(&vm, window, seed_h, origin[2]);
+    for lip in benilla_voxel::world::add_skirts(&mut vm, skirts, SKIRT_DEPTH) {
+        edited.push(edited[lip as usize]);
+    }
+    // MONKEY (voxel fix): the carve-band distance per vertex — the shader drops UNEDITED voxel
+    // fragments outside the carve region, where the real ground is drawn.
+    let carved_at = |cx: i32, cy: i32| {
+        let (dx, dy) = (cx - key[0], cy - key[1]);
+        (-2..=2).contains(&dx)
+            && (-2..=2).contains(&dy)
+            && carved[((dx + 2) + 5 * (dy + 2)) as usize]
+    };
+    let band = benilla_voxel::world::carve_band(&vm, origin, &carved_at, CARVE_INSET);
     if vm.indices.len() < 3 {
         return MonkeyMeshOut {
             mesh: None,
@@ -1860,9 +2006,14 @@ fn monkey_voxel_mesh_job(
     let mut mesh = monkey_voxel_mesh_to_bevy(&vm);
     // MONKEY (voxel): the "edited" weight rides in the vertex colour (r) — `monkey_voxel.wgsl`
     // raises the top/wall slope threshold on edited faces so a dug wall reads as earth.
+    // MONKEY (voxel fix): g = the carve-band distance (yd, > 0 outside the carve region).
     mesh.insert_attribute(
         Mesh::ATTRIBUTE_COLOR,
-        edited.iter().map(|&e| [e, e, e, 1.0]).collect::<Vec<[f32; 4]>>(),
+        edited
+            .iter()
+            .zip(&band)
+            .map(|(&e, &b)| [e, b, e, 1.0])
+            .collect::<Vec<[f32; 4]>>(),
     );
     let aabb = mesh.compute_aabb();
     MonkeyMeshOut {
@@ -1934,6 +2085,27 @@ fn monkey_voxel_stream(
             world.need_seed.remove(&col);
             world.expand_column(col);
             done += 1;
+        }
+    }
+
+    // MONKEY (voxel fix): 1b. after a revert / undo, drop the chunks no live edit needs (the real
+    //    ADT comes back there once the carve below shrinks).
+    let mut colliders_gone = false;
+    if world.prune_at.is_some_and(|t| Instant::now() >= t) {
+        let gone = world.prune_unedited();
+        if !gone.is_empty() {
+            for (_, e) in &gone {
+                if let Some(e) = e {
+                    commands.entity(*e).despawn();
+                    colliders_gone = true;
+                }
+            }
+            info!(
+                "MONKEY (voxel): deactivated {} chunk(s) no live edit needs ({} active left) - the \
+                 real ground returns there",
+                gone.len(),
+                world.data.chunks.len()
+            );
         }
     }
 
@@ -2084,7 +2256,7 @@ fn monkey_voxel_stream(
                 let mut ec = commands.spawn((
                     Mesh3d(meshes.add(mesh)),
                     MeshMaterial3d(mat),
-                    Transform::from_translation(wow_to_bevy(window_origin(k))),
+                    Transform::from_translation(wow_to_bevy(monkey_voxel_render_origin(k))),
                     MonkeyVoxelChunk(k),
                     RigidBody::Static,
                     Name::new(format!("MONKEY voxel chunk {k:?}")),
@@ -2101,7 +2273,7 @@ fn monkey_voxel_stream(
     }
     // A collider inserted outside the streamer's attach queue must bump the epoch (cached
     // collision answers hold only at the stamp they were computed at).
-    if colliders {
+    if colliders || colliders_gone {
         if let Some(mut epoch) = epoch {
             epoch.bump();
         }
@@ -2113,9 +2285,9 @@ fn monkey_voxel_stream(
     // 6. Dispatch remeshes (hot first; bulk under the in-flight cap + dispatch budget).
     let mut dispatched = 0usize;
     for d in world.take_mesh_jobs(dispatch_deadline) {
-        let (window, skirts, seed_h, origin_z) = (d.window, d.skirts, d.seed_h, d.origin_z);
-        let task =
-            pool.spawn(async move { monkey_voxel_mesh_job(&window, skirts, &seed_h, origin_z) });
+        let (window, skirts, seed_h, key, carved) = (d.window, d.skirts, d.seed_h, d.key, d.carved);
+        let task = pool
+            .spawn(async move { monkey_voxel_mesh_job(&window, skirts, &seed_h, key, carved) });
         world.meshing.push(MonkeyMeshTask {
             key: d.key,
             gen: d.gen,
@@ -2184,16 +2356,7 @@ fn monkey_voxel_stream(
     }
     if world.carve_dirty && (world.bulk_idle() || hot_attached > 0) {
         world.carve_dirty = false;
-        let cols: BTreeSet<ColumnKey> = world
-            .wanted
-            .iter()
-            .filter_map(|(col, kzs)| {
-                let (lo, hi) = world.data.seeds.get(col)?.surface_chunks()?;
-                let surface = (lo..=hi)
-                    .all(|kz| kzs.contains(&kz) && world.meshed.contains(&[col[0], col[1], kz]));
-                surface.then_some(*col)
-            })
-            .collect();
+        let cols = world.carve_columns();
         if cols != world.carve_cols {
             world.carve = (!cols.is_empty()).then(|| {
                 Arc::new(VoxelCarve::from_columns(
@@ -2283,7 +2446,8 @@ fn clutter_replace(
                         return None;
                     }
                     let mut sp = sp.clone();
-                    sp.placement.position[2] = top;
+                    // Drawn RENDER_DROP below the density surface (the mesh entity's offset).
+                    sp.placement.position[2] = top - benilla_voxel::world::RENDER_DROP;
                     sp.ground_normal = wow_to_bevy(n).to_array();
                     Some(sp)
                 })
@@ -2808,7 +2972,11 @@ mod tests {
         assert_eq!(ps.len(), 4, "the pit-wall tuft is dropped: {ps:?}");
         assert_eq!(ps[0], [-3.0, 4.0, 20.0], "outside the carve: untouched");
         assert!((ps[1][2] - 17.0).abs() < 0.3, "pit floor {:?}", ps[1]);
-        assert!((ps[2][2] - 20.15).abs() < 0.1, "seeded surface {:?}", ps[2]);
+        assert!(
+            (ps[2][2] - (20.15 - benilla_voxel::world::RENDER_DROP)).abs() < 0.1,
+            "seeded surface (drawn on the ADT) {:?}",
+            ps[2]
+        );
         assert!((ps[3][2] - 22.5).abs() < 0.3, "mound crown {:?}", ps[3]);
         assert!(out[0].1[1].ground_normal[1] > 0.9, "Bevy +Y up normal");
     }
@@ -3051,7 +3219,7 @@ mod tests {
             key: d.key,
             gen: d.gen,
             hot: true,
-            out: monkey_voxel_mesh_job(&d.window, d.skirts, &d.seed_h, d.origin_z),
+            out: monkey_voxel_mesh_job(&d.window, d.skirts, &d.seed_h, d.key, d.carved),
         };
         // The newer finishes first and is shown …
         world.mesh_returned(ready(&b[0]));
@@ -3104,7 +3272,7 @@ mod tests {
         for &k in &keys {
             assert_eq!(sync.chunks[&k], world.data.chunks[&k], "chunk {k:?}");
             // The off-thread mesh job == the sync mesh.
-            let out = monkey_voxel_mesh_job(&world.data.window_i8(k), [false; 4], &[], 0.0);
+            let out = monkey_voxel_mesh_job(&world.data.window_i8(k), [false; 4], &[], k, [false; 25]);
             assert_eq!(out.tris, sync.mesh(k).tri_count(), "chunk {k:?} mesh");
             assert_eq!(out.collider.is_some(), out.tris > 0);
         }
@@ -3285,6 +3453,69 @@ mod tests {
         let nonce = net.outbox[0].nonce;
         world.confirm(0, nonce, 77);
         assert!(world.pending_local(0).is_empty());
+    }
+
+    /// MONKEY (voxel fix, owner "revert didn't fix them"): edit → full undo → the chunks no live
+    /// edit needs are deactivated: no density, no entity, the carve is EMPTY (the real ADT is back
+    /// everywhere). A second, surviving edit elsewhere keeps exactly its own area.
+    #[test]
+    fn full_undo_deactivates_the_area_and_empties_the_carve() {
+        let mut world = MonkeyVoxelWorld {
+            map: Some(0),
+            ..Default::default()
+        };
+        let mut net = MonkeyVoxelNet::default();
+        for x in -2..=8 {
+            for y in -2..=4 {
+                world
+                    .data
+                    .seeds
+                    .insert([x, y], Arc::new(ColumnSeed::from_fn([x, y], |_, _| Some(40.0))));
+            }
+        }
+        let a = VoxelEditOp { stroke: 3, ..dig([24.0, 24.0, 40.0], 3.0) };
+        let b = VoxelEditOp { stroke: 4, ..dig([120.0, 24.0, 40.0], 2.0) };
+        let na = world.local_edit_nonce(&mut net, a, None).unwrap();
+        world.local_edit_nonce(&mut net, b, None).unwrap();
+        drain_builds(&mut world);
+        let fake_entities: Vec<ChunkKey> = world.data.chunks.keys().copied().collect();
+        for k in &fake_entities {
+            world.meshed.insert(*k);
+            world.entities.insert(*k, Entity::PLACEHOLDER);
+        }
+        let both = world.carve_columns();
+        assert!(both.contains(&[1, 1]) && both.contains(&[7, 1]), "{both:?}");
+        // Undo stroke 3 (offline: drop its pending prediction).
+        assert_eq!(world.drop_stroke_local(0, 3).len(), 1);
+        assert!(world.prune_at.is_some(), "a dropped edit schedules the prune");
+        drain_builds(&mut world);
+        let gone = world.prune_unedited();
+        assert!(gone.iter().all(|(k, e)| k[0] <= 2 && e.is_some()), "only stroke 3's area");
+        assert!(!gone.is_empty());
+        let left = world.carve_columns();
+        assert!(left.contains(&[7, 1]) && !left.iter().any(|c| c[0] <= 2), "{left:?}");
+        assert!(world.data.chunks.keys().all(|k| k[0] >= 6));
+        // Undo the other one too: nothing is left at all.
+        let _ = na;
+        assert_eq!(world.drop_stroke_local(0, 4).len(), 1);
+        drain_builds(&mut world);
+        let gone = world.prune_unedited();
+        assert!(!gone.is_empty());
+        assert_eq!(world.active_chunks(), 0, "no voxel chunk remains");
+        assert!(world.entities.is_empty(), "every chunk entity is despawned");
+        assert!(world.carve_columns().is_empty(), "the carve is empty: the real ADT is back");
+        assert!(world.wanted.is_empty());
+        // A server-side revert (region reset of confirmed edits) prunes the same way.
+        let c = dig([24.0, 24.0, 40.0], 3.0);
+        let nc = world.local_edit_nonce(&mut net, c, None).unwrap();
+        world.confirm(0, nc, 50);
+        drain_builds(&mut world);
+        assert!(world.active_chunks() > 0);
+        let (rx, ry) = c.region();
+        world.reset_region(0, rx, ry, 1);
+        drain_builds(&mut world);
+        world.prune_unedited();
+        assert_eq!(world.active_chunks(), 0);
     }
 
     /// MONKEY (EME seam): a pinned nonce is kept (and the layer's counter continues after it), a

@@ -307,3 +307,81 @@ fn v3_vectors_follow_the_closure_rule_and_are_written() {
         eprintln!("golden: wrote {out}");
     }
 }
+
+/// MONKEY (voxel, CONTRACT v3.3): V3 + 14 SOFT-brush edits (`param` bit 15 on modes 0 / 1 / 2:
+/// soft lower / raise / smooth, every falloff, hardness 0 / 30 / 50 / 100, partial and full
+/// strength, the 0.5 and 16 yd radii, a chunk-corner straddle, a held brush (4 edits on one spot), a
+/// hard dig over soft ground, and a robustness param with falloff 3 + hardness 127 + reserved bits).
+fn v33_edits() -> Vec<VoxelEditOp> {
+    let mut e = v3_edits();
+    let n = e.len() as u32;
+    let soft = |falloff: u16, hardness: u16| (0x8000u16 | falloff | (hardness << 2)) as i16;
+    let extra: [([f32; 3], f32, u8, u8, i16); 14] = [
+        ([-8944.0, -64.0, 81.0], 6.0, 1, 51, soft(0, 0)),      // raise the big dig's floor
+        ([-8944.0, -64.0, 81.2], 6.0, 1, 51, soft(0, 0)),      // held: 4 edits on one spot
+        ([-8944.0, -64.0, 81.4], 6.0, 1, 51, soft(0, 0)),
+        ([-8944.0, -64.0, 81.6], 6.0, 1, 51, soft(0, 0)),
+        ([-8944.0, -64.0, 82.0], 16.0, 1, 255, soft(1, 50)),   // max radius, chunk corner, linear
+        ([-8950.25, -70.5, 81.7], 4.5, 0, 128, soft(2, 0)),    // lower, flat falloff, half
+        ([-8939.75, -71.25, 79.5], 0.5, 0, 200, soft(0, 100)), // tiny, hardness 100
+        ([-8936.0, -80.0, 84.5], 8.0, 0, 77, soft(0, 30)),     // lower over the +1.5 flatten
+        ([-8944.0, -70.0, 82.0], 8.0, 2, 64, soft(0, 0)),      // soft smooth
+        ([-8930.1, -59.9, 83.3], 3.0, 2, 255, soft(1, 25)),    // soft smooth, linear, full
+        ([-8925.5, -80.25, 90.0], 7.0, 2, 160, soft(2, 50)),   // soft smooth, flat, on the build
+        ([-8948.0, -76.0, 72.0], 5.0, 0, 255, 0),              // a HARD dig over soft ground
+        ([-8960.0, -48.0, 82.0], 7.5, 1, 90, -1),              // param 0xffff: falloff 3, h 127, reserved
+        ([-8912.0, -56.0, 84.0], 4.0, 1, 255, soft(0, 0)),     // fresh ground, full strength
+    ];
+    for (i, (p, r, m, s, prm)) in extra.iter().enumerate() {
+        e.push(op(*p, *r, *m, *s, n + 1 + i as u32, *prm));
+    }
+    e
+}
+
+#[test]
+fn v33_soft_vectors_follow_the_closure_rule_and_are_written() {
+    let edits = v33_edits();
+    assert!(edits[edits.len() - 14..].iter().filter(|e| e.soft().is_some()).count() == 13);
+    let (text, full, keys) = golden(&edits, true);
+    let h_full = chunks_hash(&full.chunks);
+    let mut j = MapJournal::default();
+    for e in &edits {
+        j.insert(*e);
+    }
+    let (mut sets, mut avg, mut bad) = (0, 0usize, 0);
+    for e in &edits {
+        let set: Vec<ChunkKey> = j
+            .read_closure(&e.touched_chunks())
+            .into_iter()
+            .filter(|k| full.chunks.contains_key(k))
+            .collect();
+        let mut w = VoxelWorldData {
+            chunks: full.chunks.clone(),
+            seeds: full.seeds.clone(),
+        };
+        w.build(&set, j.edits_for(&set).iter());
+        sets += 1;
+        avg += set.len();
+        if chunks_hash(&w.chunks) != h_full {
+            bad += 1;
+        }
+    }
+    assert_eq!(bad, 0, "a closure rebuild differed from the full replay");
+    // The soft edits really changed the field (vs the V3 set alone).
+    let (_, v3, _) = golden(&v3_edits(), true);
+    assert_ne!(chunks_hash(&v3.chunks), h_full);
+    let text = format!(
+        "# MONKEY voxel golden v3.3 (benilla-voxel tests/golden_v3.rs, CONTRACT v3.3 soft brushes). Height fn,\n\
+         # P1 + V3 edits, activation and line format = golden-v3.txt (edit lines: param printed as i16; soft\n\
+         # params have bit 15 set, so they print negative: e.g. -32768 = 0x8000 = soft, smooth falloff, hardness 0).\n\
+         # Edits 71-84 = the soft set (world.rs apply_edit_set: SoftBrush::weight + the MODE_DIG|BUILD|SMOOTH\n\
+         # gather branch); 82 = a hard dig. density_hash = world.rs chunks_hash.\n\
+         {text}closure_rebuild sets {sets} avg_chunks {:.1} differing_sets {bad}\nactive_chunks {}\n",
+        avg as f32 / sets as f32,
+        keys.len()
+    );
+    if let Ok(out) = std::env::var("MONKEY_VOXEL_GOLDEN33_OUT") {
+        std::fs::write(&out, &text).expect("write the golden file");
+        eprintln!("golden: wrote {out}");
+    }
+}

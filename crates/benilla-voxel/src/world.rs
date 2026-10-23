@@ -61,6 +61,74 @@ pub const MODE_ROUGHEN: u8 = 5;
 /// The highest mode the wire defines.
 pub const MODE_MAX: u8 = MODE_ROUGHEN;
 
+/// MONKEY (voxel, CONTRACT v3.3): `param` bit 15 on modes 0 / 1 / 2 = a SOFT brush (Noggit-like:
+/// lower / raise / smooth by an amount with a radial falloff, see [`SoftBrush`]). `param` without
+/// it (every v2 / v3.0 edit: 0) keeps the hard CSG dig / build and the uniform smooth.
+pub const SOFT_FLAG: u16 = 0x8000;
+/// The soft brushes' falloff curves (`param` bits 0-1).
+pub const FALLOFF_SMOOTH: u8 = 0;
+pub const FALLOFF_LINEAR: u8 = 1;
+pub const FALLOFF_FLAT: u8 = 2;
+/// MONKEY (voxel): the voxel field is DRAWN (and collided) this far below its density surface: the
+/// seed sits [`SEED_LIFT`] above the ADT, so an unedited voxel surface then lies exactly on the
+/// real ground (no "lifted border" step at the carve's edge) plus 0.02 yd, so where both overlap
+/// (the carve's 0.5-yd inset band) the real ground wins the depth test. Client presentation only:
+/// the density, the wire and the server replica are unchanged.
+pub const RENDER_DROP: f32 = SEED_LIFT + 0.02;
+
+/// MONKEY (voxel, CONTRACT v3.3): a decoded soft-brush `param` (modes 0 / 1 / 2 with
+/// [`SOFT_FLAG`]). Bits: 0-1 falloff (0 smooth, 1 linear, 2 flat, 3 = smooth), 2-8 hardness
+/// percent (0..=127, values over 100 count as 100), 9-14 reserved (sent 0, ignored), 15 = 1.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SoftBrush {
+    pub falloff: u8,
+    pub hardness: u8,
+}
+
+impl SoftBrush {
+    /// Decode a `param`; `None` = not a soft brush (bit 15 clear).
+    pub fn from_param(param: u16) -> Option<Self> {
+        if param & SOFT_FLAG == 0 {
+            return None;
+        }
+        let f = (param & 0x3) as u8;
+        Some(Self {
+            falloff: if f == 3 { FALLOFF_SMOOTH } else { f },
+            hardness: (((param >> 2) & 0x7f) as u8).min(100),
+        })
+    }
+
+    /// The wire `param` (bit 15 set, reserved bits 0).
+    pub fn to_param(self) -> u16 {
+        SOFT_FLAG | (self.falloff.min(2) as u16) | ((self.hardness.min(100) as u16) << 2)
+    }
+
+    /// The falloff weight of a sample at lattice distance `dist` from the centre of a brush of
+    /// lattice radius `r` (0 outside). EXACT op order (the server's C++ replica copies it, IEEE
+    /// f32, no FMA): `inner = r * (hardness as f32 / 100.0)`; `dist >= r` → 0; `dist <= inner` →
+    /// 1; else `t = (dist - inner) / (r - inner)`, smooth `u = 1 - t; (u * u) * (3 - 2 * u)`,
+    /// linear `1 - t`, flat `1`.
+    #[inline]
+    pub fn weight(self, dist: f32, r: f32) -> f32 {
+        if dist >= r {
+            return 0.0;
+        }
+        let inner = r * (self.hardness as f32 / 100.0);
+        if dist <= inner {
+            return 1.0;
+        }
+        let t = (dist - inner) / (r - inner);
+        match self.falloff {
+            FALLOFF_LINEAR => 1.0 - t,
+            FALLOFF_FLAT => 1.0,
+            _ => {
+                let u = 1.0 - t;
+                (u * u) * (3.0 - 2.0 * u)
+            }
+        }
+    }
+}
+
 const C: i32 = CHUNK as i32;
 
 /// `(kx, ky, kz)` chunk key on the current map (WoW axes).
@@ -166,7 +234,25 @@ impl VoxelEditOp {
     /// neighbour average) — such an edit links every chunk it touches for a canonical rebuild
     /// ([`MapJournal::read_closure`]). Dig / build / flatten are per-sample.
     pub fn reads_neighbours(&self) -> bool {
-        self.mode == MODE_SMOOTH
+        self.mode == MODE_SMOOTH || self.soft_shift().is_some()
+    }
+
+    /// MONKEY (voxel, CONTRACT v3.3): the soft brush of a mode 0 / 1 / 2 edit (`param` bit 15).
+    pub fn soft(&self) -> Option<SoftBrush> {
+        match self.mode {
+            MODE_DIG | MODE_BUILD | MODE_SMOOTH => SoftBrush::from_param(self.param),
+            _ => None,
+        }
+    }
+
+    /// MONKEY (voxel): a soft LOWER (mode 0) / RAISE (mode 1): the brush + the z direction it reads
+    /// from (+1 = the sample above, lower; -1 = the sample below, raise). Reads its z neighbour.
+    pub fn soft_shift(&self) -> Option<(SoftBrush, i32)> {
+        match self.mode {
+            MODE_DIG => self.soft().map(|b| (b, 1)),
+            MODE_BUILD => self.soft().map(|b| (b, -1)),
+            _ => None,
+        }
     }
 
     /// MONKEY (voxel): the flatten plane height in WoW yards (`z + (param as i16) / 100`).
@@ -489,8 +575,9 @@ pub fn apply_edit_set(
     let c = edit.centre_lat();
     let r = edit.radius_lat();
     let mut changed = Vec::new();
+    let soft = edit.soft();
     match edit.mode {
-        0 | 1 => {
+        0 | 1 if soft.is_none() => {
             for k in chunks_of_box(lo, hi) {
                 let Some(d) = set.get_mut(&k) else {
                     continue;
@@ -575,8 +662,12 @@ pub fn apply_edit_set(
                 }
             }
         }
-        MODE_SMOOTH => {
+        // MONKEY (voxel): smooth (hard or soft) and the CONTRACT v3.3 soft lower / raise — all read
+        // the PRE-edit field around the sample they write (Jacobi), so they share the gather.
+        MODE_DIG | MODE_BUILD | MODE_SMOOTH => {
             let strength = edit.strength as f32 / 255.0;
+            // The z neighbour a soft lower (+1) / raise (-1) reads; 0 = smooth.
+            let shift_dz = edit.soft_shift().map_or(0, |(_, d)| d);
             // Gather the pre-edit field over the brush box + the read ring.
             let (glo, ghi) = (
                 [lo[0] - 1, lo[1] - 1, lo[2] - 1],
@@ -609,26 +700,55 @@ pub fn apply_edit_set(
             for z in lo[2]..=hi[2] {
                 for y in lo[1]..=hi[1] {
                     for x in lo[0]..=hi[0] {
-                        let d2 = (x as f32 - c[0]).powi(2)
-                            + (y as f32 - c[1]).powi(2)
-                            + (z as f32 - c[2]).powi(2);
-                        if d2 > r2 {
-                            continue;
-                        }
+                        // MONKEY (voxel, CONTRACT v3.3): a soft brush weighs each sample by its
+                        // falloff `w` (skip `w <= 0`, i.e. outside the sphere); the hard smooth
+                        // keeps its v2 maths bit for bit (uniform blend inside `d2 <= r2`).
+                        let a = match soft {
+                            Some(b) => {
+                                let (dx, dy, dz) = (x as f32 - c[0], y as f32 - c[1], z as f32 - c[2]);
+                                let w = b.weight((dx * dx + dy * dy + dz * dz).sqrt(), r);
+                                if w <= 0.0 {
+                                    continue;
+                                }
+                                strength * w
+                            }
+                            None => {
+                                let d2 = (x as f32 - c[0]).powi(2)
+                                    + (y as f32 - c[1]).powi(2)
+                                    + (z as f32 - c[2]).powi(2);
+                                if d2 > r2 {
+                                    continue;
+                                }
+                                strength
+                            }
+                        };
                         let k = [chunk_of(x), chunk_of(y), chunk_of(z)];
                         let Some(d) = set.get_mut(&k) else {
                             continue;
                         };
                         let g = |dx: i32, dy: i32, dz: i32| grid[at([x + dx, y + dy, z + dz])] as f32;
-                        let avg = (g(1, 0, 0)
-                            + g(-1, 0, 0)
-                            + g(0, 1, 0)
-                            + g(0, -1, 0)
-                            + g(0, 0, 1)
-                            + g(0, 0, -1))
-                            / 6.0;
                         let old = g(0, 0, 0);
-                        let new = (old * (1.0 - strength) + avg * strength)
+                        let new = if shift_dz != 0 {
+                            // Soft lower / raise: the field moves vertically by `a` voxels (≤ 1) —
+                            // linear between this sample and its z neighbour, so a held brush lifts
+                            // the ground like a heightmap (no clamp-saturation bubble).
+                            let n = g(0, 0, shift_dz);
+                            old + (n - old) * a
+                        } else {
+                            let avg = (g(1, 0, 0)
+                                + g(-1, 0, 0)
+                                + g(0, 1, 0)
+                                + g(0, -1, 0)
+                                + g(0, 0, 1)
+                                + g(0, 0, -1))
+                                / 6.0;
+                            if soft.is_some() {
+                                old + (avg - old) * a
+                            } else {
+                                old * (1.0 - strength) + avg * strength
+                            }
+                        };
+                        let new = new
                             .round()
                             .clamp(i8::MIN as f32, i8::MAX as f32) as i8;
                         let idx = owned_index(x - k[0] * C, y - k[1] * C, z - k[2] * C);
@@ -1066,12 +1186,39 @@ pub const EDITED_RAMP: f32 = 0.5;
 /// column counts as edited; any other length = all 0). The shader keeps natural slopes on the
 /// ground's own top mapping (a seeded hillside matches the real ground beside it) but sends
 /// steep EDITED faces to the earth / rock wall layer.
-pub fn edited_weights(m: &VoxelMesh, seed_h: &[f32], origin_z: f32) -> Vec<f32> {
+///
+/// MONKEY (voxel fix, owner 2026-10-23 "smooth fucked up the cliff textures"): two tests, the
+/// weight is the SMALLER of them, so an unedited surface is 0 at ANY slope:
+/// - DENSITY: `win` (the mesh window, [`VoxelWorldData::window_i8`]) against the seed density of
+///   the same samples — a vertex whose cube's 8 corners all still hold the seed value is 0 (no
+///   edit touched it), ramping to 1 from 0.25 to 0.75 voxel of change ([`EDITED_DENSITY_FROM`]);
+/// - GEOMETRY: the vertex's distance off the seeded ground measured along the ground's NORMAL
+///   (`|dz| / sqrt(1 + |∇h|²)`, not vertically: surface nets places a steep cliff's vertices up to a
+///   few tenths of a yard off it vertically), ramping from [`EDITED_FROM`] over [`EDITED_RAMP`] —
+///   a lightly smoothed slope that still follows the ground keeps the ground's own texturing.
+///
+/// `win` of any other length skips the density test (geometry only).
+pub fn edited_weights(m: &VoxelMesh, win: &[i8], seed_h: &[f32], origin_z: f32) -> Vec<f32> {
     let s = SAMPLES as usize;
     if seed_h.len() != s * s {
         return vec![0.0; m.positions.len()];
     }
     let at = |x: usize, y: usize| seed_h[x.min(s - 1) + y.min(s - 1) * s];
+    // Per window sample: how far (voxels) the density left the seed.
+    let diff: Option<Vec<f32>> = (win.len() == s * s * s).then(|| {
+        let iz0 = (origin_z / VOXEL_SIZE).round() as i32;
+        let mut d = vec![0.0f32; s * s * s];
+        for z in 0..s {
+            for y in 0..s {
+                for x in 0..s {
+                    let i = x + s * (y + s * z);
+                    let seed = seed_density(at(x, y), iz0 + z as i32);
+                    d[i] = (win[i] as f32 - seed as f32).abs() / DENSITY_SCALE;
+                }
+            }
+        }
+        d
+    });
     m.positions
         .iter()
         .map(|p| {
@@ -1081,17 +1228,90 @@ pub fn edited_weights(m: &VoxelMesh, seed_h: &[f32], origin_z: f32) -> Vec<f32> 
                 (fx - ix as f32).clamp(0.0, 1.0),
                 (fy - iy as f32).clamp(0.0, 1.0),
             );
+            let density_w = diff.as_ref().map_or(1.0, |d| {
+                let iz = ((p[2] / VOXEL_SIZE).floor().max(0.0) as usize).min(s - 2);
+                let (cx, cy) = (ix.min(s - 2), iy.min(s - 2));
+                let mut m = 0.0f32;
+                for c in 0..8 {
+                    let (ox, oy, oz) = (c & 1, (c >> 1) & 1, c >> 2);
+                    m = m.max(d[(cx + ox) + s * ((cy + oy) + s * (iz + oz))]);
+                }
+                ((m - EDITED_DENSITY_FROM) / EDITED_DENSITY_RAMP).clamp(0.0, 1.0)
+            });
+            if density_w <= 0.0 {
+                return 0.0;
+            }
             let hs = [at(ix, iy), at(ix + 1, iy), at(ix, iy + 1), at(ix + 1, iy + 1)];
             if hs.iter().any(|h| !h.is_finite()) {
-                return 1.0;
+                return density_w;
             }
             let h = (hs[0] * (1.0 - tx) + hs[1] * tx) * (1.0 - ty)
                 + (hs[2] * (1.0 - tx) + hs[3] * tx) * ty;
-            let dz = (p[2] + origin_z - h).abs();
-            ((dz - EDITED_FROM) / EDITED_RAMP).clamp(0.0, 1.0)
+            let gx = ((hs[1] - hs[0]) * (1.0 - ty) + (hs[3] - hs[2]) * ty) / VOXEL_SIZE;
+            let gy = ((hs[2] - hs[0]) * (1.0 - tx) + (hs[3] - hs[1]) * tx) / VOXEL_SIZE;
+            let dz = (p[2] + origin_z - h).abs() / (1.0 + gx * gx + gy * gy).sqrt();
+            ((dz - EDITED_FROM) / EDITED_RAMP).clamp(0.0, 1.0).min(density_w)
         })
         .collect()
 }
+
+/// MONKEY (voxel): the density test of [`edited_weights`]: a change under this many voxels is
+/// untouched ground …
+pub const EDITED_DENSITY_FROM: f32 = 0.25;
+/// … ramping to fully edited over this many more.
+pub const EDITED_DENSITY_RAMP: f32 = 0.5;
+
+/// MONKEY (voxel fix): the per-vertex CARVE-BAND distance — how far (yd, WoW XY) a vertex lies
+/// OUTSIDE the carve region of the union `carved` (16-yd columns, the outer boundary inset by
+/// `inset`, CONTRACT §1), ≤ 0 inside. `origin` = the mesh window's WoW origin. The voxel shader
+/// discards UNEDITED fragments past [`BAND_DISCARD`]: there the real ADT ground is drawn (it is
+/// only clipped inside the region), so an untouched voxel surface never doubles it.
+pub fn carve_band(m: &VoxelMesh, origin: [f32; 3], carved: &dyn Fn(i32, i32) -> bool, inset: f32) -> Vec<f32> {
+    m.positions
+        .iter()
+        .map(|p| {
+            let (x, y) = (p[0] + origin[0], p[1] + origin[1]);
+            let (kx, ky) = ((x / CHUNK_YARDS).floor() as i32, (y / CHUNK_YARDS).floor() as i32);
+            if !carved(kx, ky) {
+                // A point in an uncarved column: its distance to the nearest carved column's
+                // region (approximate: the 8 neighbours; far = 16).
+                let mut best = CHUNK_YARDS;
+                for dy in -1..=1 {
+                    for dx in -1..=1 {
+                        if (dx, dy) == (0, 0) || !carved(kx + dx, ky + dy) {
+                            continue;
+                        }
+                        best = best.min(column_region_dist(kx + dx, ky + dy, x, y, carved, inset));
+                    }
+                }
+                return best;
+            }
+            column_region_dist(kx, ky, x, y, carved, inset)
+        })
+        .collect()
+}
+
+/// Signed distance (outside > 0) of `(x, y)` to carved column `(kx, ky)`'s region rectangle (its
+/// footprint, inset on each side whose neighbour is not carved).
+fn column_region_dist(kx: i32, ky: i32, x: f32, y: f32, carved: &dyn Fn(i32, i32) -> bool, inset: f32) -> f32 {
+    let ins = |dx: i32, dy: i32| if carved(kx + dx, ky + dy) { 0.0 } else { inset };
+    let x0 = kx as f32 * CHUNK_YARDS + ins(-1, 0);
+    let x1 = (kx + 1) as f32 * CHUNK_YARDS - ins(1, 0);
+    let y0 = ky as f32 * CHUNK_YARDS + ins(0, -1);
+    let y1 = (ky + 1) as f32 * CHUNK_YARDS - ins(0, 1);
+    let ex = (x0 - x).max(x - x1);
+    let ey = (y0 - y).max(y - y1);
+    if ex <= 0.0 && ey <= 0.0 {
+        ex.max(ey)
+    } else {
+        (ex.max(0.0).powi(2) + ey.max(0.0).powi(2)).sqrt()
+    }
+}
+
+/// MONKEY (voxel): unedited voxel fragments farther than this OUTSIDE the carve region (yd,
+/// [`carve_band`]) are not drawn — the real ground is there. The 0.1-yd strip just past the
+/// region keeps both (the voxel [`RENDER_DROP`] 0.02 yd under), so no crack can open between them.
+pub const BAND_DISCARD: f32 = 0.1;
 
 /// MONKEY (voxel): `n` deterministic synthetic edits (the bench / `WOW_VOXEL_SYNTH_EDITS` hook)
 /// spread over a `span`-yard square centred on `centre`, sitting on `ground(x, y)` (`None` →
@@ -1148,9 +1368,12 @@ pub fn synth_edits(
 /// [`SEED_LIFT`] above the real ground it overlaps; a grazing ray could slip into that slit, pass
 /// the terrain's carved edge and see the sky under the voxel surface (the owner's "wounds"). The
 /// skirt closes the slit; it continues the lip's own vertex normals, so it shades like the ground.
-pub fn add_skirts(m: &mut VoxelMesh, sides: [bool; 4], depth: f32) {
+///
+/// Returns, per appended vertex (in order), the lip vertex it hangs from.
+pub fn add_skirts(m: &mut VoxelMesh, sides: [bool; 4], depth: f32) -> Vec<u32> {
+    let mut lips: Vec<u32> = Vec::new();
     if !sides.iter().any(|&s| s) || m.indices.len() < 3 {
-        return;
+        return lips;
     }
     // The outermost cube layer per side, in window yards: cube 0 spans [0, 1] samples, cube 32
     // spans [32, 33].
@@ -1195,6 +1418,8 @@ pub fn add_skirts(m: &mut VoxelMesh, sides: [bool; 4], depth: f32) {
     let mut lip: HashMap<u32, (u32, u32)> = HashMap::new();
     let mut ring = |m: &mut VoxelMesh, v: u32| -> (u32, u32) {
         *lip.entry(v).or_insert_with(|| {
+            lips.push(v);
+            lips.push(v);
             let p = m.positions[v as usize];
             let s = on_side(p);
             let mut d = [0.0f32, 0.0];
@@ -1223,6 +1448,7 @@ pub fn add_skirts(m: &mut VoxelMesh, sides: [bool; 4], depth: f32) {
         m.indices
             .extend_from_slice(&[b, a, am, b, am, bm, bm, am, ab, bm, ab, bb]);
     }
+    lips
 }
 
 /// MONKEY (voxel): how far a skirt's ledge reaches OUTWARD past the lip (yd) …
@@ -2269,7 +2495,7 @@ mod tests {
         let w = world_with(&[k], &[edit([8.0, 8.0, 20.0], 4.0, MODE_DIG)]);
         let m = w.mesh(k);
         let o = window_origin(k);
-        let e = edited_weights(&m, &w.window_seed_heights(k), o[2]);
+        let e = edited_weights(&m, &w.window_i8(k), &w.window_seed_heights(k), o[2]);
         assert_eq!(e.len(), m.positions.len());
         let (mut ground, mut pit) = (0, 0);
         for (p, &v) in m.positions.iter().zip(&e) {
@@ -2284,7 +2510,7 @@ mod tests {
             }
         }
         assert!(ground > 50 && pit > 20, "{ground} ground / {pit} pit vertices");
-        assert!(edited_weights(&m, &[], 0.0).iter().all(|&v| v == 0.0));
+        assert!(edited_weights(&m, &[], &[], 0.0).iter().all(|&v| v == 0.0));
     }
 
     fn ground_h(x: f32, y: f32) -> f32 {
@@ -2562,5 +2788,180 @@ mod tests {
         assert!((z - 23.0).abs() < 0.3, "{z}");
         // The steep flank of the pit, near its rim: no top steep enough to grow on.
         assert!(w.top_near(10.9, 8.0, 20.0, 24.0, 0.65).is_none());
+    }
+
+    /// MONKEY (voxel, CONTRACT v3.3): soft-brush `param` round trip + the falloff curves.
+    #[test]
+    fn soft_brush_param_and_falloff() {
+        for f in [FALLOFF_SMOOTH, FALLOFF_LINEAR, FALLOFF_FLAT] {
+            for h in [0u8, 1, 37, 99, 100] {
+                let b = SoftBrush { falloff: f, hardness: h };
+                assert_eq!(SoftBrush::from_param(b.to_param()), Some(b));
+            }
+        }
+        assert_eq!(SoftBrush::from_param(0), None, "v2 / v3.0 edits stay hard");
+        assert_eq!(SoftBrush::from_param(0x7fff), None);
+        // Falloff 3 = smooth; hardness over 100 = 100; reserved bits ignored.
+        let odd = SoftBrush::from_param(0x8000 | 3 | (127 << 2) | (0x3f << 9)).unwrap();
+        assert_eq!(odd, SoftBrush { falloff: FALLOFF_SMOOTH, hardness: 100 });
+        let s = SoftBrush { falloff: FALLOFF_SMOOTH, hardness: 0 };
+        assert_eq!(s.weight(0.0, 8.0), 1.0);
+        assert_eq!(s.weight(8.0, 8.0), 0.0);
+        assert!((s.weight(4.0, 8.0) - 0.5).abs() < 1e-6);
+        assert!(s.weight(2.0, 8.0) > 0.8 && s.weight(6.0, 8.0) < 0.2);
+        let l = SoftBrush { falloff: FALLOFF_LINEAR, hardness: 50 };
+        assert_eq!(l.weight(3.9, 8.0), 1.0);
+        assert!((l.weight(6.0, 8.0) - 0.5).abs() < 1e-6);
+        let fl = SoftBrush { falloff: FALLOFF_FLAT, hardness: 0 };
+        assert_eq!(fl.weight(7.99, 8.0), 1.0);
+        // Only modes 0-2 read the flag; flatten's param is its plane.
+        let mut e = edit([0.0, 0.0, 20.0], 4.0, MODE_BUILD);
+        e.param = s.to_param();
+        assert!(e.soft().is_some() && e.reads_neighbours());
+        e.mode = MODE_FLATTEN;
+        assert!(e.soft().is_none() && !e.reads_neighbours());
+    }
+
+    /// The most air-over-solid crossings in any lattice column of `keys` (a hill with a floating
+    /// bubble crosses twice).
+    fn max_surfaces_per_column(w: &VoxelWorldData, keys: &[ChunkKey]) -> usize {
+        let c = CHUNK as i32;
+        let zlo = keys.iter().map(|k| k[2]).min().unwrap() * c;
+        let zhi = (keys.iter().map(|k| k[2]).max().unwrap() + 1) * c - 1;
+        let mut worst = 0;
+        for k in keys {
+            for y in 0..c {
+                for x in 0..c {
+                    let (ix, iy) = (k[0] * c + x, k[1] * c + y);
+                    let mut n = 0;
+                    for iz in zlo..zhi {
+                        if w.sample([ix, iy, iz + 1]) >= 0 && w.sample([ix, iy, iz]) < 0 {
+                            n += 1;
+                        }
+                    }
+                    worst = worst.max(n);
+                }
+            }
+        }
+        worst
+    }
+
+    /// MONKEY (voxel, owner "tools way too strong"): a soft RAISE held 2 s (16 edits at the 8/s
+    /// uplink cadence, 20 % strength, recentred on the new top each time like the tool) grows a
+    /// gentle, single-surfaced hill: ~0.1 yd per edit at the centre, a smooth falloff to nothing at
+    /// the radius, no bubble; a soft LOWER mirrors it. Deterministic, and the canonical rebuild of
+    /// the journal equals the incremental apply.
+    #[test]
+    fn soft_raise_held_grows_a_gentle_hill_and_lower_mirrors_it() {
+        let flat = |_: f32, _: f32| Some(20.0);
+        let keys: Vec<ChunkKey> = (0..=1)
+            .flat_map(|x| (0..=1).flat_map(move |y| (0..=2).map(move |z| [x, y, z])))
+            .collect();
+        let fresh = || {
+            let mut w = VoxelWorldData::default();
+            for k in &keys {
+                w.seeds
+                    .entry([k[0], k[1]])
+                    .or_insert_with(|| Arc::new(ColumnSeed::from_fn([k[0], k[1]], flat)));
+            }
+            w.build(&keys, std::iter::empty());
+            w
+        };
+        let run = |mode: u8| {
+            let mut w = fresh();
+            let brush = SoftBrush { falloff: FALLOFF_SMOOTH, hardness: 0 };
+            for _ in 0..16 {
+                let top = w
+                    .top_near(16.0, 16.0, 20.0, 8.0, 0.0)
+                    .map_or(20.0, |(z, _)| z);
+                let mut e = edit([16.0, 16.0, top], 5.0, mode);
+                e.strength = 51;
+                e.param = brush.to_param();
+                w.apply_incremental(&e);
+            }
+            w
+        };
+        let base = 20.0 + SEED_LIFT;
+        let z = |w: &VoxelWorldData, x: f32| w.top_near(x, 16.0, 21.0, 8.0, 0.0).unwrap().0;
+        let hill = run(MODE_BUILD);
+        let rise = z(&hill, 16.0) - base;
+        assert!((1.0..2.2).contains(&rise), "2 s at 20 % raises ~1.6 yd, got {rise}");
+        let (r1, r2, r3) = (z(&hill, 17.5) - base, z(&hill, 19.0) - base, z(&hill, 20.5) - base);
+        assert!(rise > r1 && r1 > r2 && r2 > r3 && r3 >= -0.02, "falloff {rise} {r1} {r2} {r3}");
+        assert!((z(&hill, 23.0) - base).abs() < 0.02, "outside the brush: untouched");
+        assert_eq!(max_surfaces_per_column(&hill, &keys), 1, "no bubble");
+        let pit = run(MODE_DIG);
+        let drop = base - z(&pit, 16.0);
+        assert!((1.0..2.2).contains(&drop), "the soft lower mirrors it: {drop}");
+        assert_eq!(max_surfaces_per_column(&pit, &keys), 1);
+        assert_eq!(run(MODE_BUILD).chunks, hill.chunks, "deterministic");
+        let mut j = MapJournal::default();
+        let mut w = fresh();
+        for (i, z0) in [20.15f32, 20.3, 20.5].iter().enumerate() {
+            let mut e = edit([16.0, 16.0, *z0], 5.0, MODE_BUILD);
+            e.strength = 200;
+            e.param = SoftBrush { falloff: FALLOFF_LINEAR, hardness: 30 }.to_param();
+            e.seq = Some(i as u32 + 1);
+            e.local = false;
+            j.insert(e);
+            w.apply_incremental(&e);
+        }
+        let mut c = VoxelWorldData::default();
+        c.seeds = w.seeds.clone();
+        c.build(&keys, j.edits_for(&keys).iter());
+        assert_eq!(chunks_hash(&c.chunks), chunks_hash(&w.chunks));
+    }
+
+    /// MONKEY (voxel fix, owner's cliff): an UNEDITED seeded surface is "untouched ground" at any
+    /// slope (weight 0 on a 70° cliff), and a gentle soft smooth over it stays ground-textured.
+    #[test]
+    fn unedited_steep_cliff_has_zero_edited_weight() {
+        let cliff = |x: f32, _: f32| Some(20.0 + 2.75 * (x - 8.0).clamp(-3.0, 3.0));
+        let keys: Vec<ChunkKey> = (0..=2).map(|z| [0, 0, z]).collect();
+        let mut w = VoxelWorldData::default();
+        w.seeds.insert([0, 0], Arc::new(ColumnSeed::from_fn([0, 0], cliff)));
+        w.build(&keys, std::iter::empty());
+        let weights = |w: &VoxelWorldData| {
+            let mut all = Vec::new();
+            for k in &keys {
+                let m = w.mesh(*k);
+                let o = window_origin(*k);
+                all.extend(edited_weights(&m, &w.window_i8(*k), &w.window_seed_heights(*k), o[2]));
+            }
+            all
+        };
+        let e = weights(&w);
+        assert!(!e.is_empty() && e.iter().all(|&v| v == 0.0), "an unedited cliff is ground");
+        let mut sm = edit([8.0, 8.0, 20.0], 6.0, MODE_SMOOTH);
+        sm.strength = 64;
+        sm.param = SoftBrush { falloff: FALLOFF_SMOOTH, hardness: 0 }.to_param();
+        w.build(&keys, [sm].iter());
+        let e = weights(&w);
+        let hi = e.iter().filter(|&&v| v > 0.5).count();
+        assert!(hi * 20 < e.len(), "a gentle smooth keeps the cliff ground: {hi}/{} edited", e.len());
+    }
+
+    /// MONKEY (voxel fix): the carve-band distance — ≤ 0 inside the carve region (no inset on an
+    /// internal seam), the inset band and uncarved neighbours positive.
+    #[test]
+    fn carve_band_is_negative_inside_and_positive_past_the_inset() {
+        let carved = |kx: i32, ky: i32| (kx, ky) == (0, 0) || (kx, ky) == (1, 0);
+        // Window-local positions; the origin (-0.5, -0.5) is added back.
+        let pts = [
+            [9.0f32, 9.5],  // (8.5, 9.0): inside column (0,0)
+            [17.5, 9.5],    // (17, 9): inside, past the internal seam
+            [16.75, 2.0],   // (16.25, 1.5): past the seam, 1 yd inside the −y edge
+            [9.0, 0.75],    // (8.5, 0.25): the −y inset band, 0.25 past the region
+            [9.0, 0.0],     // (8.5, -0.5): the uncarved column below, 1.0 past the region
+        ];
+        let m = VoxelMesh {
+            positions: pts.iter().map(|p| [p[0], p[1], 0.0]).collect(),
+            normals: vec![[0.0, 0.0, 1.0]; pts.len()],
+            indices: vec![],
+        };
+        let b = carve_band(&m, [-0.5, -0.5, 0.0], &carved, 0.5);
+        assert!(b[0] < 0.0 && b[1] < 0.0 && b[2] < 0.0, "{b:?}");
+        assert!((b[3] - 0.25).abs() < 1e-5, "{b:?}");
+        assert!((b[4] - 1.0).abs() < 1e-5, "{b:?}");
     }
 }
