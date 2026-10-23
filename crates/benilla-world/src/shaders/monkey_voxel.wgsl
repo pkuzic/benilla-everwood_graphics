@@ -221,8 +221,11 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     // face, `benilla_voxel::world::edited_weights`) and the carve-band distance (colour g, yd, > 0
     // outside the carve region, `carve_band`).
     var edited = 0.0;
+    var tilt = 1.0;
 #ifdef VERTEX_COLORS
     edited = clamp(in.color.r, 0.0, 1.0);
+    // MONKEY (voxel fix): cosine between this face and the seeded ground's normal under it.
+    tilt = in.color.b;
     // MONKEY (voxel fix, owner "borders feel lifted"): outside the carve the REAL ground is drawn
     // (it is clipped only inside); an untouched voxel surface there would double it — drop it.
     // The first 0.1 yd past the region keeps both (BAND_DISCARD), so no crack can open.
@@ -241,9 +244,12 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     // MONKEY (voxel fix, owner's cliff "smooth fucked up the textures"): an UNTOUCHED surface
     // (edited = 0) is drawn EXACTLY like the real ground at any slope — the ADT's own planar mapping
     // + alpha blend, never the wall triplanar (the real terrain never triplanars; a 70° seeded cliff
-    // keeps its grass / moss / rock blend). Only EDITED faces slide to the slope rule: a top only
-    // when nearly level (≥ ~0.86 up, ≤ ~30°), so a 45° pit wall reads as earth, not stretched grass.
-    let top_edited = smoothstep(mix(0.5, 0.86, edited), mix(0.7, 0.95, edited), n.y);
+    // keeps its grass / moss / rock blend). An EDITED face keeps the ground's layers while it is
+    // nearly level (≥ ~0.8 up) OR still faces within ~40° of the way the seeded ground did (a hill
+    // raised on a river bank, a smoothed slope — owner 2026-10-23: a raise must not grow a rock
+    // patch); it reads as earth / rock only when it turned away from the ground: a pit wall, a
+    // built sphere's flank.
+    let top_edited = max(smoothstep(0.72, 0.85, n.y), smoothstep(0.6, 0.8, tilt));
     let top_w = mix(1.0, top_edited, edited);
     let under_w = smoothstep(0.5, 0.7, -n.y) * edited;
     let side_w = max(1.0 - top_w - under_w, 0.0);
@@ -420,7 +426,9 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     // golden dirt under blue light came out dark teal. Pull the light on edited faces mostly to
     // grey, keeping its brightness (untouched ground: edited = 0, unchanged).
     let primary_luma = dot(primary, vec3<f32>(0.299, 0.587, 0.114));
-    primary = mix(primary, vec3<f32>(primary_luma), 0.85 * edited);
+    // Only on the WALL part of an edited face: an edited top (a raised hill, a levelled floor) is
+    // lit like the ground beside it.
+    primary = mix(primary, vec3<f32>(primary_luma), 0.85 * edited * (1.0 - top_w));
 
     let world_shadow_lane = wow_light.sh_c16.w > 0.5;
     let mcsh_suppress = select(0.0, sun_shadow_strength, world_shadow_lane);

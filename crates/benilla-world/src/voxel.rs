@@ -1984,8 +1984,10 @@ fn monkey_voxel_mesh_job(
     // MONKEY (voxel): edited weights for the surface; each skirt vertex (appended below) takes
     // its lip's weight.
     let mut edited = benilla_voxel::world::edited_weights(&vm, window, seed_h, origin[2]);
+    let mut tilt = benilla_voxel::world::seed_tilt_cos(&vm, seed_h);
     for lip in benilla_voxel::world::add_skirts(&mut vm, skirts, SKIRT_DEPTH) {
         edited.push(edited[lip as usize]);
+        tilt.push(tilt[lip as usize]);
     }
     // MONKEY (voxel fix): the carve-band distance per vertex — the shader drops UNEDITED voxel
     // fragments outside the carve region, where the real ground is drawn.
@@ -2006,13 +2008,15 @@ fn monkey_voxel_mesh_job(
     let mut mesh = monkey_voxel_mesh_to_bevy(&vm);
     // MONKEY (voxel): the "edited" weight rides in the vertex colour (r) — `monkey_voxel.wgsl`
     // raises the top/wall slope threshold on edited faces so a dug wall reads as earth.
-    // MONKEY (voxel fix): g = the carve-band distance (yd, > 0 outside the carve region).
+    // MONKEY (voxel fix): g = the carve-band distance (yd, > 0 outside the carve region), b = the
+    // cosine to the seeded ground's normal (`seed_tilt_cos`).
     mesh.insert_attribute(
         Mesh::ATTRIBUTE_COLOR,
         edited
             .iter()
             .zip(&band)
-            .map(|(&e, &b)| [e, b, e, 1.0])
+            .zip(&tilt)
+            .map(|((&e, &b), &t)| [e, b, t, 1.0])
             .collect::<Vec<[f32; 4]>>(),
     );
     let aabb = mesh.compute_aabb();
@@ -2386,9 +2390,9 @@ fn monkey_voxel_stream(
 /// weight is `smoothstep(0.5, 0.7, n.z)`), not the wall texture.
 const CLUTTER_MIN_UP: f32 = 0.65;
 /// MONKEY (voxel): … and on an EDITED face (a top more than this many yd off the ADT ground) only
-/// at this uprightness — the shader's edited-face top band (`smoothstep(0.86, 0.95, n.z)`).
+/// at this uprightness — the shader's edited-face top band (`smoothstep(0.72, 0.85, n.z)`).
 const CLUTTER_EDITED_OFF: f32 = 0.55;
-const CLUTTER_EDITED_MIN_UP: f32 = 0.9;
+const CLUTTER_EDITED_MIN_UP: f32 = 0.8;
 /// How far above / below its ADT height a tuft looks for its voxel top (yd).
 const CLUTTER_REACH: f32 = 24.0;
 /// Frame budget (ms) for re-placing MCNK clutter sets (~1–3 ms each); at least one per frame,

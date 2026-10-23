@@ -1255,6 +1255,44 @@ pub fn edited_weights(m: &VoxelMesh, win: &[i8], seed_h: &[f32], origin_z: f32) 
         .collect()
 }
 
+/// MONKEY (voxel fix, owner 2026-10-23: a soft raise on a river bank grew a rock patch): per vertex
+/// of a [`mesh_window`] mesh, the cosine between its normal and the SEEDED ground's normal under
+/// it (`seed_h` = [`VoxelWorldData::window_seed_heights`], bilinear; a missing column = 0). The
+/// shader keeps an EDITED face on the ground's own layers while it still faces roughly the way the
+/// ground did (a hill raised on a slope, a smoothed bank) and sends it to the wall layer only when
+/// it turned far away from it (a pit wall, a built sphere's flank). Any other `seed_h` length → 1.
+pub fn seed_tilt_cos(m: &VoxelMesh, seed_h: &[f32]) -> Vec<f32> {
+    let s = SAMPLES as usize;
+    if seed_h.len() != s * s {
+        return vec![1.0; m.positions.len()];
+    }
+    let at = |x: usize, y: usize| seed_h[x.min(s - 1) + y.min(s - 1) * s];
+    m.positions
+        .iter()
+        .zip(&m.normals)
+        .map(|(p, n)| {
+            let (fx, fy) = (p[0] / VOXEL_SIZE, p[1] / VOXEL_SIZE);
+            let (ix, iy) = (fx.floor().max(0.0) as usize, fy.floor().max(0.0) as usize);
+            let (tx, ty) = (
+                (fx - ix as f32).clamp(0.0, 1.0),
+                (fy - iy as f32).clamp(0.0, 1.0),
+            );
+            let hs = [at(ix, iy), at(ix + 1, iy), at(ix, iy + 1), at(ix + 1, iy + 1)];
+            if hs.iter().any(|h| !h.is_finite()) {
+                return 0.0;
+            }
+            let gx = ((hs[1] - hs[0]) * (1.0 - ty) + (hs[3] - hs[2]) * ty) / VOXEL_SIZE;
+            let gy = ((hs[2] - hs[0]) * (1.0 - tx) + (hs[3] - hs[1]) * tx) / VOXEL_SIZE;
+            let ls = (gx * gx + gy * gy + 1.0).sqrt();
+            let ln = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
+            if ln < 1.0e-6 {
+                return 1.0;
+            }
+            (-gx * n[0] - gy * n[1] + n[2]) / (ls * ln)
+        })
+        .collect()
+}
+
 /// MONKEY (voxel): the density test of [`edited_weights`]: a change under this many voxels is
 /// untouched ground …
 pub const EDITED_DENSITY_FROM: f32 = 0.25;
@@ -2963,5 +3001,37 @@ mod tests {
         assert!(b[0] < 0.0 && b[1] < 0.0 && b[2] < 0.0, "{b:?}");
         assert!((b[3] - 0.25).abs() < 1e-5, "{b:?}");
         assert!((b[4] - 1.0).abs() < 1e-5, "{b:?}");
+    }
+
+    /// MONKEY (voxel fix): an edited face that still faces like the ground (a soft hill raised on a
+    /// sloped bank) keeps a tilt cosine near 1; a pit wall dug in level ground is near 0.
+    #[test]
+    fn seed_tilt_tells_a_raised_slope_from_a_pit_wall() {
+        let bank = |x: f32, _: f32| Some(20.0 + 0.4 * x);
+        let keys: Vec<ChunkKey> = (0..=2).map(|z| [0, 0, z]).collect();
+        let mut w = VoxelWorldData::default();
+        w.seeds.insert([0, 0], Arc::new(ColumnSeed::from_fn([0, 0], bank)));
+        let mut e = edit([8.0, 8.0, 23.35], 5.0, MODE_BUILD);
+        e.strength = 51;
+        e.param = SoftBrush { falloff: FALLOFF_SMOOTH, hardness: 0 }.to_param();
+        let mut es = Vec::new();
+        for i in 0..16 {
+            let mut x = e;
+            x.pos[2] += 0.1 * i as f32;
+            es.push(x);
+        }
+        w.build(&keys, es.iter());
+        let mut worst = 1.0f32;
+        for k in &keys {
+            let m = w.mesh(*k);
+            for c in seed_tilt_cos(&m, &w.window_seed_heights(*k)) {
+                worst = worst.min(c);
+            }
+        }
+        assert!(worst > 0.8, "a soft hill on a 22-degree bank stays ground-facing: {worst}");
+        let flat = world_with(&[[0, 0, 1]], &[edit([8.0, 8.0, 20.0], 4.0, MODE_DIG)]);
+        let m = flat.mesh([0, 0, 1]);
+        let t = seed_tilt_cos(&m, &flat.window_seed_heights([0, 0, 1]));
+        assert!(t.iter().any(|&c| c < 0.2), "a hard pit has walls");
     }
 }
