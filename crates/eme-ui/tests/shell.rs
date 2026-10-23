@@ -169,6 +169,11 @@ fn settle(ctx: &egui::Context, shell: &mut EmeShell, w: &World) -> EmeShellOutpu
     out
 }
 
+/// Whether control `id` was drawn at all.
+fn drawn(out: &EmeShellOutput, id: &str) -> bool {
+    out.probe.iter().any(|p| p.id == id)
+}
+
 fn entry<'a>(out: &'a EmeShellOutput, id: &str) -> &'a eme_ui::EmeProbeEntry {
     out.probe.iter().find(|p| p.id == id).unwrap_or_else(|| {
         panic!(
@@ -222,21 +227,19 @@ fn rank_matrix_tools_undo_banner() {
         let mut shell = probing_shell();
         let out = settle(&ctx, &mut shell, &w);
 
-        // Mutating tools need rank 3; the read-only log tool opens at 2.
-        assert_eq!(entry(&out, "tool:sculpt").enabled, rank >= 3, "rank {rank}");
-        assert_eq!(entry(&out, "tool:water").enabled, rank >= 3, "rank {rank}");
+        // The toolbar = `registry.visible`: mutating tools from rank 3, the read-only log at 2.
+        assert_eq!(drawn(&out, "tool:sculpt"), rank >= 3, "rank {rank}");
+        assert_eq!(drawn(&out, "tool:water"), rank >= 3, "rank {rank}");
         assert!(entry(&out, "tool:log").enabled, "rank {rank}");
         // Undo / redo are edits.
         assert_eq!(entry(&out, "undo").enabled, rank >= 3, "rank {rank}");
         assert!(!entry(&out, "redo").enabled);
         // Banner exactly for the read-only rank.
         assert_eq!(out.read_only_banner, rank == 2, "rank {rank}");
-        // A disabled tool says why.
+        // A read-only rank says why the edit buttons are off.
         if rank == 2 {
-            let tip = entry(&out, "tool:sculpt").tooltip.as_deref().unwrap();
+            let tip = entry(&out, "undo").tooltip.as_deref().unwrap();
             assert!(tip.contains('3'), "tooltip names the rank: {tip}");
-        } else {
-            assert!(entry(&out, "tool:sculpt").tooltip.is_none());
         }
     }
 }
@@ -247,7 +250,10 @@ fn rank_below_view_disables_everything() {
     let ctx = egui::Context::default();
     let mut shell = probing_shell();
     let out = settle(&ctx, &mut shell, &w);
-    for id in ["tool:sculpt", "tool:log", "undo", "redo"] {
+    for id in ["tool:sculpt", "tool:log"] {
+        assert!(!drawn(&out, id), "{id}");
+    }
+    for id in ["undo", "redo"] {
         assert!(!entry(&out, id).enabled, "{id}");
     }
 }
@@ -263,8 +269,7 @@ fn server_caps_can_hide_a_tool() {
     let mut shell = probing_shell();
     let out = settle(&ctx, &mut shell, &w);
     assert!(entry(&out, "tool:sculpt").enabled);
-    assert!(!entry(&out, "tool:water").enabled);
-    assert!(entry(&out, "tool:water").tooltip.is_some());
+    assert!(!drawn(&out, "tool:water"), "a tool the server does not offer is not shown");
 }
 
 #[test]
@@ -283,10 +288,11 @@ fn clicking_undo_and_a_tool_emit_commands() {
 
 #[test]
 fn a_disabled_button_emits_nothing() {
-    let w = World::new(2);
+    let mut w = World::new(2);
+    committed_stroke(&mut w.undo, 1);
     let ctx = egui::Context::default();
     let mut shell = probing_shell();
-    assert!(click(&ctx, &mut shell, &w, "tool:sculpt").is_empty());
+    assert!(click(&ctx, &mut shell, &w, "undo").is_empty());
 }
 
 #[test]
@@ -441,7 +447,7 @@ fn russian_shell_draws() {
     let mut shell = probing_shell();
     let out = settle(&ctx, &mut shell, &w);
     assert!(out.read_only_banner);
-    let tip = entry(&out, "tool:sculpt").tooltip.clone().unwrap();
+    let tip = entry(&out, "undo").tooltip.clone().unwrap();
     assert!(tip.contains("ранг"), "{tip}");
 }
 
@@ -517,25 +523,4 @@ fn panels_track_resized_width_into_layout() {
     settle(&ctx, &mut shell, &w);
     assert!(shell.layout.left_width >= eme_ui::layout::PANEL_MIN);
     assert!(shell.layout.right_width <= eme_ui::layout::PANEL_MAX);
-}
-
-#[test]
-fn toggle_requests_respect_rank() {
-    use bevy::prelude::*;
-    use eme_ui::{apply_toggle_requests, EmeActive, EmeToggleRequested};
-    for (rank, expect) in [(1u8, false), (2, true), (4, true)] {
-        let mut app = App::new();
-        app.add_message::<EmeToggleRequested>()
-            .init_resource::<EmeActive>()
-            .insert_resource(session(rank))
-            .add_systems(Update, apply_toggle_requests);
-        app.world_mut().write_message(EmeToggleRequested);
-        app.update();
-        assert_eq!(app.world().resource::<EmeActive>().0, expect, "rank {rank}");
-        if expect {
-            app.world_mut().write_message(EmeToggleRequested);
-            app.update();
-            assert!(!app.world().resource::<EmeActive>().0, "toggles back off");
-        }
-    }
 }

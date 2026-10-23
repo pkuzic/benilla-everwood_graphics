@@ -1,25 +1,16 @@
 //! The in-window egui debug panel, floated top-right over the full-screen world and toggled by
 //! [`DEV_CHORD`]+`D`. It edits [`DebugState`]; apply systems elsewhere turn that into world
-//! changes. [`EguiPointerOver`] is owned by `ui_script` and only written here, so gameplay never
-//! names a dev-owned type. egui runs in manual-context mode on its own overlay camera.
+//! changes. egui itself (plugin, overlay camera, pointer arbitration, demand gate) is the shared
+//! lane in `crate::egui_lane`, which the EME editor shell draws on too; this panel only states its
+//! demand there.
 
-use bevy::camera::visibility::RenderLayers;
-use bevy::camera::CameraOutputMode;
 use bevy::prelude::*;
-use bevy::render::render_resource::BlendState;
-use bevy_egui::{
-    egui, EguiContext, EguiContextSettings, EguiContexts, EguiFullOutput, EguiGlobalSettings,
-    EguiInput, EguiPlugin, EguiPostUpdateSet, EguiPreUpdateSet, EguiPrimaryContextPass,
-    PrimaryEguiContext,
-};
+use bevy_egui::{egui, EguiContexts, EguiPrimaryContextPass};
 
 use benilla_assets::LockRecover;
 use benilla_world::lighting::{ClockSource, GameClock, WowLighting};
 use benilla_world::model_render::{ModelKind, ModelPart};
 use benilla_world::modkeys::{dev_chord, DEV_CHORD};
-
-/// The egui half of the pointer arbitration: written here, owned by `ui_script`.
-use crate::ui_script::EguiPointerOver;
 
 mod inspect;
 mod journal;
@@ -46,28 +37,6 @@ pub(crate) fn overlay_text(ui: &mut egui::Ui) {
     let style = ui.style_mut();
     style.visuals.override_text_color = Some(OVERLAY_TEXT);
     style.wrap_mode = Some(egui::TextWrapMode::Extend);
-}
-
-/// Strip Tab from egui's input: it is bound to `TargetNearestEnemy`, and egui would take it as
-/// focus navigation and grab the keyboard. Bevy's `ButtonInput<KeyCode>` still sees it.
-fn strip_egui_tab_focus(mut inputs: Query<&mut EguiInput>) {
-    for mut input in &mut inputs {
-        input.events.retain(|e| {
-            !matches!(
-                e,
-                egui::Event::Key {
-                    key: egui::Key::Tab,
-                    ..
-                }
-            )
-        });
-    }
-}
-
-fn track_pointer_over_ui(mut contexts: EguiContexts, mut over: ResMut<EguiPointerOver>) -> Result {
-    let ctx = contexts.ctx_mut()?;
-    over.0 = ctx.is_pointer_over_area() || ctx.wants_pointer_input();
-    Ok(())
 }
 
 /// The panel's display order for [`ModelKind`].
@@ -115,15 +84,8 @@ pub struct DebugPanelPlugin;
 
 impl Plugin for DebugPanelPlugin {
     fn build(&self, app: &mut App) {
-        app.add_plugins(EguiPlugin::default());
-        // Manual context mode, egui hosted on its own overlay camera: disable auto-creation right
-        // after adding the plugin, before its startup system runs.
-        {
-            let mut egui = app.world_mut().resource_mut::<EguiGlobalSettings>();
-            egui.auto_create_primary_context = false;
-            // The player hides the OS cursor and draws `Point.blp`, so egui must not drive it.
-            egui.enable_cursor_icon_updates = false;
-        }
+        // The shared egui lane (plugin, overlay camera, pointer arbitration, demand gate).
+        crate::egui_lane::ensure(app);
 
         // The inspector, its mouseover pick and the cast journal. `DebugState`, `InspectMode` and
         // `EguiPointerOver` are inited by their owners.
@@ -143,111 +105,26 @@ impl Plugin for DebugPanelPlugin {
                 EguiPrimaryContextPass,
                 (inspect::inspect_ui, journal::journal_ui),
             )
-            .add_systems(Startup, spawn_egui_camera)
-            // Between bevy_egui filling `EguiInput` and the pass consuming it, the seam bevy_egui
-            // documents for input edits.
-            .add_systems(
-                PreUpdate,
-                strip_egui_tab_focus
-                    .after(EguiPreUpdateSet::ProcessInput)
-                    .before(EguiPreUpdateSet::BeginPass),
-            )
-            .add_systems(
-                EguiPrimaryContextPass,
-                (debug_panel_ui, track_pointer_over_ui),
-            )
+            .add_systems(EguiPrimaryContextPass, debug_panel_ui)
             // No ordering against `UiInput`: a dev chord cannot be typed text.
-            .add_systems(Update, (toggle_panel, gate_egui_lane).chain())
-            // A gated frame still owes bevy_egui a prepared empty output, between the end pass it
-            // skipped and the output consumer that still runs.
             .add_systems(
-                PostUpdate,
-                feed_gated_egui_output
-                    .after(EguiPostUpdateSet::EndPass)
-                    .before(EguiPostUpdateSet::ProcessOutput),
+                Update,
+                (toggle_panel, dev_egui_demand)
+                    .chain()
+                    .in_set(crate::egui_lane::EguiDemandSet),
             );
     }
 }
 
-/// Feed each gated context an empty output: `run_manually` is not "off", and bevy_egui's
-/// `process_output_system` logs an ERROR every frame a context has none. The first feed is a real
-/// `Context::run`, because tessellating a context that never began a pass panics `No fonts loaded`.
-fn feed_gated_egui_output(
-    mut contexts: Query<(&mut EguiContext, &mut EguiFullOutput, &EguiContextSettings)>,
-    // The empty pass's output minus its one-time texture delta, fed on every later gated frame
-    // instead of running a real pass.
-    mut cached: Local<Option<egui::FullOutput>>,
-) {
-    for (mut ctx, mut full_output, settings) in &mut contexts {
-        if settings.run_manually && full_output.0.is_none() {
-            full_output.0 = Some(match &*cached {
-                Some(out) => out.clone(),
-                None => {
-                    // `get_mut`: `get` needs bevy_egui's `immutable_ctx` feature. The font
-                    // texture delta must reach the GPU exactly once, so the cache drops it.
-                    let out = ctx.get_mut().run(egui::RawInput::default(), |_| {});
-                    let mut keep = out.clone();
-                    keep.textures_delta = Default::default();
-                    keep.shapes.clear();
-                    *cached = Some(keep);
-                    out
-                }
-            });
-        }
-    }
-}
-
-/// The full-window overlay camera hosting the primary egui context, order 2: above the player-UI
-/// pass (order 1) and the world camera (order 0), so dev overlays always sit on top.
-fn spawn_egui_camera(mut commands: Commands) {
-    commands.spawn((
-        PrimaryEguiContext, // `#[require(EguiContext)]` ⇒ this camera carries EguiContext
-        // Named for [`crate::preflight`]'s MSAA check, which reports cameras by name.
-        Name::new("egui dev-overlay camera"),
-        Camera2d,
-        // Set explicitly: `Camera` requires `Msaa`, default `Sample4`, and Bevy keys the 2D depth
-        // texture on the target alone, so this must match the player-UI camera's `Msaa::Off` or a
-        // pass fails validation. egui feathers its own edges anyway.
-        bevy::render::view::Msaa::Off,
-        RenderLayers::none(),
-        Camera {
-            order: 2,
-            // An overlay composites only its own pixels: egui paints a cleared transparent canvas
-            // in premultiplied colour, so the blit over the swapchain blends premultiplied
-            // (`SrcAlpha` would weight it twice). Loading the shared main texture instead would
-            // re-present the player-UI camera's un-decoded frame. It never touches the world
-            // image, so writeback is off.
-            output_mode: CameraOutputMode::Write {
-                blend_state: Some(BlendState::PREMULTIPLIED_ALPHA_BLENDING),
-                clear_color: ClearColorConfig::None,
-            },
-            clear_color: ClearColorConfig::Custom(Color::NONE),
-            msaa_writeback: bevy::camera::MsaaWriteback::Off,
-            ..default()
-        },
-    ));
-}
-
-/// Demand-gate the egui lane: with the panel closed and inspect off, the primary context goes
-/// `run_manually` (bevy_egui skips its pass) and the overlay camera sleeps, so a hidden dev surface
-/// costs nothing. `EguiPointerOver` clears on the way down: its writer runs inside the gated pass.
-fn gate_egui_lane(
+/// The dev half of the egui lane's demand: the panel is open or the inspector is armed.
+fn dev_egui_demand(
     debug: Res<DebugState>,
     inspect: Res<crate::ui_script::InspectMode>,
-    mut cams: Query<(&mut Camera, &mut EguiContextSettings), With<PrimaryEguiContext>>,
-    mut over: ResMut<EguiPointerOver>,
+    mut demand: ResMut<crate::egui_lane::EguiLaneDemand>,
 ) {
-    let open = debug.open || inspect.enabled;
-    for (mut cam, mut settings) in &mut cams {
-        if cam.is_active != open {
-            cam.is_active = open;
-            if !open && over.0 {
-                over.0 = false;
-            }
-        }
-        if settings.run_manually == open {
-            settings.run_manually = !open;
-        }
+    let want = debug.open || inspect.enabled;
+    if demand.dev != want {
+        demand.dev = want;
     }
 }
 

@@ -280,6 +280,13 @@ impl Default for MonkeyVoxelWorld {
 }
 
 impl MonkeyVoxelWorld {
+    /// MONKEY (EME): the last stream pass's wall time, ms (`phase_ms[6]`).
+    pub(crate) fn stream_ms(&self) -> f32 {
+        self.phase_ms[6]
+    }
+}
+
+impl MonkeyVoxelWorld {
     /// The carve (union of surface columns) for the terrain hiding; `None` = nothing carved.
     pub fn carve(&self) -> Option<Arc<VoxelCarve>> {
         self.carve.clone()

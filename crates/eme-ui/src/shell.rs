@@ -187,14 +187,23 @@ impl EmeShell {
             status_bar(ui, model);
         });
 
-        // Left: tool options.
+        // Left: tool options, a floating box as tall as its content (top-left, under the strip),
+        // so the host's chat in the bottom-left corner stays in view.
         if self.layout.left_open {
-            let r = egui::SidePanel::left("eme_left")
-                .resizable(true)
+            let top = ctx.available_rect().top();
+            let r = egui::Window::new("eme_left")
+                .title_bar(false)
+                .collapsible(false)
+                .movable(false)
+                .resizable([true, false])
+                .fixed_pos(egui::pos2(6.0, top + 6.0))
                 .default_width(self.layout.left_width)
-                .width_range(PANEL_MIN..=PANEL_MAX)
+                .min_width(PANEL_MIN)
+                .max_width(PANEL_MAX)
                 .show(ctx, |ui| options_panel(ui, &mut f));
-            self.layout.left_width = r.response.rect.width().clamp(PANEL_MIN, PANEL_MAX);
+            if let Some(r) = r {
+                self.layout.left_width = r.response.rect.width().clamp(PANEL_MIN, PANEL_MAX);
+            }
         }
 
         // Right: history / restore / log.
@@ -229,36 +238,18 @@ fn top_strip(ui: &mut Ui, f: &mut Frame, layout: &mut EmeLayout) {
     ui.horizontal_wrapped(|ui| {
         ui.label(RichText::new(tr.t("MONKEY_EME_TITLE")).strong());
         ui.separator();
+        // The toolbar: only the tools this rank may use AND the server offers
+        // (`EmeToolRegistry::visible`); nothing to grey out, nothing to explain.
         let active = m.tools.active_id();
-        for id in m.tools.ids() {
-            let Some(tool) = m.tools.get(id.as_str()) else {
-                continue;
-            };
-            let rank_ok = perms.allows_rank(tool.min_rank());
-            let offered = m
-                .session
-                .caps
-                .as_ref()
-                .is_none_or(|c| c.offers_tool(id.as_str()));
-            let enabled = rank_ok && offered;
-            let tip = if !rank_ok {
-                Some(tr.f(
-                    "MONKEY_EME_TOOL_NEEDS_RANK",
-                    &[&tool.min_rank().to_string()],
-                ))
-            } else if !offered {
-                Some(tr.t("MONKEY_EME_TOOL_NOT_OFFERED").to_owned())
-            } else {
-                None
-            };
+        for id in m.tools.visible(&perms, m.session.caps.as_ref()) {
             let is_active = active == Some(id);
             let name = f.tool_name(id);
             let text = if is_active {
-                format!("▸ {name}")
+                format!("› {name}")
             } else {
                 name
             };
-            if f.button(ui, format!("tool:{id}"), text, enabled, is_active, tip) {
+            if f.button(ui, format!("tool:{id}"), text, true, is_active, None) {
                 f.push(EmeUiCommand::ActivateTool(id));
             }
         }
@@ -300,9 +291,9 @@ fn top_strip(ui: &mut Ui, f: &mut Frame, layout: &mut EmeLayout) {
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             // Link and rank: glyph + word, never colour alone.
             let (glyph, key, colour) = match m.session.link {
-                eme_core::EmeLink::Up { .. } => ("●", "MONKEY_EME_LINK_UP", m.theme.ok),
+                eme_core::EmeLink::Up { .. } => ("⚫", "MONKEY_EME_LINK_UP", m.theme.ok),
                 eme_core::EmeLink::Handshaking => {
-                    ("◌", "MONKEY_EME_LINK_HANDSHAKING", m.theme.warn)
+                    ("○", "MONKEY_EME_LINK_HANDSHAKING", m.theme.warn)
                 }
                 eme_core::EmeLink::Unsupported => {
                     ("✖", "MONKEY_EME_LINK_UNSUPPORTED", m.theme.error)
@@ -521,7 +512,7 @@ fn right_panel(ui: &mut Ui, f: &mut Frame, tab: &mut EmeRightTab, label: &mut St
         ] {
             let selected = *tab == t;
             let text = if selected {
-                format!("▸ {}", tr.t(key))
+                format!("› {}", tr.t(key))
             } else {
                 tr.t(key).to_owned()
             };
@@ -545,9 +536,9 @@ fn state_view(s: &EmeEntryState) -> (&'static str, &'static str) {
         EmeEntryState::Open
         | EmeEntryState::Committing
         | EmeEntryState::UndoPending
-        | EmeEntryState::RedoPending => ("◌", "MONKEY_EME_STATE_PENDING"),
+        | EmeEntryState::RedoPending => ("○", "MONKEY_EME_STATE_PENDING"),
         EmeEntryState::Applied => ("✔", "MONKEY_EME_STATE_APPLIED"),
-        EmeEntryState::Undone => ("↶", "MONKEY_EME_STATE_UNDONE"),
+        EmeEntryState::Undone => ("⟲", "MONKEY_EME_STATE_UNDONE"),
         EmeEntryState::NeedsConfirm(_) => ("⚠", "MONKEY_EME_STATE_NEEDS_CONFIRM"),
     }
 }

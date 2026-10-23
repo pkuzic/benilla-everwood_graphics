@@ -13,7 +13,9 @@
 use bevy::input::mouse::{AccumulatedMouseMotion, AccumulatedMouseScroll, MouseScrollUnit};
 use bevy::prelude::*;
 
-use crate::{EmeActive, EmeHostInput, EmeSet, EmeToggleRequested};
+use crate::{
+    EmeActive, EmeHostInput, EmePointerOverUi, EmeSet, EmeToggleRequested, EmeUiWantsKeyboard,
+};
 use benilla_world::view::WorldCamera;
 
 /// Base speed bounds, yards per second.
@@ -107,6 +109,7 @@ fn free_cam_input(
     time: Res<Time<Real>>,
     active: Res<EmeActive>,
     host_input: Res<EmeHostInput>,
+    ui: (Res<EmePointerOverUi>, Res<EmeUiWantsKeyboard>),
     keys: Option<Res<ButtonInput<KeyCode>>>,
     buttons: Option<Res<ButtonInput<MouseButton>>>,
     motion: Option<Res<AccumulatedMouseMotion>>,
@@ -114,8 +117,9 @@ fn free_cam_input(
     camera: Query<&Transform, With<WorldCamera>>,
     mut cam: ResMut<EmeFreeCam>,
     mut toggle: MessageWriter<EmeToggleRequested>,
-    mut was_active: Local<bool>,
+    (mut was_active, mut looking): (Local<bool>, Local<bool>),
 ) {
+    let (over_ui, ui_keyboard) = ui;
     if !active.0 {
         // Closing forgets the pose (the next open starts at the character's camera); a pose set
         // while closed (a script's `camera` step) is kept for the next open.
@@ -131,7 +135,9 @@ fn free_cam_input(
             cam.seed_from(t);
         }
     }
-    let typing = host_input.typing;
+    // An EME text field has the keyboard as surely as the chat edit box.
+    let typing = host_input.typing || ui_keyboard.0;
+    let over_ui = over_ui.0 || host_input.pointer_over_ui;
     let Some(keys) = keys else { return };
     let down = |k: KeyCode| !typing && keys.pressed(k);
     if !typing && keys.just_pressed(KeyCode::Tab) {
@@ -150,13 +156,24 @@ fn free_cam_input(
     let slow = down(KeyCode::ControlLeft) || down(KeyCode::ControlRight);
     // Real time: the camera keeps flying while the game clock is paused / frozen.
     cam.fly(axes, fast, slow, time.delta_secs().min(0.1));
-    if buttons.is_some_and(|b| b.pressed(MouseButton::Right)) {
+    // RMB look latches on a press over the world; a press over a panel is the panel's.
+    let rmb = buttons.as_ref().is_some_and(|b| b.pressed(MouseButton::Right));
+    if buttons
+        .as_ref()
+        .is_some_and(|b| b.just_pressed(MouseButton::Right))
+    {
+        *looking = !over_ui;
+    }
+    if !rmb {
+        *looking = false;
+    }
+    if *looking {
         if let Some(m) = motion {
             cam.look(m.delta);
         }
     }
     let alt = keys.pressed(KeyCode::AltLeft) || keys.pressed(KeyCode::AltRight);
-    if let (Some(s), false) = (scroll, alt || host_input.pointer_over_ui) {
+    if let (Some(s), false) = (scroll, alt || over_ui) {
         let steps = match s.unit {
             MouseScrollUnit::Line => s.delta.y,
             MouseScrollUnit::Pixel => s.delta.y / 100.0,

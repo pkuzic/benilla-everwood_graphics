@@ -16,7 +16,7 @@ use crate::camera::EmeFreeCam;
 use crate::viewport::{active_mode, resolve_preview, EmeAim, EmeBrushPreviewState, EmeCursor};
 use crate::{
     now_ms, EmeActive, EmeEventMsg, EmeHost, EmeHostInput, EmePointerOverUi, EmeRequest, EmeSet,
-    EmeToggleRequested, EmeWire,
+    EmeToggleRequested, EmeUiWantsKeyboard, EmeWire,
 };
 use benilla_assets::coords::bevy_to_wow;
 use benilla_world::voxel::{MonkeyVoxelApi, MonkeyVoxelEvent, MonkeyVoxelSubmit};
@@ -125,6 +125,7 @@ fn pump(
 fn toggle(
     keys: Option<Res<ButtonInput<KeyCode>>>,
     host_input: Res<EmeHostInput>,
+    ui_keyboard: Res<EmeUiWantsKeyboard>,
     mut requests: MessageReader<EmeToggleRequested>,
     mut host: ResMut<EmeHost>,
     mut active: ResMut<EmeActive>,
@@ -135,7 +136,7 @@ fn toggle(
     for r in requests.read() {
         wanted = Some(r.to.unwrap_or(!wanted.unwrap_or(active.0)));
     }
-    if keys.is_some_and(|k| k.just_pressed(KeyCode::F9)) && !host_input.typing {
+    if keys.is_some_and(|k| k.just_pressed(KeyCode::F9)) && !host_input.typing && !ui_keyboard.0 {
         wanted = Some(!wanted.unwrap_or(active.0));
     }
     let Some(on) = wanted else { return };
@@ -184,7 +185,14 @@ fn frame(
     keys: Option<Res<ButtonInput<KeyCode>>>,
     buttons: Option<Res<ButtonInput<MouseButton>>>,
     scroll: Option<Res<bevy::input::mouse::AccumulatedMouseScroll>>,
-    ui: (Res<EmeHostInput>, Res<EmePointerOverUi>, Res<EmeCursor>, Res<EmeAim>, Res<EmeFreeCam>),
+    ui: (
+        Res<EmeHostInput>,
+        Res<EmePointerOverUi>,
+        Res<EmeUiWantsKeyboard>,
+        Res<EmeCursor>,
+        Res<EmeAim>,
+        Res<EmeFreeCam>,
+    ),
     mut requests: MessageReader<EmeRequest>,
     mut host: ResMut<EmeHost>,
     mut wire: ResMut<EmeWire>,
@@ -193,7 +201,7 @@ fn frame(
     mut anchor: ResMut<EmeViewAnchor>,
     mut prev_primary: Local<bool>,
 ) {
-    let (host_input, over_ui, cursor, aim, free_cam) = ui;
+    let (host_input, over_ui, ui_keyboard, cursor, aim, free_cam) = ui;
     let now = now_ms(&time);
     let host = &mut *host;
     api.claim_input(active.0);
@@ -205,8 +213,9 @@ fn frame(
         return;
     }
     let perms = host.dispatcher.permissions();
-    let typing = host_input.typing;
-    let pointer_over_ui = over_ui.0 || host_input.pointer_over_ui;
+    let typing = host_input.typing || ui_keyboard.0;
+    // A virtual (script) cursor is never over a panel: the shell follows the OS pointer.
+    let pointer_over_ui = (over_ui.0 || host_input.pointer_over_ui) && cursor.virtual_norm.is_none();
 
     // Panel / script requests.
     for r in requests.read() {
@@ -219,6 +228,16 @@ fn frame(
             }
             EmeRequest::ConfirmUndo(id) => {
                 log_undo(host.dispatcher.confirm_undo(now, &mut *wire, *id));
+            }
+            EmeRequest::CancelConfirm(id) => {
+                if let Err(e) = host.dispatcher.undo_stack_mut().cancel_confirm(*id) {
+                    info!("EME: cancel confirm: {e:?}");
+                }
+            }
+            EmeRequest::Service(req) => {
+                if let Err(e) = host.dispatcher.request(now, &mut *wire, None, req.clone()) {
+                    info!("EME: {} not sent: {e:?}", req.op());
+                }
             }
             EmeRequest::SelectTool(id) => {
                 let mut sink = EmeCommandSink::new();

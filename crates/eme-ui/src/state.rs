@@ -12,23 +12,33 @@ use eme_core::{
 
 use crate::layout::EmeRightTab;
 
-/// The shell renders only while this is true. The F9 toggle lives in another crate; it flips this
-/// (directly, or by writing [`EmeToggleRequested`] and letting [`crate::apply_toggle_requests`] do
-/// it).
-#[derive(Resource, Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct EmeActive(pub bool);
+/// Where the shell reads the tool registry and the undo stack from: the host's own state (the
+/// `eme` plugin implements it for its `EmeHost`, so there is ONE registry and ONE stack), or
+/// [`EmeStandaloneSource`] for a host without the `eme` plugin (tests, a tool demo).
+pub trait EmeShellSource: Resource {
+    /// Registered tools (the toolbar shows `registry.visible(perms, caps)`).
+    fn registry(&self) -> &EmeToolRegistry;
+    /// The shared undo stack (History tab, undo / redo state, the confirmation modal).
+    fn undo_stack(&self) -> &EmeUndoStack;
+}
 
-/// "Please toggle EME". Written by whatever owns the hotkey.
-#[derive(Message, Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct EmeToggleRequested;
-
-/// The tool registry, as a resource (the host registers its tools into `.0`).
+/// A registry + undo stack owned by the UI crate itself, for a host without the `eme` plugin.
 #[derive(Resource, Debug, Default)]
-pub struct EmeTools(pub EmeToolRegistry);
+pub struct EmeStandaloneSource {
+    /// Registered tools.
+    pub registry: EmeToolRegistry,
+    /// The undo stack.
+    pub undo: EmeUndoStack,
+}
 
-/// The shared undo stack, as a resource.
-#[derive(Resource, Debug, Default)]
-pub struct EmeUndo(pub EmeUndoStack);
+impl EmeShellSource for EmeStandaloneSource {
+    fn registry(&self) -> &EmeToolRegistry {
+        &self.registry
+    }
+    fn undo_stack(&self) -> &EmeUndoStack {
+        &self.undo
+    }
+}
 
 /// Who the caller is and how the link looks. Fed from the `caps` reply and the transport.
 #[derive(Resource, Debug, Clone, Default)]
@@ -110,14 +120,4 @@ pub enum EmeUiCommand {
     },
     /// The user opened a right-hand tab: a good moment to refresh its data.
     TabOpened(EmeRightTab),
-}
-
-/// Whether the pointer / keyboard is over EME UI. The viewport reads this to know whether a click
-/// is for the world or for a panel. Reset to false while the shell is hidden.
-#[derive(Resource, Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct EmeInputArbiter {
-    /// The pointer is over an EME panel, window or modal (or egui is dragging).
-    pub pointer_over_ui: bool,
-    /// An EME text field has keyboard focus (hotkeys must not fire).
-    pub keyboard_captured: bool,
 }

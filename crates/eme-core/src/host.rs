@@ -10,6 +10,7 @@
 //! | [`EmeToggleRequested`] | message | the F9 key handler, a menu button, a script | the `eme` plugin, which applies the rank gate |
 //! | [`EmePointerOverUi`] | resource | the UI shell's input arbiter (egui wants the pointer) | the viewport: no picking / brushing under a panel |
 //! | [`EmeHostInput`] | resource | the host client (chat edit box focused, pointer over its own UI) | the viewport and the free camera |
+//! | [`EmeUiWantsKeyboard`] | resource | the UI shell (an EME text field is focused) | the hotkeys and the free camera |
 
 /// Whether the EME editor is open (free camera, brush, panels). Only the `eme` plugin flips it,
 /// and only for a caller whose rank may open EME (`caps.rank ≥ 2`); for anyone else it stays
@@ -41,3 +42,9 @@ pub struct EmeHostInput {
     /// The pointer is over the host's own UI (chat frame): no picking / brushing.
     pub pointer_over_ui: bool,
 }
+
+/// An EME text field (a restore-point label, a typed height) has the keyboard this frame (the UI
+/// shell writes it): no camera keys, no hotkeys, no F9 / Tab.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "bevy", derive(bevy_ecs::resource::Resource))]
+pub struct EmeUiWantsKeyboard(pub bool);

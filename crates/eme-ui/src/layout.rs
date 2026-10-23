@@ -42,8 +42,8 @@ impl Default for EmeLayout {
         Self {
             left_open: true,
             right_open: true,
-            left_width: 260.0,
-            right_width: 320.0,
+            left_width: 230.0,
+            right_width: 270.0,
             right_tab: EmeRightTab::History,
         }
     }
@@ -64,8 +64,8 @@ impl EmeLayout {
                 d
             }
         };
-        self.left_width = fix(self.left_width, 260.0);
-        self.right_width = fix(self.right_width, 320.0);
+        self.left_width = fix(self.left_width, 230.0);
+        self.right_width = fix(self.right_width, 270.0);
         self
     }
 

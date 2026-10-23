@@ -20,7 +20,8 @@
 //!   {"op": "exit"}
 //! ]}
 //! ```
-//! Other ops: `tool {id}`, `option {key, value}`, `redo`, `log {msg}`, `wait_active`. Every wait
+//! Other ops: `tool {id}`, `option {key, value}`, `redo`, `log {msg}`, `wait_active`,
+//! `tab {name: history|restore|log}` / `panels {left, right}` (the shell's side panels). Every wait
 //! takes `max_s` (default 20) and logs a timeout instead of hanging. Each step logs an
 //! `EME script:` line with the voxel journal / chunk counts, so a run is checkable from its log.
 
@@ -152,6 +153,10 @@ fn run_script(
     mut commands: Commands,
     mut exit: MessageWriter<AppExit>,
     api: MonkeyVoxelApi,
+    (mut shell, mut ui_cmds): (
+        ResMut<eme_ui::EmeShell>,
+        MessageWriter<eme_ui::EmeUiCommand>,
+    ),
 ) {
     if script.done() {
         return;
@@ -262,6 +267,27 @@ fn run_script(
         }
         "undo" => {
             requests.write(EmeRequest::Undo);
+        }
+        "panels" => {
+            if let Some(b) = step.get("left").and_then(Json::as_bool) {
+                shell.layout.left_open = b;
+            }
+            if let Some(b) = step.get("right").and_then(Json::as_bool) {
+                shell.layout.right_open = b;
+            }
+        }
+        "tab" => {
+            let tab = match step.get("name").and_then(Json::as_str).unwrap_or("") {
+                "restore" => Some(eme_ui::EmeRightTab::Restore),
+                "log" => Some(eme_ui::EmeRightTab::Log),
+                "history" => Some(eme_ui::EmeRightTab::History),
+                _ => None,
+            };
+            if let Some(tab) = tab {
+                shell.layout.right_open = true;
+                shell.layout.right_tab = tab;
+                ui_cmds.write(eme_ui::EmeUiCommand::TabOpened(tab));
+            }
         }
         "redo" => {
             requests.write(EmeRequest::Redo);

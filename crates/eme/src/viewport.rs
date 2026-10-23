@@ -194,10 +194,13 @@ fn draw_preview(
     active: Res<EmeActive>,
     over_ui: Res<EmePointerOverUi>,
     host_input: Res<EmeHostInput>,
+    cursor: Res<EmeCursor>,
     state: Res<EmeBrushPreviewState>,
     mut gizmos: Gizmos<EmeGizmos>,
 ) {
-    if !active.0 || !state.visible || over_ui.0 || host_input.pointer_over_ui {
+    // A script's virtual cursor is never over a panel (the shell follows the OS pointer).
+    let over = (over_ui.0 || host_input.pointer_over_ui) && cursor.virtual_norm.is_none();
+    if !active.0 || !state.visible || over {
         return;
     }
     let c = state.color;

@@ -3037,6 +3037,7 @@ dependencies = [
  "benilla-world",
  "bevy",
  "eme-core",
+ "eme-ui",
  "serde",
  "serde_json",
 ]

@@ -826,7 +826,15 @@ pub(crate) mod schedule_tests {
     /// FOLLOW-UP: the swim bob writes a rig's visual offset with no order against
     /// `rig_anim::compose`. Upstream 378 + 105 of ours = 483, read off the merged tree
     /// (merge upstream 93e50421, 2026-10-15).
+    ///
+    /// MONKEY (voxel, 2026-10-23): with feature `voxel` the voxel layer's `MonkeyVoxelMaterial`
+    /// lane adds bevy's `check_entities_needing_specialization::<…MonkeyVoxelExt>` against
+    /// `straddle::sync_straddle_twins` and `zfill::sync_zfill_twins` (read off
+    /// `WOW_AMBIGUITY_DUMP_POST=1`): +2, the same kind as every other material lane's pair.
+    #[cfg(not(feature = "voxel"))]
     const POST_UPDATE_CEILING: usize = 483;
+    #[cfg(feature = "voxel")]
+    const POST_UPDATE_CEILING: usize = 483 + 2;
     const POST_UPDATE_SLACK: usize = 20;
     /// The actionable pairs in `Update`: conflicting access, no declared order, and nothing
     /// [`Classes`] explains, so the executor orders them however the graph falls. The count may
@@ -909,7 +917,18 @@ pub(crate) mod schedule_tests {
     /// ceiling to 3,964; the merged tree reads 4,026 = upstream 3,964 + 62 of ours (the lanes'
     /// residual pairs above, now also pairing with upstream's new Update systems). Read off the
     /// merged tree's test run.
+    ///
+    /// MONKEY (EME, 2026-10-23): with feature `eme` (it pulls `voxel`) the tree reads 4,203 =
+    /// 4,026 + 177, every one of the 177 a pair of the voxel layer / EME transport lanes
+    /// (`net::voxel_relay`, `net::eme_relay`, `benilla_world::voxel`, the carve's
+    /// `terrain_stream` re-clips and `clutter` re-places) against `net::apply::apply_net_updates`
+    /// and the terrain streamer — none of the EME UI lane's systems (`eme_host`, `egui_lane`,
+    /// `eme::ui`) pairs (read off `WOW_AMBIGUITY_DUMP=1`). Allowed only under the feature, until
+    /// the voxel / relay lanes declare their orders.
+    #[cfg(not(feature = "eme"))]
     const UPDATE_ACTIONABLE_CEILING: usize = 4_026;
+    #[cfg(feature = "eme")]
+    const UPDATE_ACTIONABLE_CEILING: usize = 4_026 + 177;
     const UPDATE_ACTIONABLE_SLACK: usize = 40;
 
     fn ratchet(what: &str, n: usize, ceiling: usize, slack: usize) {

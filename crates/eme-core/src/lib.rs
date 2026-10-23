@@ -41,7 +41,7 @@ pub use api::{
     EmeServiceClient,
 };
 pub use bus::{EmeDispatchError, EmeDispatcher, EmePumpOutput, EmeRoute, EmeToolReply};
-pub use host::{EmeActive, EmeHostInput, EmePointerOverUi, EmeToggleRequested};
+pub use host::{EmeActive, EmeHostInput, EmePointerOverUi, EmeToggleRequested, EmeUiWantsKeyboard};
 pub use command::{EmeCommand, EmeCommandSink, EmeIssued, EmeObjectRequest, EmeStrokeMark};
 pub use perm::{EmeCapability, EmePermissions, EmeRank};
 pub use service::{

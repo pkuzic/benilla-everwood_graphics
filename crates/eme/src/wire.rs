@@ -48,6 +48,8 @@ pub struct EmeWire {
     pub(crate) awaiting: HashSet<u16>,
     /// Edits submitted while offline, for the emulated server to confirm.
     pub(crate) offline_sent: Vec<EmeVoxelEdit>,
+    /// Edits sent since start (the status bar's uplink rate).
+    pub sent_total: u64,
 }
 
 impl EmeWire {
@@ -72,6 +74,7 @@ impl EmeWire {
 
 impl EmeTransport for EmeWire {
     fn send_edit(&mut self, edit: &EmeVoxelEdit) {
+        self.sent_total += 1;
         self.edits_out.push(*edit);
     }
 

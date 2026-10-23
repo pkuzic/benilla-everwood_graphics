@@ -9,7 +9,7 @@ description = "Everwood ME (EME) UI shell: egui tool strip, option / history / r
 workspace = true
 
 [dependencies]
-eme-core = { path = "../eme-core" }
+eme-core = { path = "../eme-core", features = ["bevy"] }
 bevy = { workspace = true }
 bevy_egui = "0.39"
 serde = { version = "1", features = ["derive"] }

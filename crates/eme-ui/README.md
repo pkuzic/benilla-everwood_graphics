@@ -10,25 +10,28 @@ modal for `others_edited`, and a read-only banner for rank 2.
 
 ## Embedding
 
-```rust
-app.add_plugins(eme_ui::EmeUiPlugin)           // adds EguiPlugin itself if absent
-   .insert_resource(eme_ui::EmeLayoutPath(Some("benilla-config/eme-layout.toml".into())))
-   .insert_resource(eme_ui::EmeLanguage(eme_ui::EmeLang::from_locale("ruRU")));
-```
+With the `eme` plugin (the normal case) nothing is embedded by hand: `eme::EmePlugin` adds
+`EmeUiPlugin::<eme::EmeHost>`, so the shell reads THE tool registry and THE undo stack of
+`EmeHost` (via the `EmeShellSource` trait), and `eme::ui` turns every `EmeUiCommand` into an
+`eme::EmeRequest` / service request and fills the restore-point, log, status and session
+resources. The host only:
 
-The host (another crate) must:
+* adds `EguiPlugin` itself if it wants its own egui camera (benilla does: one overlay camera,
+  `PrimaryEguiContext`, shared with its dev panel) — else `EmeUiPlugin` adds the plugin;
+* keeps the primary egui context running while `EmeActive` is on;
+* sets `EmeLanguage` (benilla: the client locale, `ruRU` → Russian) and `EmeLayoutPath`.
 
-* spawn the bevy_egui primary context camera (`PrimaryEguiContext`);
-* register tools into `ResMut<EmeTools>` (`.0` is the `EmeToolRegistry`);
-* keep current: `EmeSession` (perms from the `caps` rank, `caps`, `link`), `EmeStatus`,
-  `EmeRestorePoints`, `EmeLogTable`, and `EmeUndo` (`.0` is the `EmeUndoStack`);
-* set `EmeActive(true)` to show the shell (or write `EmeToggleRequested`, which flips it, and only
-  opens for ranks that may open EME);
-* read `MessageReader<EmeUiCommand>` and apply: `ActivateTool` -> registry `activate`, `Undo`/`Redo`
-  -> the stack, `ConfirmUndo`/`CancelConfirm` -> `confirm_undo`/`cancel_confirm`, `SetOption` ->
-  `tool.set_option`, `Service` -> send the request, `LogPage`/`TabOpened` -> refresh data;
-* before the viewport acts on a click, check `EmeInputArbiter` (`pointer_over_ui`,
-  `keyboard_captured`).
+Without the `eme` plugin (tests, a demo), use `EmeUiPlugin::<EmeStandaloneSource>` and keep the
+registry / undo stack in that resource, `EmeSession`, `EmeStatus`, `EmeRestorePoints` and
+`EmeLogTable` current yourself, and apply the `EmeUiCommand`s.
+
+The shared names are eme-core's (`eme_core::host`, feature `bevy`): `EmeActive` (the shell draws
+while it is on; whoever owns it applies the rank gate — `EmeToggleRequested` is a request to that
+owner), and the two input flags the shell writes, `EmePointerOverUi` (the viewport must not pick or
+brush) and `EmeUiWantsKeyboard` (no hotkeys or camera keys).
+
+The toolbar is `EmeToolRegistry::visible(perms, caps)`: a tool the rank may not use, or the server
+does not offer, is not shown at all.
 
 Everything visible goes through `EmeI18n` (`locales/enUS.json`, `locales/ruRU.json`, keys
 `MONKEY_EME_*`). Extra keys: `EmeI18n::extend_json(lang, json)`.

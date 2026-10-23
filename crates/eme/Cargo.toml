@@ -10,6 +10,8 @@ workspace = true
 
 [dependencies]
 eme-core = { path = "../eme-core", features = ["bevy"] }
+# The UI shell (egui panels), fed from `EmeHost` (`src/ui.rs`).
+eme-ui = { path = "../eme-ui" }
 # The voxel seam (`MonkeyVoxelApi`); `default-features = false` keeps `dev` out of a player build.
 benilla-world = { path = "../benilla-world", default-features = false, features = ["voxel"] }
 benilla-assets = { path = "../benilla-assets", default-features = false }

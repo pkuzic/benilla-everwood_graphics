@@ -16,55 +16,65 @@ pub mod shell;
 pub mod state;
 pub mod theme;
 
+use std::marker::PhantomData;
+
 use bevy::ecs::system::SystemParam;
 use bevy::prelude::*;
 use bevy_egui::{EguiContexts, EguiPlugin, EguiPrimaryContextPass};
 
+pub use eme_core::{EmeActive, EmePointerOverUi, EmeToggleRequested, EmeUiWantsKeyboard};
 pub use i18n::{EmeI18n, EmeLang, EmeLanguage, Tr};
 pub use layout::{EmeLayout, EmeLayoutPath, EmeRightTab};
 pub use shell::{EmeProbeEntry, EmeShell, EmeShellModel, EmeShellOutput};
 pub use state::{
-    EmeActive, EmeInputArbiter, EmeLogTable, EmeRestorePoints, EmeSession, EmeStatus,
-    EmeToggleRequested, EmeTools, EmeUiCommand, EmeUndo,
+    EmeLogTable, EmeRestorePoints, EmeSession, EmeShellSource, EmeStandaloneSource, EmeStatus,
+    EmeUiCommand,
 };
 pub use theme::EmeTheme;
 
-/// Adds the shell: resources, the [`EmeUiCommand`] / [`EmeToggleRequested`] messages, layout
-/// loading and the drawing system. Adds `bevy_egui`'s plugin itself if the host has not.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct EmeUiPlugin;
+/// Adds the shell: resources, the [`EmeUiCommand`] message, layout loading and the drawing
+/// system. `S` is where the toolbar and the History tab read the tool registry and the undo stack
+/// ([`EmeShellSource`]; the `eme` plugin passes its `EmeHost`). Adds `bevy_egui`'s plugin itself
+/// if the host has not (a host that wants its own egui camera adds `EguiPlugin` first).
+///
+/// The shared host names ([`EmeActive`], [`EmeToggleRequested`], [`EmePointerOverUi`],
+/// [`EmeUiWantsKeyboard`]) are eme-core's: the shell draws while `EmeActive` is on and writes the
+/// two input flags; opening / closing (and its rank gate) belongs to whoever owns `EmeActive`.
+pub struct EmeUiPlugin<S: EmeShellSource = EmeStandaloneSource>(PhantomData<fn() -> S>);
 
-impl Plugin for EmeUiPlugin {
+impl<S: EmeShellSource> Default for EmeUiPlugin<S> {
+    fn default() -> Self {
+        Self(PhantomData)
+    }
+}
+
+impl<S: EmeShellSource> Plugin for EmeUiPlugin<S> {
     fn build(&self, app: &mut App) {
         if !app.is_plugin_added::<EguiPlugin>() {
             app.add_plugins(EguiPlugin::default());
         }
         app.init_resource::<EmeActive>()
-            .init_resource::<EmeTools>()
-            .init_resource::<EmeUndo>()
             .init_resource::<EmeSession>()
             .init_resource::<EmeStatus>()
             .init_resource::<EmeRestorePoints>()
             .init_resource::<EmeLogTable>()
-            .init_resource::<EmeInputArbiter>()
+            .init_resource::<EmePointerOverUi>()
+            .init_resource::<EmeUiWantsKeyboard>()
             .init_resource::<EmeTheme>()
             .init_resource::<EmeI18n>()
             .init_resource::<EmeLanguage>()
             .init_resource::<EmeLayoutPath>()
             .init_resource::<EmeShell>()
             .add_message::<EmeUiCommand>()
-            .add_message::<EmeToggleRequested>()
             .add_systems(Startup, load_layout)
-            .add_systems(Update, apply_toggle_requests)
-            .add_systems(EguiPrimaryContextPass, shell_system);
+            .add_systems(EguiPrimaryContextPass, shell_system::<S>);
     }
 }
 
 /// Everything the shell reads.
 #[derive(SystemParam)]
-struct ShellData<'w> {
-    tools: Res<'w, EmeTools>,
-    undo: Res<'w, EmeUndo>,
+struct ShellData<'w, S: EmeShellSource> {
+    source: Option<Res<'w, S>>,
     session: Res<'w, EmeSession>,
     status: Res<'w, EmeStatus>,
     restore: Res<'w, EmeRestorePoints>,
@@ -80,42 +90,42 @@ fn load_layout(path: Res<EmeLayoutPath>, mut shell: ResMut<EmeShell>) {
     }
 }
 
-/// Turns [`EmeToggleRequested`] into a flip of [`EmeActive`]; opening needs a rank that may open
-/// EME (the F9 key does nothing for players).
-pub fn apply_toggle_requests(
-    mut requests: MessageReader<EmeToggleRequested>,
-    mut active: ResMut<EmeActive>,
-    session: Res<EmeSession>,
-) {
-    for _ in requests.read() {
-        if active.0 {
-            active.0 = false;
-        } else if session.perms.can_open() {
-            active.0 = true;
+/// The input flags the shell owns.
+#[derive(SystemParam)]
+struct ShellInput<'w> {
+    over: ResMut<'w, EmePointerOverUi>,
+    keyboard: ResMut<'w, EmeUiWantsKeyboard>,
+}
+
+impl ShellInput<'_> {
+    fn set(&mut self, over: bool, keyboard: bool) {
+        if self.over.0 != over {
+            self.over.0 = over;
+        }
+        if self.keyboard.0 != keyboard {
+            self.keyboard.0 = keyboard;
         }
     }
 }
 
-fn shell_system(
+fn shell_system<S: EmeShellSource>(
     mut contexts: EguiContexts,
     active: Res<EmeActive>,
-    data: ShellData,
+    data: ShellData<S>,
     path: Res<EmeLayoutPath>,
     mut shell: ResMut<EmeShell>,
-    mut arbiter: ResMut<EmeInputArbiter>,
+    mut input: ShellInput,
     mut commands: MessageWriter<EmeUiCommand>,
     mut saved: Local<Option<EmeLayout>>,
 ) -> Result {
-    if !active.0 {
-        if *arbiter != EmeInputArbiter::default() {
-            *arbiter = EmeInputArbiter::default();
-        }
+    let Some(source) = data.source.as_deref().filter(|_| active.0) else {
+        input.set(false, false);
         return Ok(());
-    }
+    };
     let ctx = contexts.ctx_mut()?.clone();
     let model = EmeShellModel {
-        tools: &data.tools.0,
-        undo: &data.undo.0,
+        tools: source.registry(),
+        undo: source.undo_stack(),
         session: &data.session,
         status: &data.status,
         restore: &data.restore,
@@ -124,13 +134,7 @@ fn shell_system(
         theme: &data.theme,
     };
     let out = shell.show(&ctx, &model);
-    let next = EmeInputArbiter {
-        pointer_over_ui: out.pointer_over_ui,
-        keyboard_captured: out.keyboard_captured,
-    };
-    if *arbiter != next {
-        *arbiter = next;
-    }
+    input.set(out.pointer_over_ui, out.keyboard_captured);
     for c in out.commands {
         commands.write(c);
     }

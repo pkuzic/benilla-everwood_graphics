@@ -286,4 +286,9 @@ impl MonkeyVoxelApi<'_> {
     pub fn active_chunks(&self) -> usize {
         self.world.active_chunks()
     }
+
+    /// The last stream pass (seed, build, mesh, carve), ms — an editor's status-bar "remesh" figure.
+    pub fn stream_ms(&self) -> f32 {
+        self.world.stream_ms()
+    }
 }

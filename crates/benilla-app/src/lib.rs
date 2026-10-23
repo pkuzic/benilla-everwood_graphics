@@ -48,6 +48,9 @@ mod cvars;
 mod death;
 #[cfg(feature = "dev")]
 mod debug_panel;
+/// The one egui lane (plugin, overlay camera, demand gate) the dev panel and the EME shell share.
+#[cfg(any(feature = "dev", feature = "eme"))]
+mod egui_lane;
 /// The dev/player seam: the instrument groups and the boundary rule. Always compiled; what it holds
 /// is not.
 mod dev;

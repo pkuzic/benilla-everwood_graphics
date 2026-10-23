@@ -14,11 +14,15 @@
 //! | [`offline`] | an emulated server for offline runs (local-only undo) |
 //! | [`script`] | `WOW_EME_SCRIPT=<json>`: drives the same code paths headlessly (capture mode) |
 //! | [`tools`] | the built-in tools (`sculpt`: dig / build / smooth / flatten) |
+//! | [`ui`] | the `eme-ui` shell fed from [`EmeHost`] (toolbar, options, history, restore, log, status) |
 //!
 //! ## Host contract
 //! - Shared names live in [`eme_core::host`]: [`EmeActive`] (resource), [`EmeToggleRequested`]
-//!   (message), [`EmePointerOverUi`] (written by the UI shell), [`EmeHostInput`] (written by the
-//!   host client: typing / pointer over its own UI).
+//!   (message), [`EmePointerOverUi`] / [`EmeUiWantsKeyboard`] (written by the UI shell),
+//!   [`EmeHostInput`] (written by the host client: typing / pointer over its own UI).
+//! - The UI shell ([`ui`], `eme-ui`) draws on the PRIMARY egui context: the host spawns the egui
+//!   camera (`PrimaryEguiContext`), keeps that context running while [`EmeActive`] is on, and sets
+//!   `eme_ui::EmeLanguage`. A host that configures egui itself adds `EguiPlugin` before this plugin.
 //! - The host holds the character still while [`EmeActive`] is on and keeps the world streaming
 //!   around the camera (benilla-app: `player.detached`).
 //! - A transport fills [`EmeWire::link`] and [`EmeWire::inbound`] and drains
@@ -31,6 +35,7 @@ pub mod dispatch;
 pub mod offline;
 pub mod script;
 pub mod tools;
+pub mod ui;
 pub mod viewport;
 pub mod wire;
 
@@ -41,7 +46,10 @@ use eme_core::{
 };
 
 pub use camera::EmeFreeCam;
-pub use eme_core::{EmeActive, EmeHostInput, EmePointerOverUi, EmeToggleRequested};
+pub use eme_core::{
+    EmeActive, EmeHostInput, EmePointerOverUi, EmeToggleRequested, EmeUiWantsKeyboard,
+};
+pub use eme_ui;
 pub use viewport::{EmeAim, EmeBrushPreviewState, EmeCursor, EmeGizmos};
 pub use wire::EmeWire;
 
@@ -99,6 +107,10 @@ pub enum EmeRequest {
     Redo,
     /// "Undo anyway" after an `UndoNeedsConfirm` event.
     ConfirmUndo(eme_core::EmeEntryId),
+    /// "Cancel" on that confirmation: the entry goes back to applied.
+    CancelConfirm(eme_core::EmeEntryId),
+    /// A cold-path request from a panel (restore points, log), sent as the host (no tool).
+    Service(eme_core::EmeServiceRequest),
     /// Activate a tool by id.
     SelectTool(String),
     /// Set an option of the active tool.
@@ -141,6 +153,7 @@ impl Plugin for EmePlugin {
         app.init_resource::<EmeHost>()
             .init_resource::<EmeActive>()
             .init_resource::<EmePointerOverUi>()
+            .init_resource::<EmeUiWantsKeyboard>()
             .init_resource::<EmeHostInput>()
             .init_resource::<EmeWire>()
             .add_message::<EmeToggleRequested>()
@@ -164,6 +177,7 @@ impl Plugin for EmePlugin {
         dispatch::register(app);
         offline::register(app);
         script::register(app);
+        ui::register(app);
     }
 }
 
