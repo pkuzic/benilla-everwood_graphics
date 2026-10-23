@@ -8,7 +8,10 @@
 //! - the shell's language from the client locale (`ruRU` → Russian), `WOW_EME_LANG` overriding;
 //!   its panel layout persists in `benilla-config/eme-layout.toml`;
 //! - hides the stock player UI while EME is open the way Alt+Z does (`UIParent:Hide()`), the chat
-//!   lifted onto `WorldFrame` first so it stays, and puts both back on close;
+//!   lifted onto `WorldFrame` first so it stays, and puts both back on close. `UIParent:Show()`
+//!   fires the stock OnShow re-layout (the pet bar slides up, the chat with it), so every managed
+//!   frame's anchors are recorded before the hide and put back after the show:
+//!   close restores EXACTLY the pre-open layout;
 //! - tells EME about benilla's own input each frame ([`eme_core::EmeHostInput`]: an EditBox has
 //!   the keyboard, the pointer is over the player UI);
 //! - holds the character still while EME is open: `player.detached` (the mover is parked, the
@@ -100,6 +103,42 @@ if not MonkeyEmeHidden and UIParent and WorldFrame then
   lift(getglobal("ChatFrameEditBox"))
   lift(getglobal("ChatFrameMenuButton"))
   MonkeyEmeUiWasShown = UIParent:IsShown()
+  -- Record the layout the stock re-layout on Show would move (anchors).
+  MonkeyEmeLayout = {}
+  local names = {
+    "PetActionBarFrame", "ShapeshiftBarFrame", "BonusActionBarFrame", "MainMenuBar",
+    "MultiBarBottomLeft", "MultiBarBottomRight", "MultiBarLeft", "MultiBarRight",
+    "CastingBarFrame", "BuffFrame", "TemporaryEnchantFrame", "MinimapCluster",
+    "ChatFrameMenuButton", "ChatFrameEditBox",
+    "MainMenuBarArtFrame", "MainMenuBarBackpackButton", "ExhaustionTick",
+  }
+  for i = 1, 7 do
+    table.insert(names, "ChatFrame" .. i)
+    table.insert(names, "ChatFrame" .. i .. "Tab")
+  end
+  if UIPARENT_MANAGED_FRAME_POSITIONS then
+    for k, _ in pairs(UIPARENT_MANAGED_FRAME_POSITIONS) do
+      if type(k) == "string" then table.insert(names, k) end
+    end
+  end
+  local seen = {}
+  for _, n in ipairs(names) do
+    if not seen[n] then
+      seen[n] = true
+      -- A global of that name may be anything (a number, a table): never let one abort the hide.
+      pcall(function()
+        local f = getglobal(n)
+        if f and f.GetNumPoints and f.IsShown then
+          local rec = { f = f, pts = {} }
+          for i = 1, f:GetNumPoints() do
+            local p, r, rp, x, y = f:GetPoint(i)
+            table.insert(rec.pts, { p, r, rp, x, y })
+          end
+          table.insert(MonkeyEmeLayout, rec)
+        end
+      end)
+    end
+  end
   UIParent:Hide()
 end
 "#;
@@ -112,6 +151,21 @@ if MonkeyEmeHidden then
   end
   MonkeyEmeHidden = nil
   if MonkeyEmeUiWasShown then UIParent:Show() end
+  -- The stock OnShow re-layout just ran: put every recorded frame back exactly as it was.
+  if MonkeyEmeLayout then
+    for _, rec in ipairs(MonkeyEmeLayout) do
+      local f = rec.f
+      pcall(function()
+        if table.getn(rec.pts) > 0 then
+          f:ClearAllPoints()
+          for _, pt in ipairs(rec.pts) do
+            f:SetPoint(pt[1], pt[2], pt[3], pt[4], pt[5])
+          end
+        end
+      end)
+    end
+    MonkeyEmeLayout = nil
+  end
 end
 "#;
 
