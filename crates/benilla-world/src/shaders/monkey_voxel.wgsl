@@ -178,10 +178,28 @@ fn monkey_voxel_saturation(layer: i32, level: f32) -> f32 {
 }
 
 // One wall tap with a macro-scale second tap blended in, to break obvious repetition on a big face.
-fn monkey_voxel_wall_tap(layer: i32, uv: vec2<f32>) -> vec4<f32> {
-    let a = textureSampleBias(layer_array, layer_samp, uv, layer, view.mip_bias);
-    let b = textureSampleBias(layer_array, layer_samp, uv * 0.37 + vec2<f32>(0.31, 0.57), layer, view.mip_bias);
+// Explicit gradients (`ddx`/`ddy` of `uv`, mip bias folded in), so it may run in non-uniform
+// control flow (the per-layer blend loop).
+fn monkey_voxel_wall_tap_grad(layer: i32, uv: vec2<f32>, ddx: vec2<f32>, ddy: vec2<f32>) -> vec4<f32> {
+    let a = textureSampleGrad(layer_array, layer_samp, uv, layer, ddx, ddy);
+    let b = textureSampleGrad(layer_array, layer_samp, uv * 0.37 + vec2<f32>(0.31, 0.57), layer,
+        ddx * 0.37, ddy * 0.37);
     return mix(a, b, 0.35);
+}
+
+// MONKEY (voxel): a chunk's wall layer — its most rock/dirt-like (least saturated) layer.
+fn monkey_voxel_wall_layer(li: vec4<i32>) -> i32 {
+    let level = f32(textureNumLevels(layer_array) - 1u);
+    let q0 = monkey_voxel_saturation(li.x, level);
+    let q1 = monkey_voxel_saturation(li.y, level);
+    let q2 = monkey_voxel_saturation(li.z, level);
+    let q3 = monkey_voxel_saturation(li.w, level);
+    var wl = li.x;
+    var wq = q0;
+    if (q1 < wq) { wl = li.y; wq = q1; }
+    if (q2 < wq) { wl = li.z; wq = q2; }
+    if (q3 < wq) { wl = li.w; wq = q3; }
+    return wl;
 }
 
 @fragment
@@ -234,6 +252,12 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
         // terrain's `in.uv` — and its half-texel inset alpha/shadow UV.
         let local = clamp(g - cell, vec2<f32>(0.0), vec2<f32>(1.0));
         let auv = clamp(local, vec2<f32>(0.5 / 64.0), vec2<f32>(1.0 - 0.5 / 64.0));
+        // MONKEY (voxel fix): the alpha / MCSH taps take their footprint from the CONTINUOUS grid
+        // position `g`, not from `auv`: `auv` jumps 1 → 0 across an MCNK line, so a 2×2 quad
+        // straddling it saw a huge derivative, fell to the smallest mip and drew a light 1-px
+        // seam along every MCNK line of the voxel surface.
+        let dgx = dpdx(g);
+        let dgy = dpdy(g);
         // Layer UV: chunk UV × 8, continuous across the grid (the grid origin is a chunk corner, so
         // the phase is the terrain's own).
         let tiled = g * vp.grid.w;
@@ -242,30 +266,56 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
         let s1 = textureSampleBias(layer_array, layer_samp, tiled, li.y, view.mip_bias);
         let s2 = textureSampleBias(layer_array, layer_samp, tiled, li.z, view.mip_bias);
         let s3 = textureSampleBias(layer_array, layer_samp, tiled, li.w, view.mip_bias);
-        let a = textureSample(alpha_array, layer_samp, auv, i32(round(aux.x)));
+        let a = textureSampleGrad(alpha_array, layer_samp, auv, i32(round(aux.x)), dgx, dgy);
         var top = s0;
         top = mix(top, s1, a.r);
         top = mix(top, s2, a.g);
         top = mix(top, s3, a.b);
 
-        // The chunk's most rock/dirt-like layer for walls and undersides.
-        let level = f32(textureNumLevels(layer_array) - 1u);
-        let q0 = monkey_voxel_saturation(li.x, level);
-        let q1 = monkey_voxel_saturation(li.y, level);
-        let q2 = monkey_voxel_saturation(li.z, level);
-        let q3 = monkey_voxel_saturation(li.w, level);
-        var wl = li.x;
-        var wq = q0;
-        if (q1 < wq) { wl = li.y; wq = q1; }
-        if (q2 < wq) { wl = li.z; wq = q2; }
-        if (q3 < wq) { wl = li.w; wq = q3; }
-
-        // Wall projections at the ground's texel density (repeats per yard = 8 / chunk size).
+        // MONKEY (voxel fix): the wall / underside layer = each chunk's most rock/dirt-like layer,
+        // BLENDED bilinearly between the four chunk centres around the fragment. A per-fragment
+        // pick switched texture at the MCNK line (33⅓ yd), so a pit dug across it had a hard seam
+        // (one half green dirt, the other grey rock). The tops need no blend: the ADT's own alpha
+        // maps are continuous across chunk edges.
+        // Wall projections at the ground's texel density (repeats per yard = 8 / chunk size); the
+        // UV gradients are taken here, in uniform control flow, so the taps inside the per-layer
+        // loop below can use explicit-gradient sampling.
         let k = vp.grid.w / cs;
-        let wx = monkey_voxel_wall_tap(wl, vec2<f32>(p.z, -p.y) * k);
-        let wz = monkey_voxel_wall_tap(wl, vec2<f32>(p.x, -p.y) * k);
-        let wy = monkey_voxel_wall_tap(wl, vec2<f32>(p.x, p.z) * k);
-        var wall = wx * side_x + wz * side_z + wy * under_w;
+        let uv_x = vec2<f32>(p.z, -p.y) * k;
+        let uv_z = vec2<f32>(p.x, -p.y) * k;
+        let uv_y = vec2<f32>(p.x, p.z) * k;
+        let gb = exp2(view.mip_bias);
+        let gx = array<vec2<f32>, 3>(dpdx(uv_x) * gb, dpdx(uv_z) * gb, dpdx(uv_y) * gb);
+        let gy = array<vec2<f32>, 3>(dpdy(uv_x) * gb, dpdy(uv_z) * gb, dpdy(uv_y) * gb);
+        let gc = g - vec2<f32>(0.5);
+        let c0 = floor(gc);
+        let fr = gc - c0;
+        var wls = array<i32, 4>(-1, -1, -1, -1);
+        var wws = array<f32, 4>(0.0, 0.0, 0.0, 0.0);
+        for (var j = 0u; j < 4u; j = j + 1u) {
+            let o = vec2<f32>(f32(j & 1u), f32(j >> 1u));
+            let cw = mix(1.0 - fr.x, fr.x, o.x) * mix(1.0 - fr.y, fr.y, o.y);
+            let cc = clamp(c0 + o, vec2<f32>(0.0), vec2<f32>(15.0));
+            let wl = monkey_voxel_wall_layer(vec4<i32>(round(vp.layers[i32(cc.y) * 16 + i32(cc.x)])));
+            // Equal layers merge, so a uniform neighbourhood costs one set of taps.
+            for (var s = 0u; s < 4u; s = s + 1u) {
+                if (wls[s] == wl || wls[s] < 0) {
+                    wls[s] = wl;
+                    wws[s] += cw;
+                    break;
+                }
+            }
+        }
+        var wall = vec4<f32>(0.0);
+        for (var s = 0u; s < 4u; s = s + 1u) {
+            if (wls[s] < 0 || wws[s] <= 0.0) {
+                continue;
+            }
+            let wx = monkey_voxel_wall_tap_grad(wls[s], uv_x, gx[0], gy[0]);
+            let wz = monkey_voxel_wall_tap_grad(wls[s], uv_z, gx[1], gy[1]);
+            let wy = monkey_voxel_wall_tap_grad(wls[s], uv_y, gx[2], gy[2]);
+            wall += (wx * side_x + wz * side_z + wy * under_w) * wws[s];
+        }
         // Low-frequency tone variation (≈7 yd and ≈2.5 yd scales), walls only — the tops stay
         // byte-identical to the ground beside them.
         let tone = 0.86 + 0.2 * monkey_voxel_noise3(p * 0.14) + 0.08 * (monkey_voxel_noise3(p * 0.4) - 0.5);
@@ -276,7 +326,8 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
         specmask = mixed.a;
 
         // MCSH baked shadow (255 shadowed, 0 lit; no map ⇒ lit), sampled like terrain.
-        let mcsh = textureSample(shadow_array, layer_samp, auv, max(i32(round(aux.y)), 0)).r;
+        let mcsh = textureSampleGrad(shadow_array, layer_samp, auv, max(i32(round(aux.y)), 0),
+            dgx, dgy).r;
         shadow_lit = select(1.0, 1.0 - mcsh, aux.y >= 0.0);
     } else {
         // PROCEDURAL fallback (tile not resident): grass(1)/rock(2)/dirt(3) slope-blend.
