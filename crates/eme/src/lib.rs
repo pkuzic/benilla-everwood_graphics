@@ -180,7 +180,7 @@ impl Plugin for EmePlugin {
         app.register_eme_tool(tools::sculpt::EmeSculptTool::new(ids.clone()));
         app.register_eme_tool(tools::flatten::EmeFlattenTool::new(ids.clone()));
         // MONKEY (EME, CONTRACT v3.6, Planet-Zoo terraforming): sideways growth, bridges / tunnels.
-        app.register_eme_tool(tools::pushpull::EmePushPullTool::new(ids.clone()));
+        // (push / pull is a mode of the sculpt tool: Push out / Pull in.)
         app.register_eme_tool(tools::bridge::EmeBridgeTool::new(ids.clone()));
         // MONKEY (EME, Phase 3 lanes K + L): the overlay tools.
         app.register_eme_tool(tools::water::EmeWaterTool::new(ids.clone()));

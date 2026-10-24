@@ -29,14 +29,19 @@ use eme_core::tool::{
 };
 use eme_core::transport::mode;
 
+use super::pushpull::EmePushPullTool;
+
 /// The tool id (also the server's name for it in `caps.tools`).
 pub const SCULPT: EmeToolId = EmeToolId("sculpt");
 
-/// Choice labels of the `mode` option (locale keys), in mode order 0..=2 (flatten is its own tool).
-pub const MODE_LABELS: [&str; 3] = [
+/// Choice labels of the `mode` option (locale keys): 0..=2 are the voxel modes (flatten is its own
+/// tool), 3 / 4 are MONKEY (EME, owner 2026-10-24) Push out / Pull in (the push / pull machinery).
+pub const MODE_LABELS: [&str; 5] = [
     "MONKEY_EME_SCULPT_MODE_DIG",
     "MONKEY_EME_SCULPT_MODE_BUILD",
     "MONKEY_EME_SCULPT_MODE_SMOOTH",
+    "MONKEY_EME_PUSHPULL_MODE_PUSH",
+    "MONKEY_EME_PUSHPULL_MODE_PULL",
 ];
 
 /// Choice labels of the `falloff` option, in `mode::FALLOFF_*` order.
@@ -118,6 +123,10 @@ pub struct EmeSculptTool {
     plane: Option<f32>,
     /// A wheel step with Alt resizes the brush.
     wheel_resizes: bool,
+    /// MONKEY (EME, owner 2026-10-24): `Some(false)` = Push out, `Some(true)` = Pull in. While set,
+    /// input, options and the preview belong to `pp`.
+    pub pp_mode: Option<bool>,
+    pp: EmePushPullTool,
 }
 
 impl EmeSculptTool {
@@ -139,7 +148,7 @@ impl EmeSculptTool {
         Self {
             builder: EmeStrokeBuilder::new(EmeStrokeConfig::default())
                 .with_start(ids.peek(), seed)
-                .with_ids(ids),
+                .with_ids(ids.clone()),
             tool,
             locked,
             mode,
@@ -156,6 +165,18 @@ impl EmeSculptTool {
             offset: 0.0,
             plane: None,
             wheel_resizes: true,
+            pp_mode: None,
+            pp: EmePushPullTool::new(ids),
+        }
+    }
+
+    /// Select a `mode` choice: 0..=2 voxel modes, 3 Push out, 4 Pull in.
+    fn set_mode(&mut self, i: usize) {
+        if i >= 3 {
+            self.pp_mode = Some(i == 4);
+        } else {
+            self.pp_mode = None;
+            self.mode = i as u8;
         }
     }
 
@@ -209,7 +230,17 @@ impl EmeSculptTool {
 
     /// The stroke being held, if any.
     pub fn active_stroke(&self) -> Option<u16> {
+        if self.pp_mode.is_some() {
+            return self.pp.active_stroke();
+        }
         self.builder.active_stroke()
+    }
+
+    /// Hand the shared brush settings to the push / pull machinery.
+    fn sync_pp(&mut self) {
+        self.pp.pull = self.pp_mode == Some(true);
+        self.pp.radius = self.radius;
+        self.pp.shape = self.shape;
     }
 }
 
@@ -224,6 +255,12 @@ impl EmeTool for EmeSculptTool {
 
     fn on_input(&mut self, ctx: &EmeInputCtx, out: &mut EmeCommandSink) {
         let now = ctx.now_ms;
+        if self.pp_mode.is_some() && !self.locked {
+            self.sync_pp();
+            self.pp.on_input(ctx, out);
+            self.radius = self.pp.radius;
+            return;
+        }
         if self.wheel_resizes && ctx.modifiers.alt && ctx.wheel != 0.0 {
             self.radius = (self.radius + 0.5 * ctx.wheel.signum()).clamp(0.5, 16.0);
         }
@@ -266,12 +303,16 @@ impl EmeTool for EmeSculptTool {
 
     fn options_ui_model(&self) -> EmeOptions {
         let p = self.tool.locale_prefix();
+        let mode_idx = match self.pp_mode {
+            Some(pull) => 3 + pull as usize,
+            None => self.mode as usize,
+        };
         let mut fields = vec![
             EmeOptionField {
                 key: "mode",
                 label: format!("{p}MODE"),
                 kind: EmeOptionKind::Choice(MODE_LABELS.iter().map(|s| s.to_string()).collect()),
-                value: EmeOptionValue::Choice(self.mode as usize),
+                value: EmeOptionValue::Choice(mode_idx),
                 disabled: false,
             },
             EmeOptionField {
@@ -338,6 +379,25 @@ impl EmeTool for EmeSculptTool {
                 disabled: self.mode != mode::FLATTEN,
             },
         ];
+        if self.pp_mode.is_some() {
+            // Push out / Pull in: only the options of that machinery are shown.
+            let pp = self.pp.options_ui_model();
+            let pick = |k: &str| pp.iter().find(|f| f.key == k).cloned();
+            let mut v = Vec::new();
+            v.extend(fields.iter().find(|f| f.key == "mode").cloned());
+            v.extend(fields.iter().find(|f| f.key == "radius").cloned());
+            v.extend(fields.iter().find(|f| f.key == "shape").cloned().map(|mut f| {
+                f.disabled = false;
+                f
+            }));
+            v.extend(pick("strength"));
+            v.extend(pick("falloff").map(|mut f| {
+                f.key = "edge";
+                f
+            }));
+            v.extend(pick("direction"));
+            return v;
+        }
         if self.locked {
             fields.retain(|f| !matches!(f.key, "mode" | "falloff" | "hardness" | "hard" | "shape"));
         } else {
@@ -349,8 +409,12 @@ impl EmeTool for EmeSculptTool {
     fn set_option(&mut self, key: &str, value: EmeOptionValue) {
         match (key, value) {
             ("mode", _) if self.locked => {}
-            ("mode", EmeOptionValue::Choice(i)) if i <= 2 => self.mode = i as u8,
-            ("mode", EmeOptionValue::Number(n)) if (0.0..=2.0).contains(&n) => self.mode = n as u8,
+            ("mode", EmeOptionValue::Choice(i)) if i <= 4 => self.set_mode(i),
+            ("mode", EmeOptionValue::Number(n)) if (0.0..=4.0).contains(&n) => self.set_mode(n as usize),
+            // Push out / Pull in options (the push / pull machinery keeps its own growth step).
+            ("strength", v) if self.pp_mode.is_some() => self.pp.set_option("strength", v),
+            ("edge", v) => self.pp.set_option("falloff", v),
+            ("direction", v) => self.pp.set_option("direction", v),
             ("radius", EmeOptionValue::Number(r)) => self.radius = r.clamp(0.5, 16.0),
             ("strength", EmeOptionValue::Number(s)) => self.strength = s.clamp(1.0, 100.0).round(),
             ("falloff", _) | ("hardness", _) | ("hard", _) if self.locked => {}
@@ -373,6 +437,14 @@ impl EmeTool for EmeSculptTool {
 
     fn preview(&self, ctx: &EmeInputCtx) -> Option<EmePreview> {
         let hit = ctx.hit?;
+        if self.pp_mode.is_some() && !self.locked {
+            // The arrow along the push / pull direction (a fresh copy of the settings).
+            let mut pp = EmePushPullTool::new(eme_core::EmeStrokeIds::default());
+            pp.pull = self.pp_mode == Some(true);
+            pp.radius = self.radius;
+            pp.along_view = self.pp.along_view;
+            return pp.preview(ctx);
+        }
         if self.mode == mode::FLATTEN {
             let z = self.plane.unwrap_or(hit.pos[2] + self.offset);
             return Some(EmePreview::Plane {
@@ -393,6 +465,7 @@ impl EmeTool for EmeSculptTool {
     }
 
     fn on_deactivate(&mut self, out: &mut EmeCommandSink) {
+        self.pp.on_deactivate(out);
         if let Some(stroke) = self.builder.active_stroke() {
             self.builder.cancel();
             out.push(EmeCommand::VoxelStroke {
@@ -561,5 +634,56 @@ mod tests {
         assert_eq!(e.param, 0, "smooth carries no shape");
         let shape = t.options_ui_model().into_iter().find(|f| f.key == "shape").unwrap();
         assert!(shape.disabled);
+    }
+}
+
+#[cfg(test)]
+mod push_pull_mode_tests {
+    use super::*;
+    use eme_core::perm::{EmePermissions, EmeRank};
+    use eme_core::tool::EmeButton;
+
+    /// MONKEY (EME, owner 2026-10-24): Push out / Pull in are sculpt modes; they show their own
+    /// options and the preview is an arrow along the normal (push out, pull into the surface).
+    #[test]
+    fn push_and_pull_are_sculpt_modes_with_a_direction_arrow() {
+        let mut t = EmeSculptTool::new(EmeStrokeIds::starting_at(1));
+        t.set_option("mode", EmeOptionValue::Choice(3));
+        let keys: Vec<_> = t.options_ui_model().iter().map(|f| f.key).collect();
+        assert_eq!(keys, ["mode", "radius", "shape", "strength", "edge", "direction"]);
+        let n = [1.0, 0.0, 0.0];
+        let c = |pressed: bool, held: bool| EmeInputCtx {
+            hit: Some(EmeHit { pos: [10.0, 0.0, 5.0], normal: n, object: None }),
+            primary: EmeButton { pressed, held, released: false },
+            ..EmeInputCtx::idle(0, 0, EmePermissions::from_rank(EmeRank::EDIT))
+        };
+        match t.preview(&c(false, false)) {
+            Some(EmePreview::Arrow { from, to, .. }) => {
+                assert_eq!(from, [10.0, 0.0, 5.0]);
+                assert!(to[0] > from[0], "push points out of the surface");
+            }
+            other => panic!("{other:?}"),
+        }
+        t.set_option("mode", EmeOptionValue::Choice(4));
+        match t.preview(&c(false, false)) {
+            Some(EmePreview::Arrow { from, to, .. }) => assert!(to[0] < from[0], "pull points in"),
+            other => panic!("{other:?}"),
+        }
+        // A press sends a hard dig (pull) offset along the normal, in sculpt's stroke ids.
+        let mut sink = EmeCommandSink::new();
+        t.on_input(&c(true, true), &mut sink);
+        let e = sink
+            .drain()
+            .into_iter()
+            .find_map(|i| match i.command {
+                EmeCommand::VoxelStroke { ops, .. } => ops.into_iter().next(),
+                _ => None,
+            })
+            .expect("an edit");
+        assert_eq!(e.mode, mode::DIG);
+        assert!(e.pos[0] > 10.0, "pull centre sits in front of the surface");
+        // Back to lower: the normal option set returns.
+        t.set_option("mode", EmeOptionValue::Choice(0));
+        assert!(t.options_ui_model().iter().any(|f| f.key == "hard"));
     }
 }

@@ -314,11 +314,14 @@ impl EmeTool for EmePushPullTool {
 
     fn preview(&self, ctx: &EmeInputCtx) -> Option<EmePreview> {
         let hit = ctx.hit?;
-        let c = self.csg(ctx, &hit);
-        Some(EmePreview::Path {
-            points: vec![hit.pos, c.pos],
+        // The arrow starts at the aimed point and points along the push (out of the surface) or
+        // pull (into it) direction: the surface normal, or the view direction with `direction`.
+        let d = self.direction(ctx, &hit);
+        let len = (self.radius + 1.0).clamp(1.5, 12.0) * if self.pull { -1.0 } else { 1.0 };
+        Some(EmePreview::Arrow {
+            from: hit.pos,
+            to: [hit.pos[0] + d[0] * len, hit.pos[1] + d[1] * len, hit.pos[2] + d[2] * len],
             radius: self.radius,
-            mode: c.mode,
         })
     }
 

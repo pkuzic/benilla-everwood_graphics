@@ -282,6 +282,34 @@ fn rim_lines(c: [f32; 3], radius: f32, square: bool, out: &mut Vec<[[f32; 3]; 2]
     }
 }
 
+/// A 3D arrow `from -> to`: the shaft and four barbs at the tip.
+fn arrow_lines(from: [f32; 3], to: [f32; 3], out: &mut Vec<[[f32; 3]; 2]>) {
+    out.push([from, to]);
+    let d = [to[0] - from[0], to[1] - from[1], to[2] - from[2]];
+    let len = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+    if len < 1.0e-3 {
+        return;
+    }
+    let d = [d[0] / len, d[1] / len, d[2] / len];
+    let cross = |a: [f32; 3], b: [f32; 3]| {
+        [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]]
+    };
+    let helper = if d[2].abs() > 0.9 { [1.0, 0.0, 0.0] } else { [0.0, 0.0, 1.0] };
+    let u = cross(d, helper);
+    let ul = (u[0] * u[0] + u[1] * u[1] + u[2] * u[2]).sqrt().max(1.0e-6);
+    let u = [u[0] / ul, u[1] / ul, u[2] / ul];
+    let v = cross(d, u);
+    let head = (len * 0.28).clamp(0.2, 1.5);
+    for side in [u, v, [-u[0], -u[1], -u[2]], [-v[0], -v[1], -v[2]]] {
+        let b = [
+            to[0] - d[0] * head + side[0] * head * 0.45,
+            to[1] - d[1] * head + side[1] * head * 0.45,
+            to[2] - d[2] * head + side[2] * head * 0.45,
+        ];
+        out.push([to, b]);
+    }
+}
+
 /// Resolve the active tool's preview against the world and draw it.
 pub(crate) fn resolve_preview(
     preview: Option<EmePreview>,
@@ -319,6 +347,11 @@ pub(crate) fn resolve_preview(
             out.color = mode_color(mode);
             out.square = square;
             return;
+        }
+        // MONKEY (EME, owner 2026-10-24): push / pull direction arrow + the ring on the surface.
+        Some(EmePreview::Arrow { from, to, radius }) => {
+            arrow_lines(from, to, &mut out.lines);
+            (from, radius, false)
         }
         // MONKEY (EME v3.6): water-fill cells as squares at the level.
         Some(EmePreview::Cells { cells, level, .. }) => {
@@ -413,6 +446,10 @@ pub(crate) fn active_mode(host: &EmeHost) -> u8 {
         .get(id.as_str())
         .and_then(|t| {
             t.options_ui_model().into_iter().find_map(|f| match (f.key, f.value) {
+                // Sculpt's push out (3) / pull in (4) draw like build (1) / dig (0).
+                ("mode", EmeOptionValue::Choice(i)) if i >= 3 && id == crate::tools::sculpt::SCULPT => {
+                    Some(if i == 3 { 1 } else { 0 })
+                }
                 ("mode", EmeOptionValue::Choice(i)) => Some(i as u8),
                 _ => None,
             })

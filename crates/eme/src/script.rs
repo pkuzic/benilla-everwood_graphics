@@ -130,6 +130,8 @@ fn mode_value(v: &Json) -> Option<EmeOptionValue> {
             "dig" | "lower" => 0,
             "build" | "raise" => 1,
             "smooth" => 2,
+            "push" => 3,
+            "pull" => 4,
             _ => return None,
         },
         _ => return None,

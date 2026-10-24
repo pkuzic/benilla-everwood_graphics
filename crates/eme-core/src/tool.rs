@@ -206,6 +206,16 @@ pub enum EmePreview {
         /// Voxel mode (colour): 0 dig (tunnel), 1 build (bridge).
         mode: u8,
     },
+    /// MONKEY (EME, owner 2026-10-24): an arrow along a push / pull direction. It starts at the
+    /// aimed point `from` and ends at `to`; the brush ring is drawn at `from` on the surface.
+    Arrow {
+        /// The aimed point, WoW yards.
+        from: [f32; 3],
+        /// The arrow tip, WoW yards.
+        to: [f32; 3],
+        /// Brush radius, yards.
+        radius: f32,
+    },
     /// Overlay cells to tint.
     Cells {
         /// Layer.
