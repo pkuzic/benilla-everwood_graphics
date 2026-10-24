@@ -129,6 +129,52 @@ impl SoftBrush {
     }
 }
 
+/// MONKEY (voxel, CONTRACT v3.6): brush SHAPES on modes 0 (dig / soft lower) and 1 (build / soft
+/// raise): `param` bits 9-10. 0 sphere (every earlier edit), 1 axis-aligned cube (WoW axes,
+/// half-size = radius), 2 vertical cylinder (horizontal radius = radius, half-height = radius),
+/// 3 reserved = sphere. Bits 11-14 stay reserved (ignored). Hard and soft honour the shape alike.
+pub const SHAPE_SPHERE: u8 = 0;
+pub const SHAPE_CUBE: u8 = 1;
+pub const SHAPE_CYLINDER: u8 = 2;
+/// The `param` bit offset of the shape field.
+pub const SHAPE_SHIFT: u16 = 9;
+/// The `param` mask of the shape field.
+pub const SHAPE_MASK: u16 = 0x3 << SHAPE_SHIFT;
+
+/// MONKEY (voxel, CONTRACT v3.6): the shape of a `param` (bits 9-10; 3 = sphere).
+pub fn shape_of_param(param: u16) -> u8 {
+    match ((param & SHAPE_MASK) >> SHAPE_SHIFT) as u8 {
+        SHAPE_CUBE => SHAPE_CUBE,
+        SHAPE_CYLINDER => SHAPE_CYLINDER,
+        _ => SHAPE_SPHERE,
+    }
+}
+
+/// MONKEY (voxel, CONTRACT v3.6): the lattice "distance" of offset `(dx, dy, dz)` (lattice units)
+/// from the brush centre for `shape`; a sample is inside the brush iff it is `< r`. EXACT op
+/// order (the server's C++ replica copies it, IEEE f32, no FMA):
+/// - sphere: `sqrt(dx*dx + dy*dy + dz*dz)` (summed left to right);
+/// - cube: `max(max(|dx|, |dy|), |dz|)` (Chebyshev);
+/// - cylinder: `max(sqrt(dx*dx + dy*dy), |dz|)`.
+///
+/// `max(a, b)` = `a >= b ? a : b` (inputs are always finite).
+#[inline]
+pub fn shape_dist(shape: u8, dx: f32, dy: f32, dz: f32) -> f32 {
+    #[inline]
+    fn mx(a: f32, b: f32) -> f32 {
+        if a >= b {
+            a
+        } else {
+            b
+        }
+    }
+    match shape {
+        SHAPE_CUBE => mx(mx(dx.abs(), dy.abs()), dz.abs()),
+        SHAPE_CYLINDER => mx((dx * dx + dy * dy).sqrt(), dz.abs()),
+        _ => (dx * dx + dy * dy + dz * dz).sqrt(),
+    }
+}
+
 const C: i32 = CHUNK as i32;
 
 /// `(kx, ky, kz)` chunk key on the current map (WoW axes).
@@ -252,6 +298,15 @@ impl VoxelEditOp {
             MODE_DIG => self.soft().map(|b| (b, 1)),
             MODE_BUILD => self.soft().map(|b| (b, -1)),
             _ => None,
+        }
+    }
+
+    /// MONKEY (voxel, CONTRACT v3.6): the brush shape of a mode 0 / 1 edit (`param` bits 9-10);
+    /// every other mode is a sphere.
+    pub fn shape(&self) -> u8 {
+        match self.mode {
+            MODE_DIG | MODE_BUILD => shape_of_param(self.param),
+            _ => SHAPE_SPHERE,
         }
     }
 
@@ -566,6 +621,17 @@ fn sample_in(
 /// is Jacobi over the whole edit: every new value reads the PRE-edit field, across chunk borders,
 /// so a smooth spanning several chunks of `set` is exactly the one-grid result. Returns the keys
 /// whose density changed.
+///
+/// MONKEY (voxel, CONTRACT v3.6) brush shapes, modes 0 / 1 only ([`VoxelEditOp::shape`]):
+/// - HARD dig / build: `brush = shape_dist(shape, x - c0, y - c1, z - c2) - r` ([`shape_dist`];
+///   the sphere keeps the v2 form `sqrt(powi(dx,2) + powi(dy,2) + powi(dz,2)) - r`), then exactly
+///   as v2: `old = d / DENSITY_SCALE`, dig `new = max(old, -brush)`, build `new = min(old, brush)`,
+///   `q(new * DENSITY_SCALE)`.
+/// - SOFT lower / raise: `w = SoftBrush::weight(shape_dist(shape, dx, dy, dz), r)`, the rest is
+///   the v3.3 Jacobi shift unchanged. Smooth (mode 2) and flatten ignore the shape bits.
+///
+/// The bbox (centre ± r ± 1 per axis) is the same for every shape (the cube's corners and the
+/// cylinder's caps lie on it), so activation, touched chunks and the read closure are unchanged.
 pub fn apply_edit_set(
     edit: &VoxelEditOp,
     set: &mut HashMap<ChunkKey, Box<[i8]>>,
@@ -576,6 +642,7 @@ pub fn apply_edit_set(
     let r = edit.radius_lat();
     let mut changed = Vec::new();
     let soft = edit.soft();
+    let shape = edit.shape();
     match edit.mode {
         0 | 1 if soft.is_none() => {
             for k in chunks_of_box(lo, hi) {
@@ -587,11 +654,18 @@ pub fn apply_edit_set(
                 for z in lo[2].max(base[2])..=hi[2].min(base[2] + C - 1) {
                     for y in lo[1].max(base[1])..=hi[1].min(base[1] + C - 1) {
                         for x in lo[0].max(base[0])..=hi[0].min(base[0] + C - 1) {
-                            let brush = ((x as f32 - c[0]).powi(2)
-                                + (y as f32 - c[1]).powi(2)
-                                + (z as f32 - c[2]).powi(2))
-                            .sqrt()
-                                - r;
+                            // MONKEY (voxel, CONTRACT v3.6): the shape's distance minus r
+                            // (the sphere keeps its v2 expression bit for bit).
+                            let brush = if shape == SHAPE_SPHERE {
+                                ((x as f32 - c[0]).powi(2)
+                                    + (y as f32 - c[1]).powi(2)
+                                    + (z as f32 - c[2]).powi(2))
+                                .sqrt()
+                                    - r
+                            } else {
+                                shape_dist(shape, x as f32 - c[0], y as f32 - c[1], z as f32 - c[2])
+                                    - r
+                            };
                             let idx = owned_index(x - base[0], y - base[1], z - base[2]);
                             let old = d[idx] as f32 / DENSITY_SCALE;
                             let new = if edit.mode == 0 {
@@ -706,7 +780,9 @@ pub fn apply_edit_set(
                         let a = match soft {
                             Some(b) => {
                                 let (dx, dy, dz) = (x as f32 - c[0], y as f32 - c[1], z as f32 - c[2]);
-                                let w = b.weight((dx * dx + dy * dy + dz * dz).sqrt(), r);
+                                // v3.6: soft lower / raise weigh by the shape's distance
+                                // (smooth is always a sphere: `shape()` = 0 there).
+                                let w = b.weight(shape_dist(shape, dx, dy, dz), r);
                                 if w <= 0.0 {
                                     continue;
                                 }

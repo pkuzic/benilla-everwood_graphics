@@ -385,3 +385,161 @@ fn v33_soft_vectors_follow_the_closure_rule_and_are_written() {
         eprintln!("golden: wrote {out}");
     }
 }
+
+/// MONKEY (voxel, CONTRACT v3.6): V3.3 + 16 SHAPED edits (`param` bits 9-10 on modes 0 / 1: 1 cube,
+/// 2 vertical cylinder; 3 reserved = sphere): hard cube / cylinder dig + build, soft cube raise and
+/// soft cylinder lower (every falloff, hardness 0 / 40 / 100), a max-radius cube on a chunk corner, a
+/// tiny cylinder, a cube deck of a bridge (3 cube builds in a row), a cylinder tunnel (3 cylinder digs
+/// through the deck), shape 3 + reserved bits 11-14 (= sphere), and shape bits on a smooth (ignored).
+fn v36_edits() -> Vec<VoxelEditOp> {
+    let mut e = v33_edits();
+    let n = e.len() as u32;
+    let sh = |shape: u16| (shape << 9) as i16;
+    let soft = |falloff: u16, hardness: u16, shape: u16| {
+        (0x8000u16 | falloff | (hardness << 2) | (shape << 9)) as i16
+    };
+    let extra: [([f32; 3], f32, u8, u8, i16); 16] = [
+        ([-8952.0, -60.0, 81.0], 4.0, 0, 255, sh(1)),           // hard cube pit
+        ([-8936.5, -66.25, 84.0], 3.0, 1, 255, sh(1)),          // hard cube block
+        ([-8946.0, -84.0, 80.5], 5.0, 0, 255, sh(2)),           // hard cylinder well
+        ([-8928.0, -72.0, 85.0], 2.5, 1, 255, sh(2)),           // hard cylinder pillar
+        ([-8944.0, -64.0, 82.0], 6.0, 1, 128, soft(0, 0, 1)),   // soft cube raise, smooth falloff
+        ([-8950.25, -70.5, 81.7], 4.5, 0, 200, soft(1, 40, 2)), // soft cylinder lower, linear h40
+        ([-8960.0, -64.0, 82.0], 16.0, 0, 255, sh(1)),          // max-radius cube on a chunk corner
+        ([-8939.75, -71.25, 79.5], 0.5, 1, 255, sh(2)),         // tiny cylinder
+        ([-8956.0, -56.0, 84.0], 2.0, 1, 255, sh(1)),           // bridge deck (cube) ...
+        ([-8955.0, -56.0, 84.0], 2.0, 1, 255, sh(1)),
+        ([-8954.0, -56.0, 84.0], 2.0, 1, 255, sh(1)),
+        ([-8955.0, -57.5, 83.0], 1.5, 0, 255, sh(2)),           // tunnel (cylinder) through it ...
+        ([-8955.0, -56.75, 83.0], 1.5, 0, 255, sh(2)),
+        ([-8955.0, -56.0, 83.0], 1.5, 0, 77, soft(2, 100, 2)),  // soft cylinder, flat h100
+        ([-8920.0, -96.0, 85.0], 3.0, 1, 255, 0x7e00u16 as i16), // shape 3 + bits 11-14 = sphere
+        ([-8944.0, -70.0, 82.0], 6.0, 2, 160, sh(1)),           // shape bits on a hard smooth: ignored
+    ];
+    for (i, (p, r, m, s, prm)) in extra.iter().enumerate() {
+        e.push(op(*p, *r, *m, *s, n + 1 + i as u32, *prm));
+    }
+    e
+}
+
+/// MONKEY (voxel, CONTRACT v3.6): the shape distances and weights (unit level).
+#[test]
+fn v36_shape_distances_and_weights() {
+    // Sphere = the v3.3 expression.
+    assert_eq!(shape_dist(SHAPE_SPHERE, 3.0, 4.0, 0.0), 5.0);
+    // Cube = Chebyshev: a corner offset is as "near" as the face centre.
+    assert_eq!(shape_dist(SHAPE_CUBE, 3.0, -3.0, 3.0), 3.0);
+    assert_eq!(shape_dist(SHAPE_CUBE, -1.0, 2.5, 0.5), 2.5);
+    // Cylinder = max(horizontal radius, |dz|): flat caps, round sides.
+    assert_eq!(shape_dist(SHAPE_CYLINDER, 3.0, 4.0, 1.0), 5.0);
+    assert_eq!(shape_dist(SHAPE_CYLINDER, 0.0, 1.0, -4.0), 4.0);
+    // The param field: bits 9-10, 3 = sphere, other bits ignored.
+    assert_eq!(shape_of_param(0x0200), SHAPE_CUBE);
+    assert_eq!(shape_of_param(0x8000 | 0x0400 | 0x7), SHAPE_CYLINDER);
+    assert_eq!(shape_of_param(0x0600), SHAPE_SPHERE);
+    assert_eq!(shape_of_param(0xffff), SHAPE_SPHERE);
+    assert_eq!(shape_of_param(0x7800), SHAPE_SPHERE);
+    let e = |mode: u8, param: u16| VoxelEditOp {
+        mode,
+        param,
+        radius: 4.0,
+        ..Default::default()
+    };
+    assert_eq!(e(0, 0x0200).shape(), SHAPE_CUBE);
+    assert_eq!(e(1, 0x8000 | 0x0400).shape(), SHAPE_CYLINDER);
+    assert_eq!(e(2, 0x0200).shape(), SHAPE_SPHERE, "smooth ignores the shape");
+    assert_eq!(e(3, 0x0200).shape(), SHAPE_SPHERE, "flatten's param is its plane");
+    // A soft cube's corner gets the full weight inside the hardness core; a sphere's does not.
+    let b = SoftBrush {
+        falloff: FALLOFF_LINEAR,
+        hardness: 50,
+    };
+    let r = 8.0;
+    assert_eq!(b.weight(shape_dist(SHAPE_CUBE, 3.9, 3.9, 3.9), r), 1.0);
+    assert!(b.weight(shape_dist(SHAPE_SPHERE, 3.9, 3.9, 3.9), r) < 1.0);
+    assert_eq!(b.weight(shape_dist(SHAPE_CUBE, 8.0, 0.0, 0.0), r), 0.0);
+    // Hard: a cube carves its corner, a sphere of the same radius does not.
+    let mut field: HashMap<ChunkKey, Box<[i8]>> = HashMap::new();
+    field.insert([0, 0, 0], vec![-64i8; OWNED].into_boxed_slice());
+    let air = |_: [i32; 3]| AIR;
+    let dig = |param: u16| VoxelEditOp {
+        pos: [8.0, 8.0, 8.0],
+        radius: 4.0,
+        mode: MODE_DIG,
+        param,
+        ..Default::default()
+    };
+    let at = |x: usize, y: usize, z: usize| x + 32 * (y + 32 * z);
+    let mut cube = field.clone();
+    apply_edit_set(&dig(0x0200), &mut cube, &air);
+    let mut sph = field.clone();
+    apply_edit_set(&dig(0), &mut sph, &air);
+    // Lattice 16 + 7 on every axis = 3.5 yd off the centre: inside the cube, outside the sphere.
+    let corner = at(23, 23, 23);
+    assert!(cube[&[0, 0, 0]][corner] > 0, "cube corner carved: {}", cube[&[0, 0, 0]][corner]);
+    assert!(sph[&[0, 0, 0]][corner] < 0, "sphere corner solid: {}", sph[&[0, 0, 0]][corner]);
+    // A cylinder carves straight down to its flat floor: 3.5 yd off on x, 3.5 yd down.
+    let mut cyl = field.clone();
+    apply_edit_set(&dig(0x0400), &mut cyl, &air);
+    assert!(cyl[&[0, 0, 0]][at(23, 16, 9)] > 0);
+    assert!(sph[&[0, 0, 0]][at(23, 16, 9)] < 0);
+}
+
+#[test]
+fn v36_shape_vectors_follow_the_closure_rule_and_are_written() {
+    let edits = v36_edits();
+    let shaped = edits[edits.len() - 16..]
+        .iter()
+        .filter(|e| e.shape() != SHAPE_SPHERE)
+        .count();
+    assert_eq!(shaped, 14);
+    let (text, full, keys) = golden(&edits, true);
+    let h_full = chunks_hash(&full.chunks);
+    let mut j = MapJournal::default();
+    for e in &edits {
+        j.insert(*e);
+    }
+    let (mut sets, mut avg, mut bad) = (0, 0usize, 0);
+    for e in &edits {
+        let set: Vec<ChunkKey> = j
+            .read_closure(&e.touched_chunks())
+            .into_iter()
+            .filter(|k| full.chunks.contains_key(k))
+            .collect();
+        let mut w = VoxelWorldData {
+            chunks: full.chunks.clone(),
+            seeds: full.seeds.clone(),
+        };
+        w.build(&set, j.edits_for(&set).iter());
+        sets += 1;
+        avg += set.len();
+        if chunks_hash(&w.chunks) != h_full {
+            bad += 1;
+        }
+    }
+    assert_eq!(bad, 0, "a closure rebuild differed from the full replay");
+    // The shaped edits changed the field vs the v3.3 set, and a shape is not its sphere.
+    let (_, v33, _) = golden(&v33_edits(), true);
+    assert_ne!(chunks_hash(&v33.chunks), h_full);
+    let n = edits.len();
+    let mut spheres = edits.clone();
+    for e in spheres.iter_mut().skip(n - 16) {
+        e.param &= !SHAPE_MASK;
+    }
+    let (_, sph, _) = golden(&spheres, true);
+    assert_ne!(chunks_hash(&sph.chunks), h_full, "the shape bits change the density");
+    let text = format!(
+        "# MONKEY voxel golden v3.6 (benilla-voxel tests/golden_v3.rs, CONTRACT v3.6 brush shapes). Height fn,\n\
+         # P1 + V3 + V3.3 edits, activation and line format = golden-v3.3.txt (edit lines: param printed as i16).\n\
+         # Edits 85-100 = the shape set: param bits 9-10 = shape (1 cube, 2 vertical cylinder, 3 = sphere) on\n\
+         # modes 0 / 1, hard and soft (world.rs shape_dist + apply_edit_set); 99 = shape 3 + reserved bits 11-14\n\
+         # (a sphere); 100 = shape bits on a hard smooth (ignored). density_hash = world.rs chunks_hash.\n\
+         {text}closure_rebuild sets {sets} avg_chunks {:.1} differing_sets {bad}\nactive_chunks {}\n",
+        avg as f32 / sets as f32,
+        keys.len()
+    );
+    if let Ok(out) = std::env::var("MONKEY_VOXEL_GOLDEN36_OUT") {
+        std::fs::write(&out, &text).expect("write the golden file");
+        eprintln!("golden: wrote {out}");
+    }
+}
