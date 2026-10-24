@@ -91,6 +91,10 @@ pub struct EmeHost {
     /// MONKEY (EME): the `strokes` (mine) request that seeds [`Self::stroke_ids`] after a relog
     /// is in flight / done.
     pub(crate) strokes_seeded: u8,
+    /// MONKEY (EME projects): a map edit was refused for want of a project: prompt the user.
+    pub(crate) prompt_project: bool,
+    /// MONKEY (EME projects): the project list is stale (a `project_changed` push).
+    pub(crate) projects_dirty: bool,
 }
 
 impl Default for EmeHost {
@@ -104,6 +108,8 @@ impl Default for EmeHost {
             notices: Vec::new(),
             caps_asked: false,
             strokes_seeded: 0,
+            prompt_project: false,
+            projects_dirty: false,
         }
     }
 }

@@ -449,6 +449,7 @@ fn request_capabilities_match_the_rank_table() {
             minutes: None,
             limit: None,
             before_sid: None,
+            project: None,
         },
     ] {
         assert_eq!(r.required_capability(), view, "{}", r.op());

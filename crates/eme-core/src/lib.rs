@@ -45,7 +45,8 @@ pub use host::{EmeActive, EmeHostInput, EmePointerOverUi, EmeToggleRequested, Em
 pub use command::{EmeCommand, EmeCommandSink, EmeIssued, EmeObjectRequest, EmeStrokeMark};
 pub use perm::{EmeCapability, EmePermissions, EmeRank};
 pub use service::{
-    EmeCaps, EmeDownlink, EmeRequestId, EmeServiceEnvelope, EmeServiceError, EmeServicePush,
+    EmeCaps, EmeDownlink, EmeProjectInfo, EmeProjectRef, EmeProjectRevertResult, EmeProjectRow,
+    EmeRequestId, EmeServiceEnvelope, EmeServiceError, EmeServicePush,
     EmeServiceReply, EmeServiceRequest, EmeTxId,
 };
 pub use stroke::{EmeBrushSample, EmeStrokeBuilder, EmeStrokeConfig, EmeStrokeEnd, EmeStrokeIds};

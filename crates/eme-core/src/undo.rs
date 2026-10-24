@@ -80,6 +80,8 @@ pub struct EmeUndoEntryMeta {
     pub tool: String,
     /// When it was pushed (host clock, ms).
     pub created_ms: u64,
+    /// MONKEY (EME projects): the project that was active when it was pushed.
+    pub project: Option<u32>,
 }
 
 /// Where an entry is in its server-confirmed life.
@@ -283,6 +285,8 @@ pub struct EmeUndoStack {
     outbox: Vec<EmeHistoryRequest>,
     events: EmeEvents,
     hooks: Vec<Box<dyn EmeHistoryHook>>,
+    /// MONKEY (EME projects): stamped on every new entry's meta.
+    project: Option<u32>,
 }
 
 impl Default for EmeUndoStack {
@@ -319,7 +323,39 @@ impl EmeUndoStack {
             outbox: Vec::new(),
             events: EmeEvents::default(),
             hooks: Vec::new(),
+            project: None,
         }
+    }
+
+    /// MONKEY (EME projects): the active project, stamped on entries pushed from now on.
+    pub fn set_project(&mut self, project: Option<u32>) {
+        self.project = project;
+    }
+
+    /// MONKEY (EME projects): the project stamped on new entries.
+    pub fn project(&self) -> Option<u32> {
+        self.project
+    }
+
+    /// MONKEY (EME projects): a whole project was reverted on the server: its settled entries can
+    /// no longer be undone or redone one by one, so they leave the stack
+    /// ([`EmeDiscardReason::ProjectReverted`]). Entries still waiting for the server stay.
+    pub fn discard_project(&mut self, project: u32) -> usize {
+        let mut n = 0;
+        let mut i = 0;
+        while i < self.entries.len() {
+            let e = &self.entries[i];
+            let settled = matches!(e.state, EmeEntryState::Applied | EmeEntryState::Undone)
+                && e.pending_nonces.is_empty()
+                && e.pending_commits == 0;
+            if e.meta.project == Some(project) && settled {
+                self.remove_at(i, EmeDiscardReason::ProjectReverted);
+                n += 1;
+            } else {
+                i += 1;
+            }
+        }
+        n
     }
 
     /// Continue object transaction ids after `last` (tx ids are unique per character on the
@@ -417,6 +453,7 @@ impl EmeUndoStack {
             backend,
             tool: tool.to_owned(),
             created_ms: now_ms,
+            project: self.project,
         };
         self.entries.push(EmeUndoEntry {
             meta: meta.clone(),
@@ -999,6 +1036,7 @@ fn reject_code(r: Option<EmeRejectReason>) -> &'static str {
         Some(EmeRejectReason::Rate) => "rate",
         Some(EmeRejectReason::Map) => "map",
         Some(EmeRejectReason::Stroke) => "stroke",
+        Some(EmeRejectReason::NoProject) => "no_project",
         Some(EmeRejectReason::Invalid | EmeRejectReason::Other(_)) | None => "invalid",
     }
 }

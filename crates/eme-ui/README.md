@@ -4,9 +4,17 @@ The UI shell of **Everwood ME (EME)**: egui panels (via `bevy_egui 0.39`) over `
 no tool logic, networking or voxel code. It reads resources and writes `EmeUiCommand` messages.
 Licence: MIT OR Apache-2.0.
 
-Layout: top tool strip (tools, Undo/Redo, link and rank), left panel = active tool's options,
-right panel = History / Restore points / Log tabs, bottom status bar, a "needs confirmation"
-modal for `others_edited`, and a read-only banner for rank 2.
+Layout: top tool strip (tools, Undo/Redo, link and rank), the project bar under it, left panel =
+active tool's options, right panel = History / Restore points / Log / Projects tabs, bottom status
+bar, a "needs confirmation" modal for `others_edited`, and a read-only banner for rank 2.
+
+**Projects (CONTRACT v3.4):** when the server's `caps` knows projects (`EmeSession::projects_required`)
+and none is active, every map-editing tool (`min_rank() >= 3`) is greyed out in the strip and its
+options are locked, with the tooltip "Open or create a project first"; the project bar offers the
+Projects tab (create with name + description, list mine / open / all, open, info, close, revert with
+a confirmation, un-revert at rank 4). A project revert answered `others_edited` fills
+`EmeProjects::conflict` and the shell shows a force / cancel modal (force needs rank 4). The status
+bar names the active project; History and Log can be narrowed to it.
 
 ## Embedding
 

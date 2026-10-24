@@ -146,14 +146,41 @@ fn pump(
             }
         }
     }
+    // MONKEY (EME projects): R 7 / no_project → prompt; a project closed / reverted elsewhere → say so.
+    if out.no_project {
+        host.prompt_project = true;
+    }
+    if let Some(p) = &out.project {
+        info!("EME: active project {:?}", p.as_ref().map(|p| (p.id, p.name.as_str())));
+    }
+    for push in &out.pushes {
+        if let eme_core::EmeServicePush::ProjectChanged { project, status, name } = push {
+            info!("EME: project {project} is now {status}");
+            host.projects_dirty = true;
+            if status != "open" {
+                let key = match status.as_str() {
+                    "closed" => "MONKEY_EME_PROJECT_STATUS_CLOSED",
+                    _ => "MONKEY_EME_PROJECT_STATUS_REVERTED",
+                };
+                host.notices.push((
+                    "MONKEY_EME_NOTICE_PROJECT_CHANGED".into(),
+                    vec![name.clone().unwrap_or_else(|| format!("#{project}")), key.into()],
+                    true,
+                ));
+            }
+        }
+    }
     host.replies = out.replies;
-    if wire.link.is_usable() && !host.caps_asked {
+    // MONKEY (EME, CONTRACT v3.5): ask nothing of `.mveme` before the server's `K` said rank ≥ 2
+    // (a player's client would otherwise print "There is no such command" in chat).
+    if wire.link.is_usable() && !host.caps_asked && wire.may_use_service() {
         host.caps_asked = host.dispatcher.request_caps(now, &mut *wire).is_ok();
         host.strokes_seeded = 0;
     }
     // MONKEY (EME): once an editing rank is known, ask for the newest own stroke (seeds the ids).
     if host.strokes_seeded == 0
         && !wire.offline
+        && wire.may_use_service()
         && host.dispatcher.permissions().has(EmeCapability::Edit)
     {
         let req = EmeServiceRequest::Strokes {
@@ -162,6 +189,7 @@ fn pump(
             minutes: Some(10_080),
             limit: Some(25),
             before_sid: None,
+            project: None,
         };
         if host.dispatcher.request(now, &mut *wire, None, req).is_ok() {
             host.strokes_seeded = 1;

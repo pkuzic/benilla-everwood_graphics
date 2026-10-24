@@ -4,7 +4,9 @@
 //! resources current, and applies the [`EmeUiCommand`]s the shell writes.
 
 use bevy::prelude::{Message, Resource};
-use eme_core::service::{EmeLogQuery, EmeLogRow, EmeSnapshotRow};
+use eme_core::service::{
+    EmeLogQuery, EmeLogRow, EmeProjectInfo, EmeProjectRef, EmeProjectRow, EmeSnapshotRow,
+};
 use eme_core::{
     EmeCaps, EmeEntryId, EmeLink, EmeOptionValue, EmePermissions, EmeServiceRequest, EmeToolId,
     EmeToolRegistry, EmeUndoStack,
@@ -49,6 +51,73 @@ pub struct EmeSession {
     pub caps: Option<EmeCaps>,
     /// Transport link state.
     pub link: EmeLink,
+    /// MONKEY (EME projects): the active server-side project, if any.
+    pub project: Option<EmeProjectRef>,
+    /// MONKEY (EME projects): map edits need an active project (the server knows projects).
+    pub projects_required: bool,
+}
+
+impl EmeSession {
+    /// MONKEY (EME projects): map-editing tools are locked: projects are required and none is open.
+    pub fn needs_project(&self) -> bool {
+        self.projects_required && self.project.is_none()
+    }
+}
+
+/// MONKEY (EME projects): which projects the Projects tab lists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum EmeProjectFilter {
+    /// The caller's own (any status).
+    Mine,
+    /// Every open project.
+    #[default]
+    Open,
+    /// Everything.
+    All,
+}
+
+impl EmeProjectFilter {
+    /// The `project_list` request for this filter.
+    pub fn request(self, limit: u32) -> EmeServiceRequest {
+        let (status, mine) = match self {
+            Self::Mine => (Some("all".to_owned()), true),
+            Self::Open => (Some("open".to_owned()), false),
+            Self::All => (Some("all".to_owned()), false),
+        };
+        EmeServiceRequest::ProjectList {
+            status,
+            mine,
+            limit: Some(limit),
+            before_id: None,
+        }
+    }
+}
+
+/// MONKEY (EME projects): the server answered a project revert with `others_edited`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EmeProjectConflict {
+    /// Project id.
+    pub project: u32,
+    /// Its name.
+    pub name: String,
+    /// The other authors.
+    pub others: Vec<String>,
+    /// Their live edits.
+    pub count: u32,
+}
+
+/// MONKEY (EME projects): the Projects tab's data (the host fills it from `project_list`,
+/// `project_info` and a refused `project_revert`).
+#[derive(Resource, Debug, Clone, Default, PartialEq)]
+pub struct EmeProjects {
+    /// Rows of the current filter, newest first.
+    pub rows: Vec<EmeProjectRow>,
+    /// The filter the rows belong to.
+    pub filter: EmeProjectFilter,
+    /// The last `project_info` reply.
+    pub info: Option<EmeProjectInfo>,
+    /// A revert that needs a forced resend (`others_edited`).
+    pub conflict: Option<EmeProjectConflict>,
 }
 
 /// The status bar's numbers.
@@ -199,4 +268,8 @@ pub enum EmeUiCommand {
     },
     /// The user opened a right-hand tab: a good moment to refresh its data.
     TabOpened(EmeRightTab),
+    /// MONKEY (EME projects): list projects with this filter.
+    ProjectFilter(EmeProjectFilter),
+    /// MONKEY (EME projects): the `others_edited` conflict was answered (force sent or cancelled).
+    DismissProjectConflict,
 }

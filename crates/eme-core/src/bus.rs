@@ -12,9 +12,10 @@ use crate::api::{EmeEvent, EmeEvents, EmeSendError, EmeServiceClient};
 use crate::command::{EmeCommand, EmeCommandSink, EmeObjectRequest, EmeStrokeMark};
 use crate::perm::{EmeCapability, EmePermissions};
 use crate::service::{
-    EmeCaps, EmeRequestId, EmeServiceEnvelope, EmeServicePush, EmeServiceReply, EmeServiceRequest,
-    EME_MAX_FRAME_BYTES, EME_MAX_REQUEST_ID,
+    EmeCaps, EmeProjectRef, EmeRequestId, EmeServiceEnvelope, EmeServicePush, EmeServiceReply,
+    EmeServiceRequest, EME_MAX_FRAME_BYTES, EME_MAX_REQUEST_ID,
 };
+use crate::transport::EmeRejectReason;
 use crate::tool::EmeToolId;
 use crate::transport::{EmeInbound, EmeLink, EmeTransport};
 use crate::undo::{EmeEntryId, EmeHistoryTicket, EmeUndoError, EmeUndoStack, EmeUndoStarted};
@@ -52,6 +53,11 @@ pub struct EmePumpOutput {
     pub pushes: Vec<EmeServicePush>,
     /// The link changed to this state during the pump.
     pub link: Option<EmeLink>,
+    /// MONKEY (EME projects): the active project changed during the pump (to the new value).
+    pub project: Option<Option<EmeProjectRef>>,
+    /// MONKEY (EME projects): the server refused a map edit for want of a project (`R 7` /
+    /// `no_project`): the host prompts the user to open or create one.
+    pub no_project: bool,
 }
 
 /// A command the dispatcher refused.
@@ -70,6 +76,14 @@ pub struct EmeDispatcher {
     client: EmeServiceClient<EmeRoute>,
     caps: Option<EmeCaps>,
     events: EmeEvents,
+    /// MONKEY (EME projects): the server-confirmed active project.
+    project: Option<EmeProjectRef>,
+    /// MONKEY (EME projects): the project the user last opened / created; re-opened after every
+    /// `caps` that says "none" (a HELLO / map change / reconnect starts a fresh server selection,
+    /// CONTRACT v3.4.1). Cleared by leave / close / revert or when the server refuses to open it.
+    wanted: Option<u32>,
+    /// A `project_open` of `wanted` is in flight (sent at most once per caps).
+    reopening: bool,
 }
 
 /// Default service request timeout, ms.
@@ -89,6 +103,38 @@ impl EmeDispatcher {
             client: EmeServiceClient::new(timeout_ms),
             caps: None,
             events: EmeEvents::default(),
+            project: None,
+            wanted: None,
+            reopening: false,
+        }
+    }
+
+    /// MONKEY (EME projects): the server-confirmed active project.
+    pub fn project(&self) -> Option<&EmeProjectRef> {
+        self.project.as_ref()
+    }
+
+    /// MONKEY (EME projects): the project the client re-opens after a HELLO / map change.
+    pub fn wanted_project(&self) -> Option<u32> {
+        self.wanted
+    }
+
+    /// MONKEY (EME projects): whether map edits need an active project (the server's `caps`
+    /// knows projects, CONTRACT v3.4). A server before v3.4 gates nothing.
+    pub fn projects_required(&self) -> bool {
+        self.caps.as_ref().is_some_and(|c| c.projects_ready.is_some())
+    }
+
+    /// MONKEY (EME projects): a map edit may be sent now (a project is active, or none is needed).
+    pub fn may_edit_map(&self) -> bool {
+        !self.projects_required() || self.project.is_some()
+    }
+
+    fn set_project(&mut self, p: Option<EmeProjectRef>, out: &mut EmePumpOutput) {
+        if self.project != p {
+            self.undo.set_project(p.as_ref().map(|p| p.id));
+            out.project = Some(p.clone());
+            self.project = p;
         }
     }
 
@@ -181,6 +227,21 @@ impl EmeDispatcher {
                     });
                     continue;
                 }
+            }
+            // MONKEY (EME projects, CONTRACT v3.4): no map edit without an active project.
+            let map_edit = matches!(
+                issued.command,
+                EmeCommand::VoxelStroke { .. } | EmeCommand::Overlay(_) | EmeCommand::Object(_)
+            );
+            if map_edit && !self.may_edit_map() {
+                let silent = matches!(&issued.command, EmeCommand::VoxelStroke { ops, .. } if ops.is_empty());
+                if !silent {
+                    errors.push(EmeDispatchError {
+                        origin,
+                        error: EmeSendError::NoProject,
+                    });
+                }
+                continue;
             }
             let link_ok = transport.state().is_usable();
             match issued.command {
@@ -354,9 +415,20 @@ impl EmeDispatcher {
                 }
                 EmeInbound::EditRejected { nonce, reason } => {
                     self.undo.on_edit_rejected(nonce, reason);
+                    if reason == EmeRejectReason::NoProject {
+                        // The server lost (or never had) our selection: re-open it on the next caps.
+                        self.set_project(None, &mut out);
+                        out.no_project = true;
+                        refresh_caps = true;
+                    }
                 }
                 EmeInbound::Reply(reply) => {
                     if let Some(done) = self.client.on_reply(reply) {
+                        if done.reply.err.as_deref() == Some("no_project") {
+                            self.set_project(None, &mut out);
+                            out.no_project = true;
+                            refresh_caps = true;
+                        }
                         self.route(done.route, done.op, done.reply, &mut out);
                     }
                 }
@@ -377,6 +449,19 @@ impl EmeDispatcher {
                             }
                         }
                         EmeServicePush::Obj { .. } => {}
+                        EmeServicePush::ProjectChanged { project, status, .. } => {
+                            if status != "open" {
+                                if self.project.as_ref().is_some_and(|p| p.id == *project) {
+                                    self.set_project(None, &mut out);
+                                }
+                                if self.wanted == Some(*project) {
+                                    self.wanted = None;
+                                }
+                                if status == "reverted" {
+                                    self.undo.discard_project(*project);
+                                }
+                            }
+                        }
                     }
                     out.pushes.push(push);
                 }
@@ -398,6 +483,18 @@ impl EmeDispatcher {
             // Best effort: a failure surfaces as the stale caps the host already holds.
             let _ = self.request_caps(now_ms, transport);
         }
+        // MONKEY (EME projects): a fresh server selection (caps said none) → re-open ours.
+        if self.reopening_due() && transport.state().is_usable() {
+            let id = self.wanted.expect("wanted");
+            let req = EmeServiceRequest::ProjectOpen { project: id };
+            if self
+                .client
+                .send(transport, now_ms, req, EmeRoute::Tool(None))
+                .is_ok()
+            {
+                self.reopening = true;
+            }
+        }
         // A commit that just settled may have released a queued undo.
         self.flush_history(now_ms, transport);
         self.collect_events();
@@ -415,7 +512,10 @@ impl EmeDispatcher {
             EmeRoute::Caps => {
                 if reply.ok {
                     if let Ok(caps) = EmeCaps::from_reply(&reply) {
+                        let p = caps.project.clone();
                         self.set_caps(caps);
+                        self.set_project(p, out);
+                        self.reopening = false;
                     }
                 }
                 out.replies.push(EmeToolReply {
@@ -431,7 +531,70 @@ impl EmeDispatcher {
                 self.undo.on_commit_reply(entry, &reply);
                 out.replies.push(EmeToolReply { tool, op, reply });
             }
-            EmeRoute::Tool(tool) => out.replies.push(EmeToolReply { tool, op, reply }),
+            EmeRoute::Tool(tool) => {
+                self.note_project_reply(op, &reply, out);
+                out.replies.push(EmeToolReply { tool, op, reply })
+            }
+        }
+    }
+
+    /// A `project_open` of `wanted` should be sent (caps arrived and named no project).
+    fn reopening_due(&self) -> bool {
+        self.wanted.is_some()
+            && self.project.is_none()
+            && !self.reopening
+            && self.caps.is_some()
+            && self.projects_required()
+            && self.client.permissions().has(EmeCapability::Edit)
+    }
+
+    /// MONKEY (EME projects): track the active project from the project ops' replies.
+    fn note_project_reply(&mut self, op: &str, reply: &EmeServiceReply, out: &mut EmePumpOutput) {
+        let project_of = |r: &EmeServiceReply| -> Option<EmeProjectRef> {
+            serde_json::from_value(r.extra.get("project")?.clone()).ok()
+        };
+        let id_of = |r: &EmeServiceReply| {
+            r.extra
+                .get("project_id")
+                .and_then(|v| v.as_u64())
+                .map(|n| n as u32)
+        };
+        match op {
+            "project_create" | "project_open" => {
+                if op == "project_open" {
+                    self.reopening = false;
+                }
+                if reply.ok {
+                    if let Some(p) = project_of(reply) {
+                        self.wanted = Some(p.id);
+                        self.set_project(Some(p), out);
+                    }
+                } else if op == "project_open"
+                    && matches!(reply.err.as_deref(), Some("not_found" | "conflict"))
+                {
+                    // Closed / reverted / gone: stop re-opening it.
+                    self.wanted = None;
+                }
+            }
+            "project_leave" if reply.ok => {
+                self.wanted = None;
+                self.set_project(None, out);
+            }
+            "project_close" | "project_revert" if reply.ok => {
+                let id = id_of(reply);
+                if id.is_some() && self.project.as_ref().map(|p| p.id) == id {
+                    self.set_project(None, out);
+                }
+                if id.is_some() && self.wanted == id {
+                    self.wanted = None;
+                }
+                if op == "project_revert" {
+                    if let Some(id) = id {
+                        self.undo.discard_project(id);
+                    }
+                }
+            }
+            _ => {}
         }
     }
 }
@@ -441,5 +604,6 @@ fn error_code(e: &EmeSendError) -> &'static str {
         EmeSendError::NotPermitted(_) => "rank",
         EmeSendError::LinkDown => "link_lost",
         EmeSendError::TooLarge(_) => "invalid",
+        EmeSendError::NoProject => "no_project",
     }
 }

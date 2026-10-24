@@ -13,7 +13,8 @@ use eme_core::{
 use crate::i18n::Tr;
 use crate::layout::{EmeLayout, EmeRightTab, PANEL_MAX, PANEL_MIN};
 use crate::state::{
-    EmeLogTable, EmeNotice, EmeOthersHistory, EmeRestorePoints, EmeSession, EmeStatus, EmeUiCommand,
+    EmeLogTable, EmeNotice, EmeOthersHistory, EmeProjectFilter, EmeProjects, EmeRestorePoints,
+    EmeSession, EmeStatus, EmeUiCommand,
 };
 use crate::theme::EmeTheme;
 
@@ -35,6 +36,8 @@ pub struct EmeShellModel<'a> {
     pub notice: &'a EmeNotice,
     /// Strokes by other GMs (read-only History rows).
     pub others: &'a EmeOthersHistory,
+    /// MONKEY (EME projects): the Projects tab's rows, info and revert conflict.
+    pub projects: &'a EmeProjects,
     /// Language-bound strings.
     pub tr: Tr<'a>,
     /// Palette.
@@ -87,6 +90,8 @@ pub struct EmeLogFilterUi {
     pub mode: usize,
     /// 0 = all layers, 1 = terrain, 2 = water, 3 = area.
     pub layer: usize,
+    /// MONKEY (EME projects): only rows of the active project.
+    pub project_only: bool,
 }
 
 impl EmeLogFilterUi {
@@ -125,6 +130,15 @@ impl EmeLogFilterUi {
             },
             limit: None,
             before_seq: None,
+            project: None,
+        }
+    }
+
+    /// MONKEY (EME projects): [`Self::query`] narrowed to `active` when "active project only" is on.
+    pub fn query_for(&self, active: Option<u32>) -> EmeLogQuery {
+        EmeLogQuery {
+            project: if self.project_only { active } else { None },
+            ..self.query()
         }
     }
 }
@@ -150,6 +164,27 @@ pub enum EmePending {
         /// Radius (server default 200 when `None`).
         radius: Option<f32>,
     },
+    /// MONKEY (EME projects): revert every edit of a project.
+    ProjectRevert {
+        /// Project id.
+        project: u32,
+        /// Its name.
+        name: String,
+    },
+    /// MONKEY (EME projects): re-apply a reverted project (rank 4).
+    ProjectUnrevert {
+        /// Project id.
+        project: u32,
+        /// Its name.
+        name: String,
+    },
+    /// MONKEY (EME projects): close a project.
+    ProjectClose {
+        /// Project id.
+        project: u32,
+        /// Its name.
+        name: String,
+    },
 }
 
 /// The shell: persistent UI state (layout, text fields). Draw it with [`EmeShell::show`].
@@ -165,11 +200,19 @@ pub struct EmeShell {
     pub pending: Option<EmePending>,
     /// Collect an [`EmeProbeEntry`] per control (tests).
     pub probe: bool,
+    /// MONKEY (EME projects): the new project's name being typed.
+    pub project_name: String,
+    /// MONKEY (EME projects): the new project's description being typed.
+    pub project_desc: String,
+    /// MONKEY (EME projects): the History tab shows only the active project's entries.
+    pub history_project_only: bool,
 }
 
 struct Frame<'a> {
     m: &'a EmeShellModel<'a>,
     can_edit: bool,
+    /// MONKEY (EME projects): map-editing tools are locked until a project is active.
+    needs_project: bool,
     out: &'a mut EmeShellOutput,
     probe: bool,
 }
@@ -248,6 +291,7 @@ impl EmeShell {
         let mut f = Frame {
             m: model,
             can_edit,
+            needs_project: can_edit && model.session.needs_project(),
             out: &mut out,
             probe: self.probe,
         };
@@ -257,6 +301,7 @@ impl EmeShell {
         let read_only = perms.can_open() && !can_edit;
         egui::TopBottomPanel::top("eme_top").show(ctx, |ui| {
             top_strip(ui, &mut f, &mut self.layout);
+            project_bar(ui, &mut f, &mut self.layout);
             notice_line(ui, &mut f);
             if read_only {
                 f.out.read_only_banner = true;
@@ -299,22 +344,26 @@ impl EmeShell {
         // Right: history / restore / log.
         if self.layout.right_open {
             let tab = &mut self.layout.right_tab;
-            let label = &mut self.snapshot_label;
-            let filter = &mut self.filter;
-            let pending = &mut self.pending;
+            let mut texts = RightTexts {
+                label: &mut self.snapshot_label,
+                filter: &mut self.filter,
+                pending: &mut self.pending,
+                project_name: &mut self.project_name,
+                project_desc: &mut self.project_desc,
+                history_project_only: &mut self.history_project_only,
+            };
             let r = egui::SidePanel::right("eme_right")
                 .resizable(true)
                 .default_width(self.layout.right_width)
                 .width_range(PANEL_MIN..=PANEL_MAX)
-                .show(ctx, |ui| {
-                    right_panel(ui, &mut f, tab, label, filter, pending)
-                });
+                .show(ctx, |ui| right_panel(ui, &mut f, tab, &mut texts));
             self.layout.right_width = r.response.rect.width().clamp(PANEL_MIN, PANEL_MAX);
         }
 
         // Needs-confirmation modal (Q4: warn, then confirm with force).
         confirm_modal(ctx, &mut f);
         pending_modal(ctx, &mut f, &mut self.pending);
+        project_conflict_modal(ctx, &mut f);
 
         let (over, kb) = (
             ctx.is_pointer_over_area() || ctx.wants_pointer_input(),
@@ -344,7 +393,10 @@ fn top_strip(ui: &mut Ui, f: &mut Frame, layout: &mut EmeLayout) {
             } else {
                 name
             };
-            if f.button(ui, format!("tool:{id}"), text, true, is_active, None) {
+            // MONKEY (EME projects): a map-editing tool is locked until a project is active.
+            let locked = f.needs_project && m.tools.get(id.as_str()).is_some_and(|t| t.min_rank() >= 3);
+            let tip = locked.then(|| tr.t("MONKEY_EME_NEEDS_PROJECT").to_owned());
+            if f.button(ui, format!("tool:{id}"), text, !locked, is_active, tip) {
                 f.push(EmeUiCommand::ActivateTool(id));
             }
         }
@@ -410,6 +462,44 @@ fn top_strip(ui: &mut Ui, f: &mut Frame, layout: &mut EmeLayout) {
     });
 }
 
+/// MONKEY (EME projects): the active project (or the "no project" warning) under the tool strip.
+fn project_bar(ui: &mut Ui, f: &mut Frame, layout: &mut EmeLayout) {
+    let m = f.m;
+    let tr = m.tr;
+    if !f.can_edit || !m.session.projects_required {
+        return;
+    }
+    let mut open_tab = false;
+    ui.horizontal_wrapped(|ui| match &m.session.project {
+        Some(p) => {
+            ui.label(RichText::new(format!("▣ {}", tr.f("MONKEY_EME_PROJECT_ACTIVE", &[&p.name]))).strong().color(m.theme.ok));
+            if f.button(ui, "project:info".into(), tr.t("MONKEY_EME_PROJECT_INFO").to_owned(), true, false, None) {
+                f.push(EmeUiCommand::Service(EmeServiceRequest::ProjectInfo { project: p.id }));
+                open_tab = true;
+            }
+            if f.button(ui, "project:leave".into(), tr.t("MONKEY_EME_PROJECT_LEAVE").to_owned(), true, false, None) {
+                f.push(EmeUiCommand::Service(EmeServiceRequest::ProjectLeave));
+            }
+            if f.button(ui, "project:browse".into(), tr.t("MONKEY_EME_PROJECT_CHOOSE").to_owned(), true, false, None) {
+                open_tab = true;
+            }
+        }
+        None => {
+            ui.label(RichText::new(format!("⚠ {}", tr.t("MONKEY_EME_PROJECT_NONE"))).color(m.theme.warn));
+            if f.button(ui, "project:browse".into(), tr.t("MONKEY_EME_PROJECT_CHOOSE").to_owned(), true, false, None) {
+                open_tab = true;
+            }
+        }
+    });
+    if open_tab {
+        layout.right_open = true;
+        if layout.right_tab != EmeRightTab::Projects {
+            layout.right_tab = EmeRightTab::Projects;
+            f.push(EmeUiCommand::TabOpened(EmeRightTab::Projects));
+        }
+    }
+}
+
 /// The error / result line under the strip, with a dismiss button.
 fn notice_line(ui: &mut Ui, f: &mut Frame) {
     let m = f.m;
@@ -417,7 +507,18 @@ fn notice_line(ui: &mut Ui, f: &mut Frame) {
     if n.key.is_empty() {
         return;
     }
-    let args: Vec<&str> = n.args.iter().map(String::as_str).collect();
+    // An argument that is itself a locale key (`MONKEY_EME_*`) is shown translated.
+    let args: Vec<&str> = n
+        .args
+        .iter()
+        .map(|a| {
+            if a.starts_with("MONKEY_EME_") {
+                m.tr.try_t(a).unwrap_or(a.as_str())
+            } else {
+                a.as_str()
+            }
+        })
+        .collect();
     let text = m.tr.f(&n.key, &args);
     let (glyph, colour) = if n.error {
         ("✖", m.theme.error)
@@ -498,6 +599,15 @@ fn status_bar(ui: &mut Ui, m: &EmeShellModel) {
             ui,
             tr.f("MONKEY_EME_STATUS_RATE", &[&format!("{:.1}", s.rate)]),
         );
+        // MONKEY (EME projects).
+        if m.session.projects_required {
+            let text = match &m.session.project {
+                Some(p) => tr.f("MONKEY_EME_STATUS_PROJECT", &[&p.name]),
+                None => tr.t("MONKEY_EME_STATUS_NO_PROJECT").to_owned(),
+            };
+            let colour = if m.session.project.is_some() { m.theme.ok } else { m.theme.warn };
+            ui.label(RichText::new(text).color(colour));
+        }
     });
 }
 
@@ -536,7 +646,12 @@ fn options_panel(ui: &mut Ui, f: &mut Frame) {
     }
     // A read-only rank may still use a read-only tool's controls.
     let mutating = tool.min_rank() >= 3;
-    let tool_enabled = f.can_edit || !mutating;
+    // MONKEY (EME projects): a map-editing tool's controls stay locked without a project.
+    let locked = mutating && f.needs_project;
+    if locked {
+        ui.label(RichText::new(format!("⚠ {}", tr.t("MONKEY_EME_NEEDS_PROJECT"))).color(m.theme.warn));
+    }
+    let tool_enabled = (f.can_edit || !mutating) && !locked;
     egui::ScrollArea::vertical().show(ui, |ui| {
         for field in &fields {
             option_field(ui, f, id, field, tool_enabled && !field.disabled);
@@ -649,20 +764,24 @@ fn option_field(
     }
 }
 
-fn right_panel(
-    ui: &mut Ui,
-    f: &mut Frame,
-    tab: &mut EmeRightTab,
-    label: &mut String,
-    filter: &mut EmeLogFilterUi,
-    pending: &mut Option<EmePending>,
-) {
+/// The right panel's text fields and toggles (borrowed from [`EmeShell`]).
+struct RightTexts<'a> {
+    label: &'a mut String,
+    filter: &'a mut EmeLogFilterUi,
+    pending: &'a mut Option<EmePending>,
+    project_name: &'a mut String,
+    project_desc: &'a mut String,
+    history_project_only: &'a mut bool,
+}
+
+fn right_panel(ui: &mut Ui, f: &mut Frame, tab: &mut EmeRightTab, x: &mut RightTexts) {
     let tr = f.m.tr;
-    ui.horizontal(|ui| {
+    ui.horizontal_wrapped(|ui| {
         for (t, key, name) in [
             (EmeRightTab::History, "MONKEY_EME_TAB_HISTORY", "history"),
             (EmeRightTab::Restore, "MONKEY_EME_TAB_RESTORE", "restore"),
             (EmeRightTab::Log, "MONKEY_EME_TAB_LOG", "log"),
+            (EmeRightTab::Projects, "MONKEY_EME_TAB_PROJECTS", "projects"),
         ] {
             let selected = *tab == t;
             let text = if selected {
@@ -678,10 +797,229 @@ fn right_panel(
     });
     ui.separator();
     match *tab {
-        EmeRightTab::History => history_tab(ui, f),
-        EmeRightTab::Restore => restore_tab(ui, f, label, pending),
-        EmeRightTab::Log => log_tab(ui, f, filter, pending),
+        EmeRightTab::History => history_tab(ui, f, x.history_project_only),
+        EmeRightTab::Restore => restore_tab(ui, f, x.label, x.pending),
+        EmeRightTab::Log => log_tab(ui, f, x.filter, x.pending),
+        EmeRightTab::Projects => projects_tab(ui, f, x.project_name, x.project_desc, x.pending),
     }
+}
+
+/// MONKEY (EME projects): the locale key of a project status.
+fn status_key(status: &str) -> &'static str {
+    match status {
+        "open" => "MONKEY_EME_PROJECT_STATUS_OPEN",
+        "closed" => "MONKEY_EME_PROJECT_STATUS_CLOSED",
+        _ => "MONKEY_EME_PROJECT_STATUS_REVERTED",
+    }
+}
+
+/// MONKEY (EME projects): create, list (mine / open / all), open, close, revert, un-revert, info.
+fn projects_tab(
+    ui: &mut Ui,
+    f: &mut Frame,
+    name: &mut String,
+    desc: &mut String,
+    pending: &mut Option<EmePending>,
+) {
+    let m = f.m;
+    let tr = m.tr;
+    let can_revert_others = m.session.perms.has(EmeCapability::RevertOthers);
+    let active = m.session.project.as_ref().map(|p| p.id);
+    // Create.
+    ui.label(RichText::new(tr.t("MONKEY_EME_PROJECT_NEW_TITLE")).strong());
+    ui.horizontal(|ui| {
+        ui.label(tr.t("MONKEY_EME_PROJECT_NAME"));
+        let r = ui.add_enabled(f.can_edit, egui::TextEdit::singleline(name).char_limit(64).desired_width(150.0));
+        f.rec("project:name".into(), &r, f.can_edit, None);
+    });
+    ui.horizontal(|ui| {
+        ui.label(tr.t("MONKEY_EME_PROJECT_DESC"));
+        let r = ui.add_enabled(f.can_edit, egui::TextEdit::singleline(desc).char_limit(255).desired_width(150.0));
+        f.rec("project:desc".into(), &r, f.can_edit, None);
+    });
+    let tip = (!f.can_edit).then(|| tr.t("MONKEY_EME_NEEDS_EDIT").to_owned());
+    if f.button(
+        ui,
+        "project:create".into(),
+        tr.t("MONKEY_EME_PROJECT_CREATE").to_owned(),
+        f.can_edit && !name.trim().is_empty(),
+        false,
+        tip,
+    ) {
+        let d = desc.trim();
+        f.push(EmeUiCommand::Service(EmeServiceRequest::ProjectCreate {
+            name: name.trim().to_owned(),
+            description: (!d.is_empty()).then(|| d.to_owned()),
+        }));
+        name.clear();
+        desc.clear();
+    }
+    ui.separator();
+    // Filter.
+    ui.horizontal_wrapped(|ui| {
+        for (flt, key, id) in [
+            (EmeProjectFilter::Mine, "MONKEY_EME_PROJECT_FILTER_MINE", "mine"),
+            (EmeProjectFilter::Open, "MONKEY_EME_PROJECT_FILTER_OPEN", "open"),
+            (EmeProjectFilter::All, "MONKEY_EME_PROJECT_FILTER_ALL", "all"),
+        ] {
+            let sel = m.projects.filter == flt;
+            if f.button(ui, format!("project:filter:{id}"), tr.t(key).to_owned(), true, sel, None) {
+                f.push(EmeUiCommand::ProjectFilter(flt));
+            }
+        }
+        if f.button(ui, "project:refresh".into(), tr.t("MONKEY_EME_PROJECT_REFRESH").to_owned(), true, false, None) {
+            f.push(EmeUiCommand::ProjectFilter(m.projects.filter));
+        }
+    });
+    // Info of the selected project.
+    if let Some(info) = &m.projects.info {
+        project_info_box(ui, f, info);
+    }
+    ui.separator();
+    if m.projects.rows.is_empty() {
+        ui.label(tr.t("MONKEY_EME_PROJECT_LIST_EMPTY"));
+        return;
+    }
+    egui::ScrollArea::vertical().id_salt("eme_projects").show(ui, |ui| {
+        for (n, row) in m.projects.rows.iter().enumerate() {
+            let is_active = active == Some(row.id);
+            let mut text = tr.f(
+                "MONKEY_EME_PROJECT_ROW",
+                &[&row.name, &row.owner, tr.t(status_key(&row.status)), &row.edits.to_string()],
+            );
+            if is_active {
+                text = format!("▣ {text} {}", tr.t("MONKEY_EME_PROJECT_IS_ACTIVE"));
+            }
+            let colour = match row.status.as_str() {
+                "open" => m.theme.text,
+                _ => m.theme.text_dim,
+            };
+            ui.vertical(|ui| {
+                let resp = ui.label(RichText::new(text).color(colour));
+                if !row.description.is_empty() {
+                    resp.on_hover_text(row.description.clone());
+                }
+                ui.horizontal_wrapped(|ui| {
+                    let open = row.status == "open";
+                    let own = row.mine || can_revert_others;
+                    if open && !is_active {
+                        let tip = (!f.can_edit).then(|| tr.t("MONKEY_EME_NEEDS_EDIT").to_owned());
+                        if f.button(ui, format!("project:open:{n}"), tr.t("MONKEY_EME_PROJECT_OPEN").to_owned(), f.can_edit, false, tip) {
+                            f.push(EmeUiCommand::Service(EmeServiceRequest::ProjectOpen { project: row.id }));
+                        }
+                    }
+                    if f.button(ui, format!("project:info:{n}"), tr.t("MONKEY_EME_PROJECT_INFO").to_owned(), true, false, None) {
+                        f.push(EmeUiCommand::Service(EmeServiceRequest::ProjectInfo { project: row.id }));
+                    }
+                    if open {
+                        let ok = f.can_edit && own;
+                        let tip = (!ok).then(|| tr.t("MONKEY_EME_PROJECT_OWNER_ONLY").to_owned());
+                        if f.button(ui, format!("project:close:{n}"), tr.t("MONKEY_EME_PROJECT_CLOSE").to_owned(), ok, false, tip) {
+                            *pending = Some(EmePending::ProjectClose { project: row.id, name: row.name.clone() });
+                        }
+                    }
+                    if row.status != "reverted" {
+                        let ok = f.can_edit && own;
+                        let tip = (!ok).then(|| tr.t("MONKEY_EME_PROJECT_OWNER_ONLY").to_owned());
+                        if f.button(ui, format!("project:revert:{n}"), tr.t("MONKEY_EME_PROJECT_REVERT").to_owned(), ok, false, tip) {
+                            *pending = Some(EmePending::ProjectRevert { project: row.id, name: row.name.clone() });
+                        }
+                    } else {
+                        let tip = (!can_revert_others).then(|| tr.t("MONKEY_EME_RESTORE_REVERT_RANK").to_owned());
+                        if f.button(ui, format!("project:unrevert:{n}"), tr.t("MONKEY_EME_PROJECT_UNREVERT").to_owned(), can_revert_others, false, tip) {
+                            *pending = Some(EmePending::ProjectUnrevert { project: row.id, name: row.name.clone() });
+                        }
+                    }
+                });
+            });
+            ui.add_space(2.0);
+        }
+    });
+}
+
+/// MONKEY (EME projects): `project_info` — counts per layer, authors, time span, "go to".
+fn project_info_box(ui: &mut Ui, f: &mut Frame, info: &eme_core::EmeProjectInfo) {
+    let m = f.m;
+    let tr = m.tr;
+    egui::Frame::new()
+        .stroke(egui::Stroke::new(1.0_f32, m.theme.text_dim))
+        .inner_margin(4)
+        .show(ui, |ui| {
+            let p = &info.project;
+            ui.label(RichText::new(tr.f("MONKEY_EME_PROJECT_INFO_TITLE", &[&p.name])).strong());
+            if !p.description.is_empty() {
+                ui.label(RichText::new(p.description.clone()).color(m.theme.text_dim));
+            }
+            ui.label(tr.f("MONKEY_EME_PROJECT_INFO_OWNER", &[&p.owner, tr.t(status_key(&p.status))]));
+            let c = |k: &str| info.counts.get(k).copied().unwrap_or_default();
+            let (v, l, a) = (c("voxel"), c("liquid"), c("area"));
+            ui.label(tr.f(
+                "MONKEY_EME_PROJECT_INFO_COUNTS",
+                &[
+                    &v.live.to_string(),
+                    &v.total.to_string(),
+                    &l.live.to_string(),
+                    &l.total.to_string(),
+                    &a.live.to_string(),
+                    &a.total.to_string(),
+                ],
+            ));
+            if info.authors.is_empty() {
+                ui.label(tr.t("MONKEY_EME_PROJECT_INFO_EMPTY"));
+            } else {
+                let names: Vec<String> = info
+                    .authors
+                    .iter()
+                    .map(|a| format!("{} ({})", a.name, a.edits))
+                    .collect();
+                ui.label(tr.f("MONKEY_EME_PROJECT_INFO_AUTHORS", &[&names.join(", ")]));
+            }
+            if let (Some(t0), Some(t1)) = (info.first_edit, info.last_edit) {
+                ui.label(tr.f("MONKEY_EME_PROJECT_INFO_SPAN", &[&hms(t0), &hms(t1)]));
+            }
+            if let Some(b) = info.bbox {
+                if f.button(ui, "project:info:show".into(), tr.t("MONKEY_EME_SHOW").to_owned(), true, false, None) {
+                    f.push(EmeUiCommand::ShowInWorld {
+                        x: (b[0] + b[2]) * 0.5,
+                        y: (b[1] + b[3]) * 0.5,
+                        z: None,
+                    });
+                }
+            }
+        });
+}
+
+/// MONKEY (EME projects): a project revert came back `others_edited`: force it (rank 4) or cancel.
+fn project_conflict_modal(ctx: &egui::Context, f: &mut Frame) {
+    let Some(c) = f.m.projects.conflict.clone() else { return };
+    let tr = f.m.tr;
+    let can = f.m.session.perms.has(EmeCapability::RevertOthers);
+    egui::Modal::new(egui::Id::new("eme_project_conflict")).show(ctx, |ui| {
+        ui.set_max_width(400.0);
+        ui.heading(format!("⚠ {}", tr.t("MONKEY_EME_PROJECT_OTHERS_TITLE")));
+        ui.add_space(6.0);
+        ui.label(tr.f(
+            "MONKEY_EME_PROJECT_OTHERS_BODY",
+            &[&c.others.join(", "), &c.name, &c.count.to_string()],
+        ));
+        if !can {
+            ui.label(RichText::new(tr.t("MONKEY_EME_PROJECT_FORCE_RANK")).color(f.m.theme.warn));
+        }
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            let tip = (!can).then(|| tr.t("MONKEY_EME_PROJECT_FORCE_RANK").to_owned());
+            if f.button(ui, "project:force".into(), tr.t("MONKEY_EME_PROJECT_FORCE").to_owned(), can, false, tip) {
+                f.push(EmeUiCommand::Service(EmeServiceRequest::ProjectRevert {
+                    project: c.project,
+                    force: true,
+                }));
+                f.push(EmeUiCommand::DismissProjectConflict);
+            }
+            if f.button(ui, "project:force:no".into(), tr.t("MONKEY_EME_CONFIRM_NO").to_owned(), true, false, None) {
+                f.push(EmeUiCommand::DismissProjectConflict);
+            }
+        });
+    });
 }
 
 /// Glyph + locale key for an entry state; shape and word, never colour alone.
@@ -709,18 +1047,32 @@ fn mode_name(tr: crate::i18n::Tr, mode: Option<u8>) -> String {
     tr.t(key).to_owned()
 }
 
-fn history_tab(ui: &mut Ui, f: &mut Frame) {
+fn history_tab(ui: &mut Ui, f: &mut Frame, project_only: &mut bool) {
     let m = f.m;
     let tr = m.tr;
-    if m.undo.entries().is_empty() && m.others.rows.is_empty() {
+    // MONKEY (EME projects): "active project only" narrows my entries and hides the others' rows.
+    let active = m.session.project.as_ref().map(|p| p.id);
+    if m.session.projects_required {
+        let r = ui.checkbox(project_only, tr.t("MONKEY_EME_FILTER_PROJECT"));
+        f.rec("history:project_only".into(), &r, true, None);
+    }
+    let only = *project_only && m.session.projects_required;
+    let mine: Vec<&EmeUndoEntry> = m
+        .undo
+        .entries()
+        .iter()
+        .filter(|e| !only || (active.is_some() && e.meta().project == active))
+        .collect();
+    let others_shown = !only;
+    if mine.is_empty() && (m.others.rows.is_empty() || !others_shown) {
         ui.label(tr.t("MONKEY_EME_HISTORY_EMPTY"));
         return;
     }
     egui::ScrollArea::vertical().show(ui, |ui| {
-        if m.undo.entries().is_empty() {
+        if mine.is_empty() {
             ui.label(tr.t("MONKEY_EME_HISTORY_EMPTY"));
         }
-        for e in m.undo.entries().iter().rev() {
+        for e in mine.iter().rev() {
             let (glyph, key) = state_view(e.state());
             let colour = match e.state() {
                 EmeEntryState::Applied => m.theme.ok,
@@ -733,6 +1085,9 @@ fn history_tab(ui: &mut Ui, f: &mut Frame) {
                 line.push_str(&format!("  ({})", e.pending()));
             }
             ui.label(RichText::new(line).color(colour));
+        }
+        if !others_shown {
+            return;
         }
         // Other GMs' strokes: theirs to undo (or an admin's, from the Log tab); shown read-only.
         ui.separator();
@@ -953,6 +1308,15 @@ fn log_filters(
             });
         f.rec("log:filter:layer".into(), &c.response, true, None);
     });
+    // MONKEY (EME projects): only the active project's rows.
+    let active = f.m.session.project.as_ref().map(|p| p.id);
+    if f.m.session.projects_required {
+        let r = ui.add_enabled(active.is_some(), egui::Checkbox::new(&mut filter.project_only, tr.t("MONKEY_EME_FILTER_PROJECT")));
+        f.rec("log:filter:project".into(), &r, active.is_some(), None);
+        if r.changed() {
+            apply = true;
+        }
+    }
     ui.horizontal_wrapped(|ui| {
         if f.button(
             ui,
@@ -1000,7 +1364,7 @@ fn log_filters(
         }
     });
     if apply {
-        f.push(EmeUiCommand::LogQuery(filter.query()));
+        f.push(EmeUiCommand::LogQuery(filter.query_for(active)));
     }
 }
 
@@ -1137,8 +1501,24 @@ fn pending_modal(ctx: &egui::Context, f: &mut Frame, pending: &mut Option<EmePen
             ),
             tr.t("MONKEY_EME_UNDOPLAYER_YES").to_owned(),
         ),
+        EmePending::ProjectRevert { name, .. } => (
+            tr.f("MONKEY_EME_PROJECT_REVERT_BODY", &[name]),
+            tr.t("MONKEY_EME_PROJECT_REVERT_YES").to_owned(),
+        ),
+        EmePending::ProjectUnrevert { name, .. } => (
+            tr.f("MONKEY_EME_PROJECT_UNREVERT_BODY", &[name]),
+            tr.t("MONKEY_EME_PROJECT_UNREVERT_YES").to_owned(),
+        ),
+        EmePending::ProjectClose { name, .. } => (
+            tr.f("MONKEY_EME_PROJECT_CLOSE_BODY", &[name]),
+            tr.t("MONKEY_EME_PROJECT_CLOSE_YES").to_owned(),
+        ),
     };
-    let can = f.m.session.perms.has(EmeCapability::RevertOthers);
+    // Project revert / close: the owner (rank 3) may; the server applies the ownership rule.
+    let can = match &p {
+        EmePending::ProjectRevert { .. } | EmePending::ProjectClose { .. } => f.can_edit,
+        _ => f.m.session.perms.has(EmeCapability::RevertOthers),
+    };
     let mut done = false;
     egui::Modal::new(egui::Id::new("eme_pending")).show(ctx, |ui| {
         ui.set_max_width(400.0);
@@ -1161,6 +1541,16 @@ fn pending_modal(ctx: &egui::Context, f: &mut Frame, pending: &mut Option<EmePen
                         minutes: *minutes,
                         radius: *radius,
                     },
+                    EmePending::ProjectRevert { project, .. } => EmeServiceRequest::ProjectRevert {
+                        project: *project,
+                        force: false,
+                    },
+                    EmePending::ProjectUnrevert { project, .. } => {
+                        EmeServiceRequest::ProjectUnrevert { project: *project }
+                    }
+                    EmePending::ProjectClose { project, .. } => {
+                        EmeServiceRequest::ProjectClose { project: *project }
+                    }
                 };
                 f.push(EmeUiCommand::Service(req));
                 done = true;

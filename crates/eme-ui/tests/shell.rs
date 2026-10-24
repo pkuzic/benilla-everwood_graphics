@@ -76,6 +76,8 @@ fn session(rank: u8) -> EmeSession {
         perms: EmePermissions::from_rank(EmeRank(rank)),
         caps: None,
         link: EmeLink::Up { server_version: 3 },
+        project: None,
+        projects_required: false,
     }
 }
 
@@ -88,6 +90,7 @@ struct World {
     log: EmeLogTable,
     notice: eme_ui::EmeNotice,
     others: eme_ui::EmeOthersHistory,
+    projects: eme_ui::EmeProjects,
     i18n: EmeI18n,
     theme: EmeTheme,
     lang: EmeLang,
@@ -104,6 +107,7 @@ impl World {
             log: EmeLogTable::default(),
             notice: Default::default(),
             others: Default::default(),
+            projects: Default::default(),
             i18n: EmeI18n::builtin(),
             theme: EmeTheme::default(),
             lang: EmeLang::EnUs,
@@ -127,6 +131,7 @@ impl World {
             log: &self.log,
             notice: &self.notice,
             others: &self.others,
+            projects: &self.projects,
             tr: self.i18n.tr(self.lang),
             theme: &self.theme,
         }
@@ -573,6 +578,7 @@ fn log_filters_build_the_query_and_apply() {
         minutes: "15".into(),
         mode: 4, // flatten
         layer: 1,
+        project_only: false,
     };
     let out = settle(&ctx, &mut shell, &w);
     for id in [
@@ -751,4 +757,108 @@ fn other_gms_strokes_are_listed_read_only() {
             z: Some(60.0)
         }]
     );
+}
+
+// --- MONKEY (EME projects, CONTRACT v3.4) ---------------------------------------------------
+
+fn project_row(id: u32, name: &str, status: &str, mine: bool) -> eme_core::EmeProjectRow {
+    serde_json::from_value(serde_json::json!({
+        "id": id, "name": name, "owner": if mine { "Geoff" } else { "Ada" }, "status": status,
+        "edits": 3, "live": 3, "mine": mine, "active": false
+    }))
+    .unwrap()
+}
+
+/// Map-editing tools are locked (with the "open or create a project" tooltip) until a project is
+/// active; read-only tools are not; the bar offers the Projects tab.
+#[test]
+fn mutating_tools_are_locked_without_a_project() {
+    let mut w = World::new(3);
+    w.session.projects_required = true;
+    w.activate("sculpt");
+    let ctx = egui::Context::default();
+    let mut shell = probing_shell();
+    let out = settle(&ctx, &mut shell, &w);
+    let sculpt = entry(&out, "tool:sculpt");
+    assert!(!sculpt.enabled);
+    assert_eq!(sculpt.tooltip.as_deref(), Some("Open or create a project first"));
+    assert!(entry(&out, "tool:log").enabled, "read-only tools stay usable");
+    assert!(!entry(&out, "opt:strength").enabled, "the active tool's options are locked");
+    assert!(entry(&out, "undo").enabled || !w.undo.can_undo(), "undo is not project-gated");
+    let cmds = click(&ctx, &mut shell, &w, "project:browse");
+    assert_eq!(cmds, vec![EmeUiCommand::TabOpened(EmeRightTab::Projects)]);
+    assert_eq!(shell.layout.right_tab, EmeRightTab::Projects);
+
+    // With a project: unlocked, and the bar names it.
+    w.session.project = Some(eme_core::EmeProjectRef { id: 4, name: "Pond".into(), status: None });
+    let out = settle(&ctx, &mut shell, &w);
+    assert!(entry(&out, "tool:sculpt").enabled);
+    assert!(entry(&out, "opt:strength").enabled);
+    assert!(drawn(&out, "project:leave"));
+    assert_eq!(click(&ctx, &mut shell, &w, "project:leave"), vec![EmeUiCommand::Service(EmeServiceRequest::ProjectLeave)]);
+
+    // A server without projects locks nothing and shows no bar.
+    let mut w = World::new(3);
+    w.activate("sculpt");
+    let out = settle(&ctx, &mut probing_shell(), &w);
+    assert!(entry(&out, "tool:sculpt").enabled);
+    assert!(!drawn(&out, "project:browse"));
+}
+
+#[test]
+fn projects_tab_create_open_and_revert_with_confirmation() {
+    let mut w = World::new(3);
+    w.session.projects_required = true;
+    w.projects.rows = vec![project_row(7, "Pond", "open", true), project_row(8, "Bridge", "open", false), project_row(9, "Old", "reverted", true)];
+    let ctx = egui::Context::default();
+    let mut shell = probing_shell();
+    shell.layout.right_tab = EmeRightTab::Projects;
+    let out = settle(&ctx, &mut shell, &w);
+    assert!(!entry(&out, "project:create").enabled, "a name first");
+    assert!(entry(&out, "project:revert:0").enabled, "the owner may revert");
+    assert!(!entry(&out, "project:revert:1").enabled, "not someone else's at rank 3");
+    assert!(!entry(&out, "project:unrevert:2").enabled, "un-revert is rank 4");
+    shell.project_name = "Пруд у мельницы".into();
+    let cmds = click(&ctx, &mut shell, &w, "project:create");
+    assert_eq!(
+        cmds,
+        vec![EmeUiCommand::Service(EmeServiceRequest::ProjectCreate { name: "Пруд у мельницы".into(), description: None })]
+    );
+    assert_eq!(
+        click(&ctx, &mut shell, &w, "project:open:1"),
+        vec![EmeUiCommand::Service(EmeServiceRequest::ProjectOpen { project: 8 })]
+    );
+    assert_eq!(click(&ctx, &mut shell, &w, "project:filter:all"), vec![EmeUiCommand::ProjectFilter(eme_ui::EmeProjectFilter::All)]);
+    // Revert asks first.
+    assert!(click(&ctx, &mut shell, &w, "project:revert:0").is_empty());
+    assert!(shell.pending.is_some());
+    assert_eq!(
+        click(&ctx, &mut shell, &w, "pending:yes"),
+        vec![EmeUiCommand::Service(EmeServiceRequest::ProjectRevert { project: 7, force: false })]
+    );
+}
+
+/// `others_edited`: rank 3 cannot force (says why), rank 4 forces.
+#[test]
+fn project_conflict_needs_rank_four_to_force() {
+    for rank in [3u8, 4] {
+        let mut w = World::new(rank);
+        w.session.projects_required = true;
+        w.projects.conflict = Some(eme_ui::EmeProjectConflict { project: 7, name: "Pond".into(), others: vec!["Ada".into()], count: 5 });
+        let ctx = egui::Context::default();
+        let mut shell = probing_shell();
+        let out = settle(&ctx, &mut shell, &w);
+        assert_eq!(entry(&out, "project:force").enabled, rank == 4);
+        if rank == 4 {
+            assert_eq!(
+                click(&ctx, &mut shell, &w, "project:force"),
+                vec![
+                    EmeUiCommand::Service(EmeServiceRequest::ProjectRevert { project: 7, force: true }),
+                    EmeUiCommand::DismissProjectConflict
+                ]
+            );
+        } else {
+            assert_eq!(click(&ctx, &mut shell, &w, "project:force:no"), vec![EmeUiCommand::DismissProjectConflict]);
+        }
+    }
 }

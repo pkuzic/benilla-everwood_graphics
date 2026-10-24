@@ -267,6 +267,9 @@ pub struct EmeLogQuery {
     /// Paging: rows with a smaller seq.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub before_seq: Option<u32>,
+    /// MONKEY (EME projects, CONTRACT v3.4): only rows of this project.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<u32>,
 }
 
 /// `ov_get`: live overlay cells inside a rectangle (span ≤ 256 yd per axis).
@@ -326,6 +329,9 @@ pub enum EmeServiceRequest {
         /// Paging: rows with a smaller `sid`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         before_sid: Option<u32>,
+        /// MONKEY (EME projects): only strokes of this project.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        project: Option<u32>,
     },
     /// Revert a stroke.
     Undo(EmeUndoArgs),
@@ -414,6 +420,59 @@ pub enum EmeServiceRequest {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<u32>,
     },
+    /// MONKEY (EME projects, CONTRACT v3.4): create a project and make it the caller's active one.
+    ProjectCreate {
+        /// Name, 1..64 chars (EN or RU).
+        name: String,
+        /// Description, ≤ 255 chars.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        description: Option<String>,
+    },
+    /// List projects (rank 2).
+    ProjectList {
+        /// `open` (server default), `closed`, `reverted` or `all`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        status: Option<String>,
+        /// Only the caller's own.
+        #[serde(default, skip_serializing_if = "is_false")]
+        mine: bool,
+        /// Row cap.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        limit: Option<u32>,
+        /// Paging: ids below this.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        before_id: Option<u32>,
+    },
+    /// Join an OPEN project (it becomes the caller's active one).
+    ProjectOpen {
+        /// Project id (`project`, not `id`: top-level `id` is the frame id).
+        project: u32,
+    },
+    /// No active project any more.
+    ProjectLeave,
+    /// Close a project (owner or rank 4): nobody can edit into it.
+    ProjectClose {
+        /// Project id.
+        project: u32,
+    },
+    /// Revert every live edit of a project (owner without other authors, else rank 4 + `force`).
+    ProjectRevert {
+        /// Project id.
+        project: u32,
+        /// Go ahead although other GMs edited in it (`others_edited`; needs rank 4).
+        #[serde(default, skip_serializing_if = "is_false")]
+        force: bool,
+    },
+    /// Re-apply a reverted project (rank 4).
+    ProjectUnrevert {
+        /// Project id.
+        project: u32,
+    },
+    /// Counts per layer, authors, bounding box, time span (rank 2).
+    ProjectInfo {
+        /// Project id.
+        project: u32,
+    },
 }
 
 impl EmeServiceRequest {
@@ -440,6 +499,14 @@ impl EmeServiceRequest {
             R::ObjMove(_) => "obj_move",
             R::ObjDelete { .. } => "obj_delete",
             R::ObjUndo { .. } => "obj_undo",
+            R::ProjectCreate { .. } => "project_create",
+            R::ProjectList { .. } => "project_list",
+            R::ProjectOpen { .. } => "project_open",
+            R::ProjectLeave => "project_leave",
+            R::ProjectClose { .. } => "project_close",
+            R::ProjectRevert { .. } => "project_revert",
+            R::ProjectUnrevert { .. } => "project_unrevert",
+            R::ProjectInfo { .. } => "project_info",
         }
     }
 
@@ -459,7 +526,9 @@ impl EmeServiceRequest {
             | R::SnapshotList { .. }
             | R::OvGet(_)
             | R::ObjNearby { .. }
-            | R::ObjGet { .. } => Some(EmeCapability::View),
+            | R::ObjGet { .. }
+            | R::ProjectList { .. }
+            | R::ProjectInfo { .. } => Some(EmeCapability::View),
             R::View { .. }
             | R::Undo(_)
             | R::Redo(_)
@@ -470,8 +539,13 @@ impl EmeServiceRequest {
             | R::ObjSpawn(_)
             | R::ObjMove(_)
             | R::ObjDelete { .. }
-            | R::ObjUndo { .. } => Some(EmeCapability::Edit),
-            R::Revert { .. } => Some(EmeCapability::RevertOthers),
+            | R::ObjUndo { .. }
+            | R::ProjectCreate { .. }
+            | R::ProjectOpen { .. }
+            | R::ProjectLeave
+            | R::ProjectClose { .. }
+            | R::ProjectRevert { .. } => Some(EmeCapability::Edit),
+            R::Revert { .. } | R::ProjectUnrevert { .. } => Some(EmeCapability::RevertOthers),
         }
     }
 
@@ -865,6 +939,8 @@ pub enum EmeServiceError {
     Limit,
     /// Server error.
     Internal,
+    /// MONKEY (EME projects): no active project (open or create one first).
+    NoProject,
     /// Client-side: no reply in time.
     Timeout,
     /// Client-side: the link dropped before the reply.
@@ -895,6 +971,7 @@ impl EmeServiceError {
             "entry_unknown" => Self::EntryUnknown,
             "limit" => Self::Limit,
             "internal" => Self::Internal,
+            "no_project" => Self::NoProject,
             "timeout" => Self::Timeout,
             "link_lost" => Self::LinkLost,
             other => Self::Other(other.to_owned()),
@@ -922,6 +999,7 @@ impl EmeServiceError {
             Self::EntryUnknown => "entry_unknown",
             Self::Limit => "limit",
             Self::Internal => "internal",
+            Self::NoProject => "no_project",
             Self::Timeout => "timeout",
             Self::LinkLost => "link_lost",
             Self::Other(s) => s,
@@ -994,6 +1072,17 @@ pub struct EmeCaps {
     /// Server limits.
     #[serde(default)]
     pub limits: EmeLimits,
+    /// MONKEY (EME projects, CONTRACT v3.4): the caller's active project, `None` = none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<EmeProjectRef>,
+    /// Whether the server knows projects at all: `None` = a server before v3.4 (nothing is gated
+    /// on a project), `Some(false)` = it does but its tables are missing (every edit is refused).
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "lenient::opt_bool_or_int"
+    )]
+    pub projects_ready: Option<bool>,
 }
 
 fn bool_as_int<S: serde::Serializer>(b: &bool, s: S) -> Result<S::Ok, S::Error> {
@@ -1141,6 +1230,136 @@ pub struct EmeUndoResult {
     /// The revert id (undo).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub revert_id: Option<u32>,
+}
+
+/// MONKEY (EME projects): a project as `caps.project` and the create / open replies name it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EmeProjectRef {
+    /// Project id.
+    pub id: u32,
+    /// Its name.
+    #[serde(default)]
+    pub name: String,
+    /// `open`, `closed`, `reverted` (absent in `caps`, where it is always open).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+}
+
+/// A `project_list` row (also the `project` of a `project_info` reply).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EmeProjectRow {
+    /// Project id.
+    pub id: u32,
+    /// Name.
+    pub name: String,
+    /// Description.
+    #[serde(default)]
+    pub description: String,
+    /// Owner's character name.
+    #[serde(default)]
+    pub owner: String,
+    /// Owner's guid (low).
+    #[serde(default)]
+    pub owner_guid: u32,
+    /// `open`, `closed` or `reverted`.
+    pub status: String,
+    /// Map id it was created on.
+    #[serde(default)]
+    pub map: u32,
+    /// Unix seconds.
+    #[serde(default)]
+    pub created: u64,
+    /// Edit rows in it (all layers).
+    #[serde(default)]
+    pub edits: u32,
+    /// Of `edits`, not reverted.
+    #[serde(default)]
+    pub live: u32,
+    /// Unix seconds of the newest edit.
+    #[serde(default)]
+    pub last_edit: Option<u64>,
+    /// The caller owns it.
+    #[serde(default, deserialize_with = "lenient::bool_or_int")]
+    pub mine: bool,
+    /// It is the caller's active project.
+    #[serde(default, deserialize_with = "lenient::bool_or_int")]
+    pub active: bool,
+}
+
+/// Rows of one layer in a project (`project_info.counts.<layer>`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EmeProjectCount {
+    /// Rows.
+    #[serde(default)]
+    pub total: u32,
+    /// Of them, not reverted.
+    #[serde(default)]
+    pub live: u32,
+}
+
+/// An author of a project (`project_info.authors`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EmeProjectAuthor {
+    /// Guid (low).
+    #[serde(default)]
+    pub guid: u32,
+    /// Character name.
+    #[serde(default)]
+    pub name: String,
+    /// Rows.
+    #[serde(default)]
+    pub edits: u32,
+    /// Of them, not reverted.
+    #[serde(default)]
+    pub live: u32,
+}
+
+/// The `project_info` reply (top-level fields).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EmeProjectInfo {
+    /// The project row.
+    pub project: EmeProjectRow,
+    /// Per layer (`voxel`, `liquid`, `area`, `object`).
+    #[serde(default)]
+    pub counts: std::collections::BTreeMap<String, EmeProjectCount>,
+    /// Authors, most edits first.
+    #[serde(default, deserialize_with = "lenient::vec_or_empty_map")]
+    pub authors: Vec<EmeProjectAuthor>,
+    /// `[x0, y0, x1, y1]` of the edits, WoW yards.
+    #[serde(default)]
+    pub bbox: Option<[f32; 4]>,
+    /// Unix seconds.
+    #[serde(default)]
+    pub first_edit: Option<u64>,
+    /// Unix seconds.
+    #[serde(default)]
+    pub last_edit: Option<u64>,
+}
+
+/// The `project_revert` / `project_unrevert` result.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EmeProjectRevertResult {
+    /// Project id.
+    #[serde(default)]
+    pub project_id: u32,
+    /// The new status.
+    #[serde(default)]
+    pub status: String,
+    /// Voxel rows.
+    #[serde(default)]
+    pub voxel: u32,
+    /// Liquid rows.
+    #[serde(default)]
+    pub liquid: u32,
+    /// Area rows.
+    #[serde(default)]
+    pub area: u32,
+    /// Objects.
+    #[serde(default)]
+    pub object: u32,
+    /// The revert id.
+    #[serde(default)]
+    pub revert_id: u32,
 }
 
 /// The fields of an `others_edited` error: who edited after the stroke.
@@ -1371,6 +1590,18 @@ pub enum EmeServicePush {
         action: EmeObjectAction,
         /// The row (pre-delete row for a delete).
         row: EmeObjectRow,
+    },
+    /// MONKEY (EME projects): a project this GM is in was closed / reverted elsewhere (or its row
+    /// is gone): it is no longer the active one.
+    ProjectChanged {
+        /// Project id.
+        project: u32,
+        /// `closed`, `reverted`, `open` or `gone`.
+        #[serde(default)]
+        status: String,
+        /// Its name, when known.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
     },
 }
 

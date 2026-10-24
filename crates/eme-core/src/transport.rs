@@ -100,6 +100,8 @@ pub enum EmeRejectReason {
     Map,
     /// 6: the stroke id was undone / reverted, or reused after being closed: start a new stroke.
     Stroke,
+    /// 7: MONKEY (EME projects, CONTRACT v3.4): no active project.
+    NoProject,
     /// Any other code.
     Other(u8),
 }
@@ -114,6 +116,7 @@ impl EmeRejectReason {
             4 => Self::Invalid,
             5 => Self::Map,
             6 => Self::Stroke,
+            7 => Self::NoProject,
             c => Self::Other(c),
         }
     }
@@ -127,6 +130,7 @@ impl EmeRejectReason {
             Self::Invalid => 4,
             Self::Map => 5,
             Self::Stroke => 6,
+            Self::NoProject => 7,
             Self::Other(c) => c,
         }
     }

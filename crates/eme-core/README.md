@@ -32,6 +32,17 @@ client resyncs. Entries therefore move through server-confirmed states (`Open �
 Applied → UndoPending → Undone → RedoPending → Applied`, with `NeedsConfirm` when another GM edited
 the area afterwards). See the `undo` module docs for the full machine.
 
+## Projects (CONTRACT v3.4) and the service gate (v3.5)
+
+When `caps` carries `projects_ready` the dispatcher refuses every map edit (voxel strokes, overlay
+batches, object ops) with `EmeSendError::NoProject` until a project is active. It tracks the active
+project from `caps.project`, the `project_*` replies, `R 7` / `no_project` (cleared, caps re-asked,
+`EmePumpOutput::no_project` set so the host prompts) and the `project_changed` push, stamps every
+undo entry with it (`EmeUndoEntryMeta::project`) and drops a reverted project's entries. The project
+the user opened is re-opened after every fresh `caps` (HELLO / map change / reconnect start a new
+server selection). The host must not send any `.mveme` before the server's `K` record said rank ≥ 2
+(the `eme` crate's `EmeWire::may_use_service`).
+
 ## Adding a tool
 
 1. One file, `crates/eme/src/tools/<name>.rs`, with a type implementing `EmeTool`:

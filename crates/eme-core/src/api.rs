@@ -33,6 +33,8 @@ pub enum EmeDiscardReason {
     /// The server refused a redo for good (`err:"conflict"`: a newer stroke or a revert made it
     /// non-redoable).
     RedoConflict,
+    /// MONKEY (EME projects): the entry's whole project was reverted on the server.
+    ProjectReverted,
 }
 
 /// Something EME did. Hosts read these; EME never needs to.
@@ -130,6 +132,9 @@ pub enum EmeSendError {
     LinkDown,
     /// The frame exceeds [`EME_MAX_FRAME_BYTES`] (split the request, e.g. fewer cells).
     TooLarge(usize),
+    /// MONKEY (EME projects, CONTRACT v3.4): a map edit with no active project (the server would
+    /// refuse it: `R 7` / `no_project`).
+    NoProject,
 }
 
 impl fmt::Display for EmeSendError {
@@ -138,6 +143,7 @@ impl fmt::Display for EmeSendError {
             Self::NotPermitted(c) => write!(f, "not permitted: {c:?}"),
             Self::LinkDown => f.write_str("link down"),
             Self::TooLarge(n) => write!(f, "frame too large: {n} > {EME_MAX_FRAME_BYTES} bytes"),
+            Self::NoProject => f.write_str("no active project"),
         }
     }
 }

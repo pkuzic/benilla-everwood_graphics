@@ -16,13 +16,17 @@ use std::collections::HashMap;
 
 use bevy::prelude::*;
 use eme_core::service::{
-    EmeLogPage, EmeLogQuery, EmeLogRow, EmeRevertResult, EmeServiceError, EmeSnapshotRow,
+    EmeLogPage, EmeLogQuery, EmeLogRow, EmeOthersEdited, EmeRevertResult, EmeServiceError,
+    EmeSnapshotRow,
 };
-use eme_core::{EmeServiceRequest, EmeToolId, EmeToolRegistry, EmeUndoStack};
+use eme_core::{
+    EmeProjectInfo, EmeProjectRevertResult, EmeProjectRow, EmeServiceRequest, EmeToolId,
+    EmeToolRegistry, EmeUndoStack,
+};
 use eme_ui::{
     EmeI18n, EmeLang, EmeLogTable, EmeNotice, EmeOtherStroke, EmeOthersHistory,
-    EmeRestorePoints, EmeRightTab, EmeSession, EmeShell, EmeShellSource, EmeStatus, EmeUiCommand,
-    EmeUiPlugin,
+    EmeProjectConflict, EmeProjects, EmeRestorePoints, EmeRightTab, EmeSession, EmeShell,
+    EmeShellSource, EmeStatus, EmeUiCommand, EmeUiPlugin,
 };
 
 use crate::camera::EmeFreeCam;
@@ -31,6 +35,8 @@ use crate::{now_ms, EmeActive, EmeHost, EmeRequest, EmeSet, EmeWire};
 use benilla_assets::coords::bevy_to_wow;
 use benilla_world::voxel::MonkeyVoxelApi;
 
+/// MONKEY (EME projects): projects listed per page.
+const PROJECT_ROWS: u32 = 15;
 /// Log rows per page (CONTRACT `log_rows_max` is 15 by default).
 const LOG_PAGE_ROWS: u32 = 15;
 /// Restore points listed.
@@ -73,10 +79,18 @@ pub struct EmeNames {
     asked_ms: u64,
 }
 
+/// MONKEY (EME projects): the project the last `project_revert` was for (its `others_edited`
+/// reply does not name it).
+#[derive(Resource, Debug, Default)]
+pub struct EmeProjectAsks {
+    revert: Option<u32>,
+}
+
 pub(crate) fn register(app: &mut App) {
     app.add_plugins(EmeUiPlugin::<EmeHost>::default())
         .init_resource::<EmeLogPaging>()
         .init_resource::<EmeNames>()
+        .init_resource::<EmeProjectAsks>()
         .add_systems(Startup, extend_locales)
         .add_systems(Update, ui_commands.in_set(EmeSet::Input))
         .add_systems(
@@ -171,9 +185,26 @@ fn ui_commands(
         Res<Time>,
         MonkeyVoxelApi,
     ),
+    (mut projects, mut asks): (ResMut<EmeProjects>, ResMut<EmeProjectAsks>),
 ) {
     for c in cmds.read() {
         let req = match c {
+            // MONKEY (EME projects).
+            EmeUiCommand::ProjectFilter(f) => {
+                projects.filter = *f;
+                EmeRequest::Service(f.request(PROJECT_ROWS))
+            }
+            EmeUiCommand::DismissProjectConflict => {
+                projects.conflict = None;
+                continue;
+            }
+            EmeUiCommand::TabOpened(EmeRightTab::Projects) => {
+                EmeRequest::Service(projects.filter.request(PROJECT_ROWS))
+            }
+            EmeUiCommand::Service(r @ EmeServiceRequest::ProjectRevert { project, .. }) => {
+                asks.revert = Some(*project);
+                EmeRequest::Service(r.clone())
+            }
             EmeUiCommand::LogQuery(q) => {
                 paging.query = q.clone();
                 paging.before = vec![None];
@@ -267,6 +298,7 @@ fn ui_replies(
     i18n: Res<EmeI18n>,
     mut out: MessageWriter<EmeRequest>,
     mut seen_errors: Local<Vec<eme_core::EmeDispatchError>>,
+    (mut projects, asks, mut shell): (ResMut<EmeProjects>, Res<EmeProjectAsks>, ResMut<EmeShell>),
 ) {
     // Local refusals (link down, not permitted) and host-queued messages.
     if host.errors != *seen_errors {
@@ -277,6 +309,25 @@ fn ui_replies(
         {
             notice.set("MONKEY_EME_NOTICE_NOT_SENT", Vec::new(), true);
         }
+        // MONKEY (EME projects): a brush used without a project.
+        if seen_errors
+            .iter()
+            .any(|e| matches!(e.error, eme_core::EmeSendError::NoProject))
+        {
+            host.prompt_project = true;
+        }
+    }
+    // MONKEY (EME projects): `R 7` / `no_project` / a local refusal → say so and show the tab.
+    if std::mem::take(&mut host.prompt_project) {
+        notice.set("MONKEY_EME_NOTICE_NO_PROJECT", Vec::new(), true);
+        shell.layout.right_open = true;
+        if shell.layout.right_tab != EmeRightTab::Projects {
+            shell.layout.right_tab = EmeRightTab::Projects;
+            out.write(EmeRequest::Service(projects.filter.request(PROJECT_ROWS)));
+        }
+    }
+    if std::mem::take(&mut host.projects_dirty) {
+        out.write(EmeRequest::Service(projects.filter.request(PROJECT_ROWS)));
     }
     for (key, args, error) in std::mem::take(&mut host.notices) {
         notice.set(key, args, error);
@@ -296,6 +347,27 @@ fn ui_replies(
         }
         if !r.reply.ok {
             info!("EME: {} refused: {:?}", r.op, r.reply.err);
+            // MONKEY (EME projects): other GMs' work in the project → the force / cancel modal.
+            if r.op == "project_revert" && r.reply.err.as_deref() == Some("others_edited") {
+                let o = r.reply.extra_as::<EmeOthersEdited>().unwrap_or_default();
+                let project = asks.revert.unwrap_or(0);
+                let name = projects
+                    .rows
+                    .iter()
+                    .find(|p| p.id == project)
+                    .map(|p| p.name.clone())
+                    .unwrap_or_else(|| format!("#{project}"));
+                projects.conflict = Some(EmeProjectConflict {
+                    project,
+                    name,
+                    others: o.others,
+                    count: o.count,
+                });
+                continue;
+            }
+            if r.reply.err.as_deref() == Some("no_project") {
+                continue; // the prompt above says it
+            }
             if !matches!(r.op, "view" | "caps") {
                 let (key, args) = error_notice(&i18n, &r.reply);
                 notice.set(key, args, true);
@@ -303,6 +375,52 @@ fn ui_replies(
             continue;
         }
         match r.op {
+            // MONKEY (EME projects).
+            "project_list" => match r.reply.rows_as::<EmeProjectRow>() {
+                Ok(rows) => projects.rows = rows,
+                Err(e) => warn!("EME: project_list rows: {e}"),
+            },
+            "project_info" => match r.reply.extra_as::<EmeProjectInfo>() {
+                Ok(info) => projects.info = Some(info),
+                Err(e) => warn!("EME: project_info: {e}"),
+            },
+            "project_create" | "project_open" => {
+                let name = host
+                    .dispatcher
+                    .project()
+                    .map(|p| p.name.clone())
+                    .unwrap_or_default();
+                notice.set("MONKEY_EME_NOTICE_PROJECT_OPEN", vec![name], false);
+                out.write(EmeRequest::Service(projects.filter.request(PROJECT_ROWS)));
+            }
+            "project_leave" => {
+                notice.set("MONKEY_EME_NOTICE_PROJECT_LEFT", Vec::new(), false);
+                out.write(EmeRequest::Service(projects.filter.request(PROJECT_ROWS)));
+            }
+            "project_close" => {
+                notice.set("MONKEY_EME_NOTICE_PROJECT_CLOSED", Vec::new(), false);
+                out.write(EmeRequest::Service(projects.filter.request(PROJECT_ROWS)));
+            }
+            "project_revert" | "project_unrevert" => {
+                let n = r.reply.extra_as::<EmeProjectRevertResult>().unwrap_or_default();
+                let key = if r.op == "project_revert" {
+                    "MONKEY_EME_NOTICE_PROJECT_REVERTED"
+                } else {
+                    "MONKEY_EME_NOTICE_PROJECT_UNREVERTED"
+                };
+                notice.set(
+                    key,
+                    vec![n.voxel.to_string(), n.liquid.to_string(), n.area.to_string()],
+                    false,
+                );
+                if projects.info.as_ref().is_some_and(|i| i.project.id == n.project_id) {
+                    out.write(EmeRequest::Service(EmeServiceRequest::ProjectInfo {
+                        project: n.project_id,
+                    }));
+                }
+                out.write(EmeRequest::Service(projects.filter.request(PROJECT_ROWS)));
+                out.write(EmeRequest::Service(log_request(&paging.query, None)));
+            }
             "snapshot_list" => match r.reply.rows_as::<EmeSnapshotRow>() {
                 Ok(rows) => {
                     restore.rows = rows;
@@ -445,8 +563,15 @@ fn ui_status(
         perms: host.dispatcher.permissions(),
         caps: host.dispatcher.caps().cloned(),
         link: wire.link,
+        project: host.dispatcher.project().cloned(),
+        projects_required: host.dispatcher.projects_required(),
     };
-    if session.perms != next.perms || session.caps != next.caps || session.link != next.link {
+    if session.perms != next.perms
+        || session.caps != next.caps
+        || session.link != next.link
+        || session.project != next.project
+        || session.projects_required != next.projects_required
+    {
         *session = next;
     }
     // Uplink rate: edits sent over a ~1 s exponential window.
@@ -482,6 +607,7 @@ fn refresh_on_open(
     mut was: Local<bool>,
     mut paging: ResMut<EmeLogPaging>,
     mut out: MessageWriter<EmeRequest>,
+    projects: Res<EmeProjects>,
 ) {
     if active.0 && !*was {
         match shell.layout.right_tab {
@@ -494,6 +620,9 @@ fn refresh_on_open(
                 out.write(EmeRequest::Service(log_request(&paging.query, None)));
             }
             EmeRightTab::History => {}
+            EmeRightTab::Projects => {
+                out.write(EmeRequest::Service(projects.filter.request(PROJECT_ROWS)));
+            }
         }
     }
     *was = active.0;

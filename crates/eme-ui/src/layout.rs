@@ -19,6 +19,8 @@ pub enum EmeRightTab {
     Restore,
     /// Audit log.
     Log,
+    /// MONKEY (EME projects): create / open / close / revert projects.
+    Projects,
 }
 
 /// The persisted layout.

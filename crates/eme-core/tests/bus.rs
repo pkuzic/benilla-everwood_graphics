@@ -151,6 +151,8 @@ fn caps(rank: u8, tools: &[&str]) -> EmeCaps {
         enforced: false,
         enforced_layers: Vec::new(),
         limits: EmeLimits::default(),
+        project: None,
+        projects_ready: None,
     }
 }
 

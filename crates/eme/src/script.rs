@@ -21,7 +21,9 @@
 //! ]}
 //! ```
 //! Other ops: `tool {id}`, `option {key, value}`, `redo`, `log {msg}`, `wait_active`,
-//! `tab {name: history|restore|log}` / `panels {left, right}` (the shell's side panels),
+//! `tab {name: history|restore|log|projects}` / `panels {left, right}` (the shell's side panels),
+//! [EME projects] `wait_project {none?}`, `project_open_named {name}`, `project_revert {name?}`,
+//! `wait_conflict`, `project_force {cancel?}` (create / leave / close via `svc`),
 //! `svc {req}` (any service request as the host, e.g. `{"op":"snapshot_create","label":"x"}`),
 //! `revert_last` (revert the newest listed restore point, as the confirmed UI button would),
 //! `select_restore {idx}`, `show {x, y}` (camera jump + marker), `filter {player, radius,
@@ -161,12 +163,13 @@ fn run_script(
         ResMut<eme_ui::EmeShell>,
         MessageWriter<eme_ui::EmeUiCommand>,
     ),
-    (restore, log_table, others, notice, wire): (
+    (restore, log_table, others, notice, wire, projects): (
         Res<eme_ui::EmeRestorePoints>,
         Res<eme_ui::EmeLogTable>,
         Res<eme_ui::EmeOthersHistory>,
         Res<eme_ui::EmeNotice>,
         Res<EmeWire>,
+        Res<eme_ui::EmeProjects>,
     ),
 ) {
     if script.done() {
@@ -354,10 +357,12 @@ fn run_script(
                 minutes: text("minutes"),
                 mode: num(&step, "mode").unwrap_or(0.0) as usize,
                 layer: num(&step, "layer").unwrap_or(0.0) as usize,
+                project_only: step.get("project_only").and_then(Json::as_bool).unwrap_or(false),
             };
             shell.layout.right_open = true;
             shell.layout.right_tab = eme_ui::EmeRightTab::Log;
-            ui_cmds.write(eme_ui::EmeUiCommand::LogQuery(shell.filter.query()));
+            let active = host.dispatcher.project().map(|p| p.id);
+            ui_cmds.write(eme_ui::EmeUiCommand::LogQuery(shell.filter.query_for(active)));
         }
         "report" => {
             info!(
@@ -389,7 +394,14 @@ fn run_script(
                     .map(|r| (r.actor, r.name.clone(), r.stroke, r.edits))
                     .collect::<Vec<_>>()
             );
-            info!("EME script: REPORT notice={:?} error={}", notice.key, notice.error);
+            info!("EME script: REPORT notice={:?} args={:?} error={}", notice.key, notice.args, notice.error);
+            info!(
+                "EME script: REPORT project={:?} required={} rows={:?} conflict={:?}",
+                host.dispatcher.project(),
+                host.dispatcher.projects_required(),
+                projects.rows.iter().map(|r| (r.id, r.name.clone(), r.status.clone(), r.edits)).collect::<Vec<_>>(),
+                projects.conflict
+            );
             let undo = host.dispatcher.undo_stack();
             info!(
                 "EME script: REPORT caps={:?} undo entries={}",
@@ -410,6 +422,7 @@ fn run_script(
                 "restore" => Some(eme_ui::EmeRightTab::Restore),
                 "log" => Some(eme_ui::EmeRightTab::Log),
                 "history" => Some(eme_ui::EmeRightTab::History),
+                "projects" => Some(eme_ui::EmeRightTab::Projects),
                 _ => None,
             };
             if let Some(tab) = tab {
@@ -420,6 +433,64 @@ fn run_script(
         }
         "redo" => {
             requests.write(EmeRequest::Redo);
+        }
+        // MONKEY (EME projects): wait until a project is active (`"none": true` = until none is).
+        "wait_project" => {
+            let want_none = step.get("none").and_then(Json::as_bool).unwrap_or(false);
+            done = host.dispatcher.project().is_some() != want_none || t > max_s;
+            if t > max_s {
+                warn!("EME script: wait_project timed out (active {:?})", host.dispatcher.project());
+            }
+        }
+        // MONKEY (EME projects): wait for the `others_edited` modal of a project revert.
+        "wait_conflict" => {
+            done = projects.conflict.is_some() || t > max_s;
+            if t > max_s {
+                warn!("EME script: wait_conflict timed out");
+            }
+        }
+        // MONKEY (EME projects): the modal's "Revert everyone's edits" (or `"cancel": true`).
+        "project_force" => match projects.conflict.clone() {
+            Some(c) => {
+                if !step.get("cancel").and_then(Json::as_bool).unwrap_or(false) {
+                    info!("EME script: forcing the revert of project {} ({})", c.project, c.name);
+                    ui_cmds.write(eme_ui::EmeUiCommand::Service(
+                        eme_core::EmeServiceRequest::ProjectRevert { project: c.project, force: true },
+                    ));
+                }
+                ui_cmds.write(eme_ui::EmeUiCommand::DismissProjectConflict);
+            }
+            None => warn!("EME script: project_force: no conflict shown"),
+        },
+        // MONKEY (EME projects): open the newest listed project named `name` (the Projects tab's Open).
+        "project_open_named" => {
+            let name = step.get("name").and_then(Json::as_str).unwrap_or("");
+            match projects.rows.iter().find(|r| r.name == name) {
+                Some(r) => {
+                    ui_cmds.write(eme_ui::EmeUiCommand::Service(
+                        eme_core::EmeServiceRequest::ProjectOpen { project: r.id },
+                    ));
+                }
+                None if t <= max_s => done = false,
+                None => warn!("EME script: project_open_named: no listed project {name:?}"),
+            }
+        }
+        // MONKEY (EME projects): revert the active (or the named) project, as the confirmed button.
+        "project_revert" => {
+            let name = step.get("name").and_then(Json::as_str);
+            let id = match name {
+                Some(n) => projects.rows.iter().find(|r| r.name == n).map(|r| r.id),
+                None => host.dispatcher.project().map(|p| p.id),
+            };
+            match id {
+                Some(project) => {
+                    ui_cmds.write(eme_ui::EmeUiCommand::Service(
+                        eme_core::EmeServiceRequest::ProjectRevert { project, force: false },
+                    ));
+                }
+                None if t <= max_s => done = false,
+                None => warn!("EME script: project_revert: no project"),
+            }
         }
         "screenshot" => {
             let path = step

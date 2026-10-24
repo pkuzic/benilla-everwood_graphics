@@ -97,3 +97,15 @@ where
     }
     d.deserialize_option(V(PhantomData))
 }
+
+/// MONKEY (EME projects): an optional flag: `true`/`false`/`0`/`1` → `Some`, `null` → `None`
+/// (use with `#[serde(default)]` so an absent field is `None` too).
+pub(crate) fn opt_bool_or_int<'de, D: Deserializer<'de>>(d: D) -> Result<Option<bool>, D::Error> {
+    let v: Option<serde_json::Value> = Option::deserialize(d)?;
+    Ok(match v {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::Bool(b)) => Some(b),
+        Some(serde_json::Value::Number(n)) => Some(n.as_f64().is_some_and(|f| f != 0.0)),
+        Some(_) => return Err(de::Error::custom("a boolean or 0/1")),
+    })
+}
