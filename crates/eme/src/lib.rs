@@ -34,6 +34,7 @@
 pub mod areas;
 pub mod camera;
 pub mod dispatch;
+pub mod objects;
 pub mod offline;
 pub mod script;
 pub mod tools;
@@ -83,6 +84,8 @@ pub struct EmeHost {
     pub stroke_ids: EmeStrokeIds,
     /// Replies for tools / panels from the last pump (overwritten each frame).
     pub replies: Vec<EmeToolReply>,
+    /// MONKEY (EME objects): the server pushes of the last pump (overwritten each frame).
+    pub pushes: Vec<eme_core::EmeServicePush>,
     /// Commands the dispatcher refused on the last dispatch.
     pub errors: Vec<EmeDispatchError>,
     /// Messages for the UI's notice line (locale key, args, is-error); drained by `ui`.
@@ -104,6 +107,7 @@ impl Default for EmeHost {
             dispatcher: EmeDispatcher::default(),
             stroke_ids: EmeStrokeIds::default(),
             replies: Vec::new(),
+            pushes: Vec::new(),
             errors: Vec::new(),
             notices: Vec::new(),
             caps_asked: false,
@@ -188,6 +192,10 @@ impl Plugin for EmePlugin {
         let catalog = tools::area::EmeAreaCatalog::default();
         app.insert_resource(areas::EmeAreas(catalog.clone()));
         app.register_eme_tool(tools::area::EmeAreaTool::new(ids, catalog));
+        // MONKEY (EME objects, CONTRACT v3.7): select, move, rotate, scale, place game objects.
+        let objects_editor: tools::objects::EmeObjectsShared = Default::default();
+        app.insert_resource(objects::EmeObjectsHandle(objects_editor.clone()));
+        app.register_eme_tool(tools::objects::EmeObjectsTool::new(objects_editor));
         app.configure_sets(
             Update,
             (EmeSet::Input, EmeSet::Frame)
@@ -204,6 +212,7 @@ impl Plugin for EmePlugin {
         dispatch::register(app);
         offline::register(app);
         script::register(app);
+        objects::register(app);
         areas::register(app);
         ui::register(app);
     }

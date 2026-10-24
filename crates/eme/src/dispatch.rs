@@ -42,7 +42,9 @@ pub(crate) fn register(app: &mut App) {
         (
             collect_voxel_events,
             pump,
+            crate::objects::route,
             toggle,
+            crate::objects::hotkeys,
             frame,
             crate::offline::serve,
         )
@@ -174,6 +176,7 @@ fn pump(
             }
         }
     }
+    host.pushes = out.pushes;
     host.replies = out.replies;
     // MONKEY (EME, CONTRACT v3.5): ask nothing of `.mveme` before the server's `K` said rank ≥ 2
     // (a player's client would otherwise print "There is no such command" in chat).

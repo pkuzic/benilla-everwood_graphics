@@ -263,6 +263,10 @@ fn ui_commands(
                 EmeRequest::Service(log_request(&paging.query, None))
             }
             EmeUiCommand::TabOpened(EmeRightTab::History) => continue,
+            // MONKEY (EME objects): the tab picks the Objects tool; its clicks go to the editor
+            // (`objects::ui_commands`).
+            EmeUiCommand::TabOpened(EmeRightTab::Objects) => EmeRequest::SelectTool("objects".to_owned()),
+            EmeUiCommand::Objects(_) => continue,
         };
         out.write(req);
     }
@@ -620,6 +624,10 @@ fn refresh_on_open(
                 out.write(EmeRequest::Service(log_request(&paging.query, None)));
             }
             EmeRightTab::History => {}
+            // The tool's own activation fetches the objects list.
+            EmeRightTab::Objects => {
+                out.write(EmeRequest::SelectTool("objects".to_owned()));
+            }
             EmeRightTab::Projects => {
                 out.write(EmeRequest::Service(projects.filter.request(PROJECT_ROWS)));
             }
@@ -646,11 +654,13 @@ mod tests {
         let pushpull = crate::tools::pushpull::EmePushPullTool::new(ids.clone());
         let bridge = crate::tools::bridge::EmeBridgeTool::new(ids.clone());
         let waterfill = crate::tools::waterfill::EmeWaterFillTool::new(ids);
+        let objects = crate::tools::objects::EmeObjectsTool::new(Default::default());
         // MONKEY (EME v3.6): the new tools' notices.
         let mut keys: Vec<String> = [
             "BRIDGE_PICK_B", "BRIDGE_READY", "BRIDGE_SENDING", "BRIDGE_TOO_LONG", "BRIDGE_TOO_MANY",
             "BRIDGE_CANCELLED", "WATERFILL_PREVIEW", "WATERFILL_OPEN", "WATERFILL_TOO_BIG",
             "WATERFILL_SHALLOW", "WATERFILL_NO_GROUND", "WATERFILL_DONE", "WATERFILL_CANCELLED",
+            "OBJECTS_LOADING",
         ]
         .iter()
         .map(|k| format!("MONKEY_EME_{k}"))
@@ -661,6 +671,7 @@ mod tests {
             &pushpull as &dyn eme_core::EmeTool,
             &bridge as &dyn eme_core::EmeTool,
             &waterfill as &dyn eme_core::EmeTool,
+            &objects as &dyn eme_core::EmeTool,
         ] {
             for f in tool.options_ui_model() {
                 keys.push(f.label.clone());

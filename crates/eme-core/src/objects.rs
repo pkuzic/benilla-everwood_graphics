@@ -320,6 +320,16 @@ impl EmeObjectsEditor {
     pub fn space(&self) -> EmeGizmoSpace {
         self.space
     }
+    /// Switch the gizmo mode (an option change; the hotkeys go through [`EmeObjectsCmd`]).
+    pub fn set_mode(&mut self, m: EmeGizmoMode) {
+        self.mode = m;
+        self.bump();
+    }
+    /// Switch world / local axes.
+    pub fn set_space(&mut self, s: EmeGizmoSpace) {
+        self.space = s;
+        self.bump();
+    }
     /// Snap settings.
     pub fn snap(&self) -> EmeSnap {
         self.snap
@@ -730,6 +740,11 @@ impl EmeObjectsEditor {
     }
 
     // ---- the frame ----------------------------------------------------------------------------
+
+    /// Bumped on every change a snapshot could show (the host copies [`Self::view`] only then).
+    pub fn revision(&self) -> u64 {
+        self.rev
+    }
 
     /// Whether [`Self::step`] ran since the last [`Self::end_frame`].
     pub fn stepped(&self) -> bool {

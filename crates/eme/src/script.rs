@@ -20,6 +20,11 @@
 //!   {"op": "exit"}
 //! ]}
 //! ```
+//! [EME objects] `obj_row {guid}` (outliner click), `obj_pick {guid}` (click the object in the
+//! world), `obj_drag {handle: x|y|z|xy|xz|yz|ring|scale, delta, s}` (grab a gizmo handle and drag),
+//! `obj_field {field: x|y|z|o|s, value}`, `obj_arm {entry}` (then `click` the ground),
+//! `obj_cmd {name: delete|duplicate|frame|refresh|more|none|disarm}`, `obj_wait {idle|rows|has|gone}`,
+//! `obj_report`.
 //! Other ops: `tool {id}`, `option {key, value}`, `redo`, `log {msg}`, `wait_active`,
 //! [v3.6] `click {x, y}` (one LMB click), `key {name: esc|enter}`; `cursor` / `click` / `stroke`
 //! also take `at: [x, y, z]` (a WoW point projected through the camera; `stroke` + `to_at`),
@@ -169,13 +174,15 @@ fn run_script(
         ResMut<crate::dispatch::EmeVirtualKeys>,
     ),
     camera_q: Query<(&Camera, &GlobalTransform), With<benilla_world::view::WorldCamera>>,
-    (restore, log_table, others, notice, wire, projects): (
+    (restore, log_table, others, notice, wire, projects, objects, world_objs): (
         Res<eme_ui::EmeRestorePoints>,
         Res<eme_ui::EmeLogTable>,
         Res<eme_ui::EmeOthersHistory>,
         Res<eme_ui::EmeNotice>,
         Res<EmeWire>,
         Res<eme_ui::EmeProjects>,
+        Res<crate::objects::EmeObjectsHandle>,
+        Res<crate::objects::EmeWorldObjects>,
     ),
 ) {
     if script.done() {
@@ -474,6 +481,7 @@ fn run_script(
                 "log" => Some(eme_ui::EmeRightTab::Log),
                 "history" => Some(eme_ui::EmeRightTab::History),
                 "projects" => Some(eme_ui::EmeRightTab::Projects),
+                "objects" => Some(eme_ui::EmeRightTab::Objects),
                 _ => None,
             };
             if let Some(tab) = tab {
@@ -542,6 +550,208 @@ fn run_script(
                 None if t <= max_s => done = false,
                 None => warn!("EME script: project_revert: no project"),
             }
+        }
+        // MONKEY (EME objects): drive the Objects tool through the same paths as a GM -----------
+        // `obj_row {guid}`: click the outliner row (select + frame).
+        "obj_row" => {
+            let guid = num(&step, "guid").unwrap_or(0.0) as u32;
+            ui_cmds.write(eme_ui::EmeUiCommand::Objects(eme_core::EmeObjectsCmd::Select(guid)));
+            ui_cmds.write(eme_ui::EmeUiCommand::Objects(eme_core::EmeObjectsCmd::Frame));
+            // The camera needs the editor to step once (it applies the command).
+            done = t >= 0.3;
+        }
+        // `obj_cmd {name: delete|duplicate|frame|refresh|more|none|disarm}`.
+        "obj_cmd" => {
+            use eme_core::EmeObjectsCmd as C;
+            let cmd = match step.get("name").and_then(Json::as_str).unwrap_or("") {
+                "delete" => Some(C::Delete),
+                "duplicate" => Some(C::Duplicate),
+                "frame" => Some(C::Frame),
+                "refresh" => Some(C::Refresh),
+                "more" => Some(C::LoadMore),
+                "none" => Some(C::SelectNone),
+                "disarm" => Some(C::DisarmSpawn),
+                other => {
+                    warn!("EME script: obj_cmd {other:?} unknown");
+                    None
+                }
+            };
+            if let Some(c) = cmd {
+                ui_cmds.write(eme_ui::EmeUiCommand::Objects(c));
+            }
+            done = t >= 0.2;
+        }
+        // `obj_field {field: x|y|z|o|s, value}`: the inspector's Enter (heading in degrees).
+        "obj_field" => {
+            use eme_core::EmeObjField as F;
+            let field = match step.get("field").and_then(Json::as_str).unwrap_or("") {
+                "x" => Some(F::X),
+                "y" => Some(F::Y),
+                "z" => Some(F::Z),
+                "o" => Some(F::Orientation),
+                "s" => Some(F::Scale),
+                _ => None,
+            };
+            if let (Some(field), Some(value)) = (field, num(&step, "value")) {
+                ui_cmds.write(eme_ui::EmeUiCommand::Objects(eme_core::EmeObjectsCmd::SetField { field, value }));
+            }
+            done = t >= 0.2;
+        }
+        // `obj_arm {entry}`: arm a template for placement (then `click` the ground).
+        "obj_arm" => {
+            ui_cmds.write(eme_ui::EmeUiCommand::Objects(eme_core::EmeObjectsCmd::ArmSpawn {
+                entry: num(&step, "entry").unwrap_or(0.0) as u32,
+                name: None,
+            }));
+            done = t >= 0.2;
+        }
+        // `obj_pick {guid}`: click the object itself in the world (its box centre, through the
+        // camera): the real picking path.
+        "obj_pick" => {
+            let guid = num(&step, "guid").unwrap_or(0.0) as u32;
+            let at = world_objs
+                .objects
+                .iter()
+                .find(|o| o.guid == guid)
+                .map(|o| o.obb.center);
+            match at {
+                Some(p) => {
+                    let i = script.idx;
+                    script.steps[i] = serde_json::json!({"op": "click", "at": [p[0], p[1], p[2]]});
+                    done = false;
+                }
+                None if t <= max_s => done = false,
+                None => warn!("EME script: obj_pick: object {guid} not streamed in"),
+            }
+        }
+        // `obj_drag {handle: x|y|z|xy|xz|yz|ring|scale, delta, s}`: grab a gizmo handle of the
+        // selection and drag it: yards (x y z), [dx, dy] yards (planes), degrees (ring), a factor
+        // (scale). Frame-counted so a slow frame cannot skip the press or the release.
+        "obj_drag" => 'drag: {
+            let draw = objects.0.lock().map(|e| e.draw()).ok();
+            let Some(g) = draw.and_then(|d| d.gizmo) else {
+                if t > max_s {
+                    warn!("EME script: obj_drag: no gizmo (nothing selected, or the rank cannot edit)");
+                } else {
+                    done = false;
+                }
+                break 'drag;
+            };
+            let f = g.frame;
+            let handle = step.get("handle").and_then(Json::as_str).unwrap_or("x").to_owned();
+            let d1 = num(&step, "delta").unwrap_or(1.0);
+            let d2 = step
+                .get("delta")
+                .and_then(Json::as_array)
+                .map(|a| [a.first().and_then(Json::as_f64).unwrap_or(0.0) as f32, a.get(1).and_then(Json::as_f64).unwrap_or(0.0) as f32]);
+            let mix = |a: [f32; 3], k: f32, b: [f32; 3]| [a[0] + b[0] * k, a[1] + b[1] * k, a[2] + b[2] * k];
+            let at = |u: f32, v: f32, i: usize, j: usize| mix(mix(f.origin, u * f.size, f.axes[i]), v * f.size, f.axes[j]);
+            let (grab, target) = match handle.as_str() {
+                "x" | "y" | "z" => {
+                    let i = match handle.as_str() { "x" => 0, "y" => 1, _ => 2 };
+                    let grab = mix(f.origin, 0.6 * f.size, f.axes[i]);
+                    (grab, mix(grab, d1, f.axes[i]))
+                }
+                "xy" | "xz" | "yz" => {
+                    let (i, j) = match handle.as_str() { "xy" => (0, 1), "xz" => (0, 2), _ => (1, 2) };
+                    let grab = at(0.4, 0.4, i, j);
+                    let [dx, dy] = d2.unwrap_or([d1, 0.0]);
+                    (grab, mix(mix(grab, dx, f.axes[i]), dy, f.axes[j]))
+                }
+                "ring" => {
+                    let a = d1.to_radians();
+                    let r = eme_core::gizmo::rot_z([f.size, 0.0, 0.0], a);
+                    let ax = f.axes[0];
+                    let ay = f.axes[1];
+                    let grab = mix(f.origin, f.size, ax);
+                    let target = mix(mix(f.origin, r[0], ax), r[1], ay);
+                    (grab, target)
+                }
+                _ => {
+                    let grab = f.tip(0);
+                    (grab, mix(f.origin, d1 * f.size, f.axes[0]))
+                }
+            };
+            let (gp, tp) = (project(grab), project(target));
+            let (Some(gp), Some(tp)) = (gp, tp) else {
+                warn!("EME script: obj_drag: the handle is off screen — aim the camera first");
+                done = t > max_s;
+                break 'drag;
+            };
+            let dur = num(&step, "s").unwrap_or(0.8).max(0.1);
+            let i = script.idx;
+            let phase = if first { 0 } else { step.get("_phase").and_then(Json::as_u64).unwrap_or(0) };
+            script.steps[i]["_phase"] = Json::from(phase + 1);
+            done = false;
+            match phase {
+                // Hover the handle, press on it, then give the tool two frames to grab it.
+                0 => {
+                    cursor.virtual_norm = Some(gp);
+                    cursor.virtual_primary = false;
+                }
+                1..=3 => {
+                    cursor.virtual_norm = Some(gp);
+                    cursor.virtual_primary = true;
+                    if phase == 3 {
+                        script.steps[i]["_t0"] = Json::from(t);
+                    }
+                }
+                _ => {
+                    let t0 = step.get("_t0").and_then(Json::as_f64).unwrap_or(0.0) as f32;
+                    let k = ((t - t0) / dur).clamp(0.0, 1.0);
+                    cursor.virtual_norm = Some(gp.lerp(tp, k));
+                    cursor.virtual_primary = true;
+                    if k >= 1.0 {
+                        // Two held frames at the target, then release.
+                        let hold = step.get("_hold").and_then(Json::as_u64).unwrap_or(0);
+                        script.steps[i]["_hold"] = Json::from(hold + 1);
+                        if hold >= 2 {
+                            cursor.virtual_primary = false;
+                            if hold >= 4 {
+                                done = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // `obj_wait {idle: true | rows: n | gone: guid | has: guid}`: wait for the editor.
+        "obj_wait" => {
+            let v = objects.0.lock().map(|e| e.view()).unwrap_or_default();
+            let ok = if step.get("idle").and_then(Json::as_bool).unwrap_or(false) {
+                v.pending == 0 && t > 0.3
+            } else if let Some(n) = num(&step, "rows") {
+                v.rows.len() >= n as usize
+            } else if let Some(g) = num(&step, "gone") {
+                !v.rows.iter().any(|r| r.guid == g as u32)
+            } else if let Some(g) = num(&step, "has") {
+                v.rows.iter().any(|r| r.guid == g as u32)
+            } else {
+                true
+            };
+            done = ok || t > max_s;
+            if t > max_s {
+                warn!("EME script: obj_wait timed out ({} rows, {} pending)", v.rows.len(), v.pending);
+            }
+        }
+        // `obj_report`: log the editor's state (rows, selection, inspector, world pick list).
+        "obj_report" => {
+            let v = objects.0.lock().map(|e| e.view()).unwrap_or_default();
+            info!(
+                "EME script: OBJ rows={:?} selected={:?} pending={} world={} armed={:?} truncated={}",
+                v.rows.iter().map(|r| (r.guid, r.entry, (r.x * 10.0).round() / 10.0, (r.y * 10.0).round() / 10.0, (r.z * 10.0).round() / 10.0, (r.o * 100.0).round() / 100.0, (r.scale * 100.0).round() / 100.0)).collect::<Vec<_>>(),
+                v.selected,
+                v.pending,
+                world_objs.objects.len(),
+                v.armed,
+                v.truncated
+            );
+            info!(
+                "EME script: OBJ primary={:?} notice={:?} {:?}",
+                v.primary.as_ref().map(|r| (r.guid, r.x, r.y, r.z, r.o, r.scale)),
+                notice.key,
+                notice.args
+            );
         }
         "screenshot" => {
             let path = step

@@ -4,6 +4,7 @@
 pub mod area;
 pub mod bridge;
 pub mod flatten;
+pub mod objects;
 pub mod pushpull;
 pub mod sculpt;
 pub mod water;

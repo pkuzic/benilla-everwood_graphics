@@ -40,6 +40,7 @@ impl Plugin for EmeHostPlugin {
                 (
                     eme_host_input.before(eme::EmeSet::Input),
                     eme_hold_character,
+                    eme_world_objects.before(eme::EmeSet::Input),
                     eme_egui_demand
                         .after(eme::EmeSet::Frame)
                         .in_set(crate::egui_lane::EguiDemandSet),
@@ -232,5 +233,99 @@ fn eme_hold_character(
             *held = None;
         }
         _ => {}
+    }
+}
+
+/// MONKEY (EME objects): the streamed game objects EME's Objects tool can pick.
+///
+/// While EME is open, a few times a second: every GameObject entity's guid (low 24 bits = the
+/// spawn guid the server's `obj_*` ops name), template entry (bits 24-47) and name (once the
+/// client's template cache has it), its origin, and the oriented box of its model: the union of
+/// its parts' mesh bounds in the object's own frame, carried back out by the object's transform.
+/// A model-less (invisible) object gets a small cube so it can still be clicked.
+#[allow(clippy::too_many_arguments)]
+fn eme_world_objects(
+    time: Res<Time<Real>>,
+    active: Res<EmeActive>,
+    mut out: ResMut<eme::objects::EmeWorldObjects>,
+    gos: Query<(Entity, &crate::net::Guid, &crate::net::NetEntity, &GlobalTransform)>,
+    children: Query<&Children>,
+    parts: Query<
+        (&GlobalTransform, Option<&bevy::camera::primitives::Aabb>),
+        With<benilla_world::interact::GoPickPart>,
+    >,
+    templates: Res<crate::go_templates::GameObjectTemplates>,
+    mut last: Local<f32>,
+) {
+    use benilla_assets::coords::bevy_to_wow;
+    use eme_core::{EmeObb, EmeWorldObject};
+    if !active.0 {
+        if !out.objects.is_empty() {
+            out.objects.clear();
+            out.stamp = out.stamp.wrapping_add(1);
+        }
+        return;
+    }
+    let now = time.elapsed_secs();
+    if now - *last < 0.3 {
+        return;
+    }
+    *last = now;
+    /// Bevy-space vector → WoW axes (a linear map, so it also takes directions).
+    fn to_wow_dir(v: Vec3) -> [f32; 3] {
+        [-v.z, -v.x, v.y]
+    }
+    let mut objects: Vec<EmeWorldObject> = Vec::new();
+    for (e, guid, net, gt) in &gos {
+        if net.kind != benilla_protocol::EntityKind::GameObject {
+            continue;
+        }
+        let pos = bevy_to_wow(gt.translation());
+        let rot = Mat3::from_quat(gt.rotation());
+        let inv = rot.transpose();
+        let (mut lo, mut hi) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
+        for d in children.iter_descendants(e) {
+            let Ok((pgt, aabb)) = parts.get(d) else { continue };
+            let Some(aabb) = aabb else { continue };
+            let (c, h) = (Vec3::from(aabb.center), Vec3::from(aabb.half_extents));
+            for i in 0..8u8 {
+                let s = Vec3::new(
+                    if i & 1 == 0 { -1.0 } else { 1.0 },
+                    if i & 2 == 0 { -1.0 } else { 1.0 },
+                    if i & 4 == 0 { -1.0 } else { 1.0 },
+                );
+                let world = pgt.transform_point(c + h * s);
+                let local = inv * (world - gt.translation());
+                lo = lo.min(local);
+                hi = hi.max(local);
+            }
+        }
+        let obb = if lo.x <= hi.x {
+            let centre_local = (lo + hi) * 0.5;
+            let half = (hi - lo) * 0.5;
+            EmeObb {
+                center: bevy_to_wow(gt.translation() + rot * centre_local),
+                axes: [
+                    to_wow_dir(rot.x_axis),
+                    to_wow_dir(rot.y_axis),
+                    to_wow_dir(rot.z_axis),
+                ],
+                half: [half.x, half.y, half.z],
+            }
+        } else {
+            EmeObb::point([pos[0], pos[1], pos[2] + 0.5], 0.6)
+        };
+        objects.push(EmeWorldObject {
+            guid: (guid.0 & 0xFF_FFFF) as u32,
+            entry: benilla_protocol::guid::entry(guid.0).unwrap_or(0),
+            name: templates.get(guid.0).map(|t| t.name.clone()).filter(|n| !n.is_empty()),
+            pos,
+            obb,
+        });
+    }
+    objects.sort_by_key(|o| o.guid);
+    if out.objects != objects {
+        out.objects = objects;
+        out.stamp = out.stamp.wrapping_add(1);
     }
 }
