@@ -1252,6 +1252,9 @@ pub fn full_replay(
 /// MONKEY (voxel): how far (yd) a voxel surface may sit off the seeded ground and still count as
 /// untouched ground (the seed is ADT + [`SEED_LIFT`]; surface nets moves a vertex ≤ ~0.25 yd).
 pub const EDITED_FROM: f32 = 0.3;
+/// MONKEY (voxel, v3.6): a mesh normal whose up component is below this faces DOWN (an underside):
+/// [`edited_weights`] never treats it as the seeded ground.
+pub const DOWN_FACING_Z: f32 = -0.3;
 /// … and over how many yards beyond that the "edited" weight ramps to 1.
 pub const EDITED_RAMP: f32 = 0.5;
 
@@ -1297,7 +1300,8 @@ pub fn edited_weights(m: &VoxelMesh, win: &[i8], seed_h: &[f32], origin_z: f32) 
     });
     m.positions
         .iter()
-        .map(|p| {
+        .enumerate()
+        .map(|(vi, p)| {
             let (fx, fy) = (p[0] / VOXEL_SIZE, p[1] / VOXEL_SIZE);
             let (ix, iy) = (fx.floor().max(0.0) as usize, fy.floor().max(0.0) as usize);
             let (tx, ty) = (
@@ -1316,6 +1320,12 @@ pub fn edited_weights(m: &VoxelMesh, win: &[i8], seed_h: &[f32], origin_z: f32) 
             });
             if density_w <= 0.0 {
                 return 0.0;
+            }
+            // MONKEY (voxel, v3.6 bridges / overhangs): the real ground is a heightfield and never
+            // faces DOWN, so a changed face pointing down (a bridge deck's or an overhang's
+            // underside) is edited however close it runs to the seeded height.
+            if m.normals.get(vi).is_some_and(|n| n[2] < DOWN_FACING_Z) {
+                return density_w;
             }
             let hs = [at(ix, iy), at(ix + 1, iy), at(ix, iy + 1), at(ix + 1, iy + 1)];
             if hs.iter().any(|h| !h.is_finite()) {
@@ -3109,5 +3119,33 @@ mod tests {
         let m = flat.mesh([0, 0, 1]);
         let t = seed_tilt_cos(&m, &flat.window_seed_heights([0, 0, 1]));
         assert!(t.iter().any(|&c| c < 0.2), "a hard pit has walls");
+    }
+
+    /// MONKEY (voxel, v3.6): a bridge deck rebuilt at the seeded height over a dug pit: its
+    /// underside faces down and counts as edited (earth / rock), even right at the seed height.
+    #[test]
+    fn a_deck_underside_at_seed_height_is_edited() {
+        let pit = edit([8.0, 8.0, 20.0], 6.0, MODE_DIG);
+        // The seeded ground under (8, 8) is ~20.6: the deck spans ~20.6 ..= 24.6.
+        let mut deck = edit([8.0, 8.0, 22.6], 2.0, MODE_BUILD);
+        deck.param = (SHAPE_CUBE as u16) << SHAPE_SHIFT;
+        let keys = [[0, 0, 0], [0, 0, 1]];
+        let w = world_with(&keys, &[pit, deck]);
+        let mut under = Vec::new();
+        for k in keys {
+            let win = w.window_i8(k);
+            let m = mesh_window(&win);
+            let o = window_origin(k);
+            let e = edited_weights(&m, &win, &w.window_seed_heights(k), o[2]);
+            for (i, n) in m.normals.iter().enumerate() {
+                let p = m.positions[i];
+                let (x, y, z) = (p[0] + o[0], p[1] + o[1], p[2] + o[2]);
+                if n[2] < -0.9 && (x - 8.0).abs() < 1.5 && (y - 8.0).abs() < 1.5 && z > 16.0 {
+                    under.push(e[i]);
+                }
+            }
+        }
+        assert!(!under.is_empty(), "the deck has an underside");
+        assert!(under.iter().all(|&w| w > 0.9), "{under:?}");
     }
 }

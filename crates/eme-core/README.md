@@ -67,6 +67,13 @@ server selection). The host must not send any `.mveme` before the server's `K` r
 
 The toolbar shows a tool only when the caller's rank reaches `min_rank()` **and** the server lists
 the id in `caps.tools`. Client gating is cosmetic; the server enforces every permission.
+A tool built purely on another tool's wire (MONKEY v3.6: `pushpull` / `bridge` send sculpt edits,
+`waterfill` sends water cells) overrides `server_tool()` to name that one, so it is offered with it.
+
+Optional hooks (MONKEY v3.6): `on_terrain(ctx, &dyn EmeTerrain)` runs on the active tool before
+`on_input` when the host passes terrain queries (`feed_with_terrain`; the ground height under a
+point), `take_notice()` hands the UI a notice line, and `EmeInputCtx` carries `view_dir` (camera ray)
+plus one-shot `cancel` (Esc) / `confirm` (Enter).
 
 ## Integrating from another program
 

@@ -21,7 +21,8 @@
 //! ]}
 //! ```
 //! Other ops: `tool {id}`, `option {key, value}`, `redo`, `log {msg}`, `wait_active`,
-//! [v3.6] `click {x, y}` (one LMB click), `key {name: esc|enter}`,
+//! [v3.6] `click {x, y}` (one LMB click), `key {name: esc|enter}`; `cursor` / `click` / `stroke`
+//! also take `at: [x, y, z]` (a WoW point projected through the camera; `stroke` + `to_at`),
 //! `tab {name: history|restore|log|projects}` / `panels {left, right}` (the shell's side panels),
 //! [EME projects] `wait_project {none?}`, `project_open_named {name}`, `project_revert {name?}`,
 //! `wait_conflict`, `project_force {cancel?}` (create / leave / close via `svc`),
@@ -165,6 +166,7 @@ fn run_script(
         MessageWriter<eme_ui::EmeUiCommand>,
         ResMut<crate::dispatch::EmeVirtualKeys>,
     ),
+    camera_q: Query<(&Camera, &GlobalTransform), With<benilla_world::view::WorldCamera>>,
     (restore, log_table, others, notice, wire, projects): (
         Res<eme_ui::EmeRestorePoints>,
         Res<eme_ui::EmeLogTable>,
@@ -211,6 +213,15 @@ fn run_script(
             aim.hit.map(|h| [h.pos[0].round(), h.pos[1].round(), (h.pos[2] * 10.0).round() / 10.0]),
         )
     };
+    // MONKEY (EME v3.6): a WoW point → the virtual cursor's viewport fraction (`at` / `to_at`).
+    let project = |p: [f32; 3]| -> Option<Vec2> {
+        let (cam, gt) = camera_q.single().ok()?;
+        let size = cam.logical_viewport_size()?;
+        let v = cam
+            .world_to_viewport(gt, benilla_assets::coords::wow_to_bevy(p))
+            .ok()?;
+        Some(v / size)
+    };
     let mut done = true;
     match op {
         "wait" => done = t >= num(&step, "s").unwrap_or(1.0),
@@ -232,10 +243,9 @@ fn run_script(
         }
         "wait_active" => done = active.0 || t > max_s,
         "cursor" => {
-            cursor.virtual_norm = Some(Vec2::new(
-                num(&step, "x").unwrap_or(0.5),
-                num(&step, "y").unwrap_or(0.5),
-            ));
+            cursor.virtual_norm = Some(vec3(&step, "at").and_then(|p| project(p)).unwrap_or_else(|| {
+                Vec2::new(num(&step, "x").unwrap_or(0.5), num(&step, "y").unwrap_or(0.5))
+            }));
         }
         "wait_hit" => done = aim.hit.is_some() && preview.visible || t > max_s,
         "wait_settled" => done = (api.settled() && t > 0.25) || t > max_s,
@@ -261,7 +271,9 @@ fn run_script(
             }
         }
         "stroke" => {
-            let from = Vec2::new(num(&step, "x").unwrap_or(0.5), num(&step, "y").unwrap_or(0.5));
+            let from = vec3(&step, "at")
+                .and_then(|p| project(p))
+                .unwrap_or_else(|| Vec2::new(num(&step, "x").unwrap_or(0.5), num(&step, "y").unwrap_or(0.5)));
             let to = step
                 .get("to")
                 .and_then(Json::as_array)
@@ -272,6 +284,7 @@ fn run_script(
                         a[1].as_f64().unwrap_or(0.5) as f32,
                     )
                 });
+            let to = vec3(&step, "to_at").and_then(|p| project(p)).unwrap_or(to);
             let dur = num(&step, "s").unwrap_or(0.5).max(0.05);
             if first {
                 // "flatten" is its own tool; dig / build / smooth are the sculpt tool's modes.
@@ -314,18 +327,20 @@ fn run_script(
         }
         // MONKEY (EME v3.6): one click (hover a frame, press ~0.1 s, release) at viewport fractions.
         "click" => {
-            cursor.virtual_norm = Some(Vec2::new(
-                num(&step, "x").unwrap_or(0.5),
-                num(&step, "y").unwrap_or(0.5),
-            ));
-            if first {
-                cursor.virtual_primary = false;
+            cursor.virtual_norm = Some(vec3(&step, "at").and_then(|p| project(p)).unwrap_or_else(|| {
+                Vec2::new(num(&step, "x").unwrap_or(0.5), num(&step, "y").unwrap_or(0.5))
+            }));
+            // Frame-counted (a slow frame must not skip the press): hover, press, release.
+            let i = script.idx;
+            let phase = if first { 0 } else { step.get("_phase").and_then(Json::as_u64).unwrap_or(0) };
+            match phase {
+                0 => cursor.virtual_primary = false,
+                1 => cursor.virtual_primary = true,
+                _ => cursor.virtual_primary = false,
+            }
+            if phase < 2 {
                 done = false;
-            } else if t < 0.1 {
-                cursor.virtual_primary = true;
-                done = false;
-            } else {
-                cursor.virtual_primary = false;
+                script.steps[i]["_phase"] = Json::from(phase + 1);
             }
         }
         // MONKEY (EME v3.6): `{"op":"key","name":"esc"|"enter"}` = Esc / Enter for the tools.

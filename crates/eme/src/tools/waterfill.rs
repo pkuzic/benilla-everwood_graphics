@@ -275,6 +275,13 @@ impl EmeWaterFillTool {
             self.margin,
             self.cap.then_some(self.max_depth),
         );
+        match &fill {
+            EmeFill::Basin { level, cells, floor, spill } => bevy::log::info!(
+                "EME waterfill at {at:?}: {} cell(s), level {level:.2}, floor {floor:.2}, spill {spill:.2}",
+                cells.len()
+            ),
+            other => bevy::log::info!("EME waterfill at {at:?}: refused {other:?}"),
+        }
         match fill {
             EmeFill::Basin {
                 level,
@@ -388,6 +395,14 @@ impl EmeTool for EmeWaterFillTool {
             self.last_batch_ms = None;
             self.flush(ctx, out);
             return;
+        }
+        if ctx.primary.pressed {
+            bevy::log::info!(
+                "EME waterfill: press (hit {:?}, over ui {}, preview {})",
+                ctx.hit.map(|h| h.pos),
+                ctx.pointer_over_ui,
+                self.preview.is_some()
+            );
         }
         if click {
             let hit = ctx.hit.expect("click has a hit");
