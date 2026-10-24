@@ -38,6 +38,12 @@ pub struct EmeWire {
     pub link: EmeLink,
     /// No server: [`crate::offline`] answers services and confirms edits locally.
     pub offline: bool,
+    /// MONKEY (EME, CONTRACT v3.5): the GM rank the server announced on the machine channel (the
+    /// `K` record after HELLO), kept current by the host transport. `.mveme` is hidden below rank
+    /// 2 (the core would print "There is no such command"), so EME asks nothing of the service
+    /// channel — not even `caps` — until this is `Some(r)` with `r >= 2` (see
+    /// [`EmeWire::may_use_service`]).
+    pub server_rank: Option<u8>,
     /// Edits sent this frame, for the dispatch system to submit to the voxel layer.
     pub edits_out: Vec<EmeVoxelEdit>,
     services_out: Vec<EmeOutgoingService>,
@@ -69,6 +75,12 @@ impl EmeWire {
     /// Queued service requests not yet taken.
     pub fn pending_services(&self) -> usize {
         self.services_out.len()
+    }
+
+    /// Whether the service channel (`.mveme`) may be used at all: offline, or the server's `K`
+    /// record said rank ≥ 2.
+    pub fn may_use_service(&self) -> bool {
+        self.offline || self.server_rank.is_some_and(|r| r >= 2)
     }
 }
 

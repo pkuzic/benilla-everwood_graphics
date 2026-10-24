@@ -94,6 +94,9 @@ pub(crate) struct MonkeyVoxelLink {
     pub(crate) mode: MonkeyVoxelMode,
     /// MONKEY (voxel): the negotiated protocol version (the `H` byte; 0 = no ACK yet).
     pub(crate) version: u8,
+    /// MONKEY (EME, CONTRACT v3.5): the GM rank of the `K` record after an ACK of 3 (`None` = none
+    /// yet, or a server without `K`). EME sends `.mveme` only at `Some(r)` with `r >= 2`.
+    pub(crate) eme_rank: Option<u8>,
     /// `(self guid, map)` the session state belongs to.
     key: Option<(u64, u32)>,
     hello_at: f32,
@@ -432,7 +435,7 @@ fn monkey_voxel_route(
     let mut confirmed_now: HashSet<u16> = HashSet::new();
     for r in records {
         match r {
-            ServerRecord::Hello { .. } => {}
+            ServerRecord::Hello { .. } | ServerRecord::EmeRank { .. } => {}
             // MONKEY (EME overlay): routed by `monkey_overlay_route` (split off before this).
             ServerRecord::Liquid { .. }
             | ServerRecord::Area { .. }
@@ -653,7 +656,7 @@ fn monkey_voxel_link_tick(
             // An H that raced the map change still counts.
             rx: rx
                 .into_iter()
-                .filter(|r| matches!(r, ServerRecord::Hello { .. }))
+                .filter(|r| matches!(r, ServerRecord::Hello { .. } | ServerRecord::EmeRank { .. }))
                 .collect(),
             ..Default::default()
         };
@@ -678,6 +681,16 @@ fn monkey_voxel_link_tick(
                 );
                 link.mode = MonkeyVoxelMode::Server;
             }
+        }
+        // MONKEY (EME, CONTRACT v3.5): the EME rank (whether `.mveme` may be sent at all).
+        if let Some(rank) = records.iter().rev().find_map(|r| match r {
+            ServerRecord::EmeRank { rank } => Some(*rank),
+            _ => None,
+        }) {
+            if link.eme_rank != Some(rank) {
+                info!("MONKEY (voxel): EME rank {rank} (K record)");
+            }
+            link.eme_rank = Some(rank);
         }
         // MONKEY (EME overlay): the overlay records take their own route.
         let (ov_records, records): (Vec<ServerRecord>, Vec<ServerRecord>) =

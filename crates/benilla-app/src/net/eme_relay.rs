@@ -224,6 +224,11 @@ fn eme_chat_link(link: Res<MonkeyVoxelLink>, mut wire: ResMut<EmeWire>) {
         MonkeyVoxelMode::Server | MonkeyVoxelMode::Relay => EmeLink::Unsupported,
     };
     wire.set_link(l);
+    // MONKEY (EME, CONTRACT v3.5): the `K` rank gates every `.mveme` line.
+    let rank = if matches!(l, EmeLink::Up { .. }) { link.eme_rank } else { None };
+    if wire.server_rank != rank {
+        wire.server_rank = rank;
+    }
 }
 
 /// Received payloads → frames → replies / pushes.
@@ -256,6 +261,14 @@ fn eme_chat_send(
         return;
     }
     for s in wire.take_services() {
+        // MONKEY (EME, CONTRACT v3.5): below the `K` rank 2 `.mveme` is a hidden command — the
+        // core would answer "There is no such command" in chat. Never send it; fail the request.
+        if !wire.may_use_service() {
+            debug!("EME: {} not sent: the server's K rank {:?} < 2", s.request.op(), wire.server_rank);
+            wire.inbound
+                .push(EmeInbound::Reply(EmeServiceReply::error(s.id, "rank")));
+            continue;
+        }
         match frame_lines(s.id.0, &s.json) {
             Some(lines) => chat.lines.extend(lines),
             None => {
@@ -265,7 +278,7 @@ fn eme_chat_send(
             }
         }
     }
-    if !wire.link.is_usable() {
+    if !wire.link.is_usable() || !wire.may_use_service() {
         chat.lines.clear();
         return;
     }

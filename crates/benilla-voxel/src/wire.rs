@@ -52,6 +52,9 @@ pub struct SyncEntry {
 pub enum ServerRecord {
     /// `H`: the server runs the authority script (`version` = 2).
     Hello { version: u8 },
+    /// MONKEY (EME, CONTRACT v3.5): `K`: the caller's GM rank, sent after an ACK of 3 in its own
+    /// message. The client sends `.mveme` only when `rank >= 2` (below it the command is hidden).
+    EmeRank { rank: u8 },
     /// `E`: an accepted edit with its global `seq` (`edit.seq = Some`, `edit.local = false`).
     Edit(VoxelEditOp),
     /// MONKEY (voxel): `e` (v3): an accepted edit with `seq`, `stroke`, `param`, and the low GUID
@@ -250,6 +253,7 @@ pub fn decode_records(hex: &str) -> (Vec<ServerRecord>, Option<WireError>) {
         let t = b[o];
         let len = match t {
             b'H' => 2,
+            b'K' => 2,
             b'E' => 27,
             b'D' => 14,
             b'X' => 9,
@@ -266,6 +270,7 @@ pub fn decode_records(hex: &str) -> (Vec<ServerRecord>, Option<WireError>) {
         }
         let rec = match t {
             b'H' => ServerRecord::Hello { version: b[o + 1] },
+            b'K' => ServerRecord::EmeRank { rank: b[o + 1] },
             b'E' => {
                 // `t, seq u32, nonce u16, map u16, x y z radius f32, mode, strength` = the 23-byte
                 // EDIT body with the op byte replaced by `t + seq`.
@@ -382,6 +387,7 @@ pub fn encode_record(r: &ServerRecord) -> Vec<u8> {
     let mut b = Vec::new();
     match *r {
         ServerRecord::Hello { version } => b.extend_from_slice(&[b'H', version]),
+        ServerRecord::EmeRank { rank } => b.extend_from_slice(&[b'K', rank]),
         ServerRecord::Edit(e) => {
             b.push(b'E');
             b.extend_from_slice(&e.seq.unwrap_or(0).to_le_bytes());
@@ -660,6 +666,16 @@ mod tests {
         assert_eq!(decode_records("zz").1, Some(WireError::BadHex));
         assert_eq!(decode_records("7100").1, Some(WireError::UnknownType(b'q')));
         assert_eq!(decode_records("4100").1, Some(WireError::Truncated), "A = v3 area record");
+    }
+
+    /// MONKEY (EME, CONTRACT v3.5): `K` = 2 bytes, the caller's GM rank.
+    #[test]
+    fn eme_rank_record_is_two_bytes() {
+        let (back, err) = decode_records("4b03");
+        assert_eq!(err, None);
+        assert_eq!(back, vec![ServerRecord::EmeRank { rank: 3 }]);
+        assert_eq!(encode_records_hex(&[ServerRecord::EmeRank { rank: 0 }]), "4b00");
+        assert_eq!(decode_records("4b").1, Some(WireError::Truncated));
     }
 
     #[test]
