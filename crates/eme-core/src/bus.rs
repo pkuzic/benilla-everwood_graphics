@@ -341,10 +341,13 @@ impl EmeDispatcher {
         request: EmeServiceRequest,
         errors: &mut Vec<EmeDispatchError>,
     ) {
-        if let Err(error) =
-            self.client
-                .send(transport, now_ms, request, EmeRoute::Commit(entry, origin))
-        {
+        let route = EmeRoute::Commit(entry, origin);
+        let sent = if is_tx_mutation(&request) {
+            self.client.send_idempotent(transport, now_ms, request, route)
+        } else {
+            self.client.send(transport, now_ms, request, route)
+        };
+        if let Err(error) = sent {
             let reply = EmeServiceReply::error(EmeRequestId::PUSH, error_code(&error));
             self.undo.on_commit_reply(entry, &reply);
             errors.push(EmeDispatchError { origin, error });
@@ -354,10 +357,14 @@ impl EmeDispatcher {
     /// Send whatever the undo stack queued; a send failure fails the entry's request at once.
     fn flush_history(&mut self, now_ms: u64, transport: &mut dyn EmeTransport) {
         for r in self.undo.drain_requests() {
-            if let Err(error) =
-                self.client
-                    .send(transport, now_ms, r.request, EmeRoute::History(r.ticket))
-            {
+            // A redo of an object op re-issues it with a fresh `tx`: safe to resend as it is.
+            let route = EmeRoute::History(r.ticket);
+            let sent = if is_tx_mutation(&r.request) {
+                self.client.send_idempotent(transport, now_ms, r.request, route)
+            } else {
+                self.client.send(transport, now_ms, r.request, route)
+            };
+            if let Err(error) = sent {
                 let reply = EmeServiceReply::error(EmeRequestId::PUSH, error_code(&error));
                 self.undo.on_reply(r.ticket, &reply);
             }
@@ -476,7 +483,7 @@ impl EmeDispatcher {
                 }
             }
         }
-        for done in self.client.expire(now_ms) {
+        for done in self.client.expire_with(now_ms, transport) {
             self.route(done.route, done.op, done.reply, &mut out);
         }
         if refresh_caps && transport.state().is_usable() {
@@ -597,6 +604,16 @@ impl EmeDispatcher {
             _ => {}
         }
     }
+}
+
+/// An object mutation whose `tx` the server dedups: resending it is safe (CONTRACT v3.7).
+fn is_tx_mutation(r: &EmeServiceRequest) -> bool {
+    matches!(
+        r,
+        EmeServiceRequest::ObjSpawn(_)
+            | EmeServiceRequest::ObjMove(_)
+            | EmeServiceRequest::ObjDelete { .. }
+    )
 }
 
 fn error_code(e: &EmeSendError) -> &'static str {

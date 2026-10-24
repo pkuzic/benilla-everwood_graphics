@@ -101,6 +101,15 @@ impl EmeTransport for EmeWire {
         id
     }
 
+    fn resend_service(&mut self, id: EmeRequestId, request: &EmeServiceRequest) {
+        let json = EmeServiceEnvelope::new(id, request.clone()).to_json();
+        self.services_out.push(EmeOutgoingService {
+            id,
+            request: request.clone(),
+            json,
+        });
+    }
+
     fn poll(&mut self) -> Vec<EmeInbound> {
         std::mem::take(&mut self.inbound)
     }

@@ -418,6 +418,7 @@ fn frame(
         view_dir,
         cancel,
         confirm,
+        ray_origin: aim.ray.map(|(o, _)| o),
     };
     let mut sink = EmeCommandSink::new();
     host.registry.feed_with_terrain(

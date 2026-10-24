@@ -168,7 +168,25 @@ struct Pending<R> {
     route: R,
     op: &'static str,
     sent_ms: u64,
+    /// MONKEY (EME objects): an idempotent mutation that is resent with the SAME id and `tx`.
+    retry: Option<Retry>,
 }
+
+/// How an idempotent request is resent (CONTRACT v3.7: the server dedups on `(character, tx)`).
+#[derive(Debug, Clone)]
+struct Retry {
+    request: EmeServiceRequest,
+    /// Wait this long for a reply before each resend and before giving up, ms.
+    after_ms: u64,
+    /// Resends left.
+    left: u8,
+}
+
+/// Resend policy of an idempotent request: wait [`EME_RETRY_AFTER_MS`] for the reply, resend up to
+/// [`EME_RETRIES`] times with the same frame id and `tx`, then fail with `timeout`.
+pub const EME_RETRY_AFTER_MS: u64 = 4_000;
+/// See [`EME_RETRY_AFTER_MS`].
+pub const EME_RETRIES: u8 = 2;
 
 /// Sends service requests and matches replies to them. `R` is the caller's routing tag (e.g. "this
 /// reply is for the undo stack, ticket T" or "for the log panel").
@@ -213,6 +231,31 @@ impl<R> EmeServiceClient<R> {
         request: EmeServiceRequest,
         route: R,
     ) -> Result<EmeRequestId, EmeSendError> {
+        self.send_inner(transport, now_ms, request, route, false)
+    }
+
+    /// MONKEY (EME objects): like [`Self::send`] for a mutation carrying a `tx` the server dedups
+    /// (`obj_spawn` / `obj_move` / `obj_delete`): if no reply comes within [`EME_RETRY_AFTER_MS`]
+    /// the SAME frame id and `tx` are sent again ([`Self::expire_with`]), up to [`EME_RETRIES`]
+    /// times, before the request fails with `timeout`.
+    pub fn send_idempotent(
+        &mut self,
+        transport: &mut dyn EmeTransport,
+        now_ms: u64,
+        request: EmeServiceRequest,
+        route: R,
+    ) -> Result<EmeRequestId, EmeSendError> {
+        self.send_inner(transport, now_ms, request, route, true)
+    }
+
+    fn send_inner(
+        &mut self,
+        transport: &mut dyn EmeTransport,
+        now_ms: u64,
+        request: EmeServiceRequest,
+        route: R,
+        idempotent: bool,
+    ) -> Result<EmeRequestId, EmeSendError> {
         if let Some(cap) = request.required_capability() {
             if !self.perms.has(cap) {
                 return Err(EmeSendError::NotPermitted(cap));
@@ -229,15 +272,61 @@ impl<R> EmeServiceClient<R> {
         }
         let op = request.op();
         let id = transport.send_service(&request);
+        let retry = idempotent.then(|| Retry {
+            request,
+            after_ms: EME_RETRY_AFTER_MS,
+            left: EME_RETRIES,
+        });
         self.pending.insert(
             id,
             Pending {
                 route,
                 op,
                 sent_ms: now_ms,
+                retry,
             },
         );
         Ok(id)
+    }
+
+    /// MONKEY (EME objects): [`Self::expire`] that first RESENDS idempotent requests which waited
+    /// [`EME_RETRY_AFTER_MS`] (same frame id, same `tx`); one out of resends fails with `timeout`
+    /// after one more wait. Everything else expires as in [`Self::expire`].
+    pub fn expire_with(
+        &mut self,
+        now_ms: u64,
+        transport: &mut dyn EmeTransport,
+    ) -> Vec<EmeCompleted<R>> {
+        let timeout = self.timeout_ms;
+        let mut due: Vec<EmeRequestId> = Vec::new();
+        let mut dead: Vec<EmeRequestId> = Vec::new();
+        for (id, p) in &self.pending {
+            let waited = now_ms.saturating_sub(p.sent_ms);
+            match &p.retry {
+                Some(r) if waited >= r.after_ms => {
+                    if r.left > 0 {
+                        due.push(*id);
+                    } else {
+                        dead.push(*id);
+                    }
+                }
+                Some(_) => {}
+                None if waited >= timeout => dead.push(*id),
+                None => {}
+            }
+        }
+        due.sort();
+        for id in due {
+            if let Some(p) = self.pending.get_mut(&id) {
+                if let Some(r) = p.retry.as_mut() {
+                    r.left -= 1;
+                    p.sent_ms = now_ms;
+                    transport.resend_service(id, &r.request);
+                }
+            }
+        }
+        dead.sort();
+        self.fail(dead, EmeServiceError::Timeout)
     }
 
     /// Match a reply; `None` for an unknown or already-completed id (a late reply after a timeout).

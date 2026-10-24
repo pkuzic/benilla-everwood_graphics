@@ -26,8 +26,10 @@
 
 pub mod api;
 pub mod bus;
+pub mod gizmo;
 pub mod command;
 pub mod host;
+pub mod objects;
 mod lenient;
 pub mod perm;
 pub mod service;
@@ -60,4 +62,14 @@ pub use transport::{
 pub use undo::{
     EmeEntryId, EmeEntryState, EmeHistoryRequest, EmeHistoryTicket, EmeUndoBackend, EmeUndoEntry,
     EmeUndoEntryMeta, EmeUndoError, EmeUndoStack, EmeUndoStarted,
+};
+
+// MONKEY (EME objects): the Objects tool's engine-free pieces.
+pub use gizmo::{
+    EmeGizmoDelta, EmeGizmoDrag, EmeGizmoFrame, EmeGizmoHandle, EmeGizmoMode, EmeGizmoSpace,
+    EmeObb, EmeObjXform, EmeSnap, EmeWorldObject,
+};
+pub use objects::{
+    EmeFrameRequest, EmeGizmoDraw, EmeObjField, EmeObjectsCmd, EmeObjectsDraw, EmeObjectsEditor,
+    EmeObjectsView,
 };

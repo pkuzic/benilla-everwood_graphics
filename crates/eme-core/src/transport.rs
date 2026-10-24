@@ -220,6 +220,10 @@ pub trait EmeTransport {
     fn send_edit(&mut self, edit: &EmeVoxelEdit);
     /// Queue one service request; returns the id written into its envelope.
     fn send_service(&mut self, request: &EmeServiceRequest) -> EmeRequestId;
+    /// MONKEY (EME objects, CONTRACT v3.7): queue `request` AGAIN under the SAME frame id `id`
+    /// (an unanswered idempotent mutation: the server dedups on its `tx` and the reply still
+    /// matches the pending request).
+    fn resend_service(&mut self, id: EmeRequestId, request: &EmeServiceRequest);
     /// Everything received since the last poll, in arrival order.
     fn poll(&mut self) -> Vec<EmeInbound>;
     /// Current link state.
@@ -290,6 +294,10 @@ impl EmeTransport for EmeLoopbackTransport {
         let id = self.ids.next_id();
         self.sent_services.push((id, request.clone()));
         id
+    }
+
+    fn resend_service(&mut self, id: EmeRequestId, request: &EmeServiceRequest) {
+        self.sent_services.push((id, request.clone()));
     }
 
     fn poll(&mut self) -> Vec<EmeInbound> {

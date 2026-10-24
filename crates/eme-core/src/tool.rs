@@ -93,6 +93,9 @@ pub struct EmeInputCtx {
     pub cancel: bool,
     /// MONKEY (EME v3.6 tools): Enter went down this frame (confirm a pending preview).
     pub confirm: bool,
+    /// MONKEY (EME objects): the cursor ray's origin, the camera eye (WoW axes); with
+    /// [`Self::view_dir`] it is the whole ray (selection and gizmo picking).
+    pub ray_origin: Option<[f32; 3]>,
 }
 
 impl EmeInputCtx {
@@ -111,6 +114,7 @@ impl EmeInputCtx {
             view_dir: None,
             cancel: false,
             confirm: false,
+            ray_origin: None,
         }
     }
 }
@@ -257,6 +261,11 @@ pub trait EmeTool: Send + Sync + 'static {
     fn server_tool(&self) -> EmeToolId {
         self.id()
     }
+    /// MONKEY (EME objects): a second `caps.tools` name that also offers this tool, for a tool
+    /// the server lists under another name to read-only ranks (`objects` / `view_objects`).
+    fn server_tool_alt(&self) -> Option<EmeToolId> {
+        None
+    }
     /// MONKEY (EME v3.6): called on the ACTIVE tool every frame before [`Self::on_input`] with the
     /// host's terrain queries (default: unused).
     fn on_terrain(&mut self, _ctx: &EmeInputCtx, _terrain: &dyn EmeTerrain) {}
@@ -376,7 +385,10 @@ impl EmeToolRegistry {
         caps: Option<&EmeCaps>,
     ) -> bool {
         perms.allows_rank(tool.min_rank())
-            && caps.is_none_or(|c| c.offers_tool(tool.server_tool().as_str()))
+            && caps.is_none_or(|c| {
+                c.offers_tool(tool.server_tool().as_str())
+                    || tool.server_tool_alt().is_some_and(|a| c.offers_tool(a.as_str()))
+            })
     }
 
     /// The toolbar: usable tools in registration order.

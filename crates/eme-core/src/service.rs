@@ -145,6 +145,9 @@ pub enum EmeObjectAction {
     Move,
     /// `obj_delete`.
     Delete,
+    /// MONKEY (EME objects, CONTRACT v3.7): `obj` push only: a project revert / un-revert moved
+    /// many objects; the receiver re-queries (the push carries no row).
+    Refresh,
 }
 
 /// A liquid kind (wire `u8`). MVP servers accept `None` and `Water` (`caps.limits.liquid_kinds`).
@@ -1588,8 +1591,9 @@ pub enum EmeServicePush {
     Obj {
         /// What happened.
         action: EmeObjectAction,
-        /// The row (pre-delete row for a delete).
-        row: EmeObjectRow,
+        /// The row (pre-delete row for a delete); none for `refresh`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        row: Option<EmeObjectRow>,
     },
     /// MONKEY (EME projects): a project this GM is in was closed / reverted elsewhere (or its row
     /// is gone): it is no longer the active one.
