@@ -63,6 +63,9 @@ mod state;
 pub(crate) mod step_probe;
 mod swim;
 mod view_subject;
+// MONKEY (voxel): lift the body out of ground that changed under it (undo / revert / login).
+#[cfg(feature = "voxel")]
+mod voxel_ground;
 mod walk;
 mod wire_in;
 pub(crate) use wire_in::regain_control_on_arrival;
@@ -279,7 +282,17 @@ impl Plugin for PlayerPlugin {
                 .in_set(WorldStage::Input)
                 .run_if(not(resource_exists::<crate::run_mode::CaptureMode>))
                 .in_set(crate::char_select::InWorldGated),
-        )
+        );
+        // MONKEY (voxel): before `control`, so the frame that lifts the body moves from there.
+        #[cfg(feature = "voxel")]
+        app.add_systems(
+            Update,
+            voxel_ground::keep_body_on_voxel_ground
+                .in_set(WorldStage::Input)
+                .before(control)
+                .in_set(crate::char_select::InWorldGated),
+        );
+        app
         // The posture queue (the `/sit` family), which `control` alone executes.
         .add_message::<StandStateRequest>()
         .add_message::<ServerStandState>()

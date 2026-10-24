@@ -306,10 +306,12 @@ impl EmeTool for EmeAreaTool {
     }
     fn preview(&self, ctx: &EmeInputCtx) -> Option<EmePreview> {
         let hit = ctx.hit?;
-        Some(EmePreview::Ring {
+        // MONKEY (EME, live bug 2026-10-24): an area cell is a whole column (zone ids have no
+        // height), so the brush is drawn as a FLAT disc at the aim height: projecting the rim onto
+        // the surface draws it down a pit's walls and up a hill, which reads as a 3D brush.
+        Some(EmePreview::Plane {
             center: hit.pos,
             radius: self.radius.max(AREA_CELL * 0.5),
-            falloff: 1.0,
         })
     }
     fn on_deactivate(&mut self, _out: &mut EmeCommandSink) {
