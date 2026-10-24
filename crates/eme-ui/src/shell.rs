@@ -6,8 +6,9 @@ use bevy::prelude::Resource;
 use bevy_egui::egui::{self, Align, Layout, RichText, Ui};
 use eme_core::service::{EmeLayer, EmeLayerFilter, EmeLogQuery};
 use eme_core::{
-    EmeCapability, EmeEntryState, EmeOptionField, EmeOptionKind, EmeOptionValue, EmeServiceRequest,
-    EmeToolId, EmeToolRegistry, EmeUndoEntry, EmeUndoStack,
+    EmeCapability, EmeEntryState, EmeObjField, EmeObjectsCmd, EmeObjectsView, EmeOptionField,
+    EmeOptionKind, EmeOptionValue, EmeServiceRequest, EmeToolId, EmeToolRegistry, EmeUndoBackend,
+    EmeUndoEntry, EmeUndoStack,
 };
 
 use crate::i18n::Tr;
@@ -38,6 +39,8 @@ pub struct EmeShellModel<'a> {
     pub others: &'a EmeOthersHistory,
     /// MONKEY (EME projects): the Projects tab's rows, info and revert conflict.
     pub projects: &'a EmeProjects,
+    /// MONKEY (EME objects): the Objects tab's snapshot of the editor.
+    pub objects: &'a EmeObjectsView,
     /// Language-bound strings.
     pub tr: Tr<'a>,
     /// Palette.
@@ -206,6 +209,16 @@ pub struct EmeShell {
     pub project_desc: String,
     /// MONKEY (EME projects): the History tab shows only the active project's entries.
     pub history_project_only: bool,
+    /// MONKEY (EME objects): the outliner search text.
+    pub obj_search: String,
+    /// MONKEY (EME objects): the spawn list filter text.
+    pub spawn_search: String,
+    /// MONKEY (EME objects): the template id being typed.
+    pub spawn_entry: String,
+    /// MONKEY (EME objects): the inspector's text buffers (x, y, z, orientation, scale).
+    pub obj_fields: [String; 5],
+    /// MONKEY (EME objects): which object / values the buffers were filled from.
+    pub obj_fields_for: Option<(u32, u64)>,
 }
 
 struct Frame<'a> {
@@ -351,6 +364,13 @@ impl EmeShell {
                 project_name: &mut self.project_name,
                 project_desc: &mut self.project_desc,
                 history_project_only: &mut self.history_project_only,
+                obj: ObjTexts {
+                    search: &mut self.obj_search,
+                    spawn_search: &mut self.spawn_search,
+                    spawn_entry: &mut self.spawn_entry,
+                    fields: &mut self.obj_fields,
+                    fields_for: &mut self.obj_fields_for,
+                },
             };
             let r = egui::SidePanel::right("eme_right")
                 .resizable(true)
@@ -543,10 +563,23 @@ fn notice_line(ui: &mut Ui, f: &mut Frame) {
 fn entry_label(f: &Frame, e: &EmeUndoEntry) -> String {
     let id = e.meta().tool.as_str();
     let key = format!("MONKEY_EME_{}_NAME", id.to_ascii_uppercase());
-    f.m.tr
+    let name = f
+        .m
+        .tr
         .try_t(&key)
         .map(str::to_owned)
-        .unwrap_or_else(|| id.to_owned())
+        .unwrap_or_else(|| id.to_owned());
+    // MONKEY (EME objects): which kind of object edit it was.
+    if let EmeUndoBackend::Object { action, .. } = e.meta().backend {
+        use eme_core::service::EmeObjectAction as A;
+        let act = match action {
+            A::Spawn => "MONKEY_EME_OBJ_ACT_SPAWN",
+            A::Move | A::Refresh => "MONKEY_EME_OBJ_ACT_MOVE",
+            A::Delete => "MONKEY_EME_OBJ_ACT_DELETE",
+        };
+        return format!("{name}: {}", f.label(act));
+    }
+    name
 }
 
 fn undo_redo_tips(f: &Frame, undo: &EmeUndoStack) -> (String, String) {
@@ -772,17 +805,37 @@ struct RightTexts<'a> {
     project_name: &'a mut String,
     project_desc: &'a mut String,
     history_project_only: &'a mut bool,
+    obj: ObjTexts<'a>,
+}
+
+/// MONKEY (EME objects): the Objects tab's text fields (borrowed from [`EmeShell`]).
+struct ObjTexts<'a> {
+    search: &'a mut String,
+    spawn_search: &'a mut String,
+    spawn_entry: &'a mut String,
+    fields: &'a mut [String; 5],
+    fields_for: &'a mut Option<(u32, u64)>,
 }
 
 fn right_panel(ui: &mut Ui, f: &mut Frame, tab: &mut EmeRightTab, x: &mut RightTexts) {
     let tr = f.m.tr;
+    // MONKEY (EME objects): the Objects tab exists only where the Objects tool does (rank and caps).
+    let objects_offered = f
+        .m
+        .tools
+        .visible(&f.m.session.perms, f.m.session.caps.as_ref())
+        .contains(&OBJ_TOOL);
     ui.horizontal_wrapped(|ui| {
         for (t, key, name) in [
             (EmeRightTab::History, "MONKEY_EME_TAB_HISTORY", "history"),
             (EmeRightTab::Restore, "MONKEY_EME_TAB_RESTORE", "restore"),
             (EmeRightTab::Log, "MONKEY_EME_TAB_LOG", "log"),
             (EmeRightTab::Projects, "MONKEY_EME_TAB_PROJECTS", "projects"),
+            (EmeRightTab::Objects, "MONKEY_EME_TAB_OBJECTS", "objects"),
         ] {
+            if t == EmeRightTab::Objects && !objects_offered {
+                continue;
+            }
             let selected = *tab == t;
             let text = if selected {
                 format!("› {}", tr.t(key))
@@ -801,6 +854,7 @@ fn right_panel(ui: &mut Ui, f: &mut Frame, tab: &mut EmeRightTab, x: &mut RightT
         EmeRightTab::Restore => restore_tab(ui, f, x.label, x.pending),
         EmeRightTab::Log => log_tab(ui, f, x.filter, x.pending),
         EmeRightTab::Projects => projects_tab(ui, f, x.project_name, x.project_desc, x.pending),
+        EmeRightTab::Objects => objects_tab(ui, f, &mut x.obj),
     }
 }
 
@@ -1614,4 +1668,332 @@ fn confirm_modal(ctx: &egui::Context, f: &mut Frame) {
             }
         });
     });
+}
+
+// ---------------------------------------------------------------------------------------------
+// MONKEY (EME objects): the Objects tab - outliner, inspector, spawn list
+// ---------------------------------------------------------------------------------------------
+
+/// The Objects tool's id (its toolbar entry; the tab activates it).
+const OBJ_TOOL: EmeToolId = EmeToolId("objects");
+
+/// Most outliner rows drawn at once.
+const OBJ_ROWS_SHOWN: usize = 300;
+/// Most spawn-list entries drawn at once.
+const OBJ_TEMPLATES_SHOWN: usize = 80;
+
+/// Whether an outliner row matches the search text (lower-cased): name, `#entry`, entry or guid.
+fn obj_row_matches(r: &eme_core::service::EmeObjectRow, q: &str) -> bool {
+    if q.is_empty() {
+        return true;
+    }
+    let q = q.trim_start_matches('#');
+    r.name.as_deref().is_some_and(|n| n.to_lowercase().contains(q))
+        || r.entry.to_string() == q
+        || r.guid.to_string() == q
+}
+
+/// A cheap signature of the numbers an object's inspector shows (to refill the text boxes only
+/// when they change).
+fn obj_row_sig(r: &eme_core::service::EmeObjectRow) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for v in [r.x, r.y, r.z, r.o, r.scale] {
+        h = (h ^ u64::from(v.to_bits())).wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+/// The inspector's text for the five fields (x, y, z, orientation in degrees, scale).
+fn obj_field_texts(r: &eme_core::service::EmeObjectRow) -> [String; 5] {
+    [
+        format!("{:.2}", r.x),
+        format!("{:.2}", r.y),
+        format!("{:.2}", r.z),
+        format!("{:.1}", r.o.to_degrees()),
+        format!("{:.2}", r.scale),
+    ]
+}
+
+fn objects_tab(ui: &mut Ui, f: &mut Frame, x: &mut ObjTexts) {
+    let m = f.m;
+    let tr = m.tr;
+    let v = m.objects;
+    if !v.active {
+        ui.label(tr.t("MONKEY_EME_OBJ_ACTIVATE"));
+        if f.button(
+            ui,
+            "obj:activate".into(),
+            tr.t("MONKEY_EME_OBJ_ACTIVATE_BTN").to_owned(),
+            true,
+            false,
+            None,
+        ) {
+            f.push(EmeUiCommand::ActivateTool(OBJ_TOOL));
+        }
+        return;
+    }
+    let can_mutate = f.can_edit && !f.needs_project;
+    let lock_tip = obj_lock_tip(f);
+    if f.needs_project {
+        ui.label(RichText::new(format!("⚠ {}", tr.t("MONKEY_EME_NEEDS_PROJECT"))).color(m.theme.warn));
+    }
+    let has_sel = !v.selected.is_empty();
+    ui.horizontal_wrapped(|ui| {
+        if f.button(ui, "obj:refresh".into(), tr.t("MONKEY_EME_OBJ_REFRESH").to_owned(), true, false, None) {
+            f.push(EmeUiCommand::Objects(EmeObjectsCmd::Refresh));
+        }
+        if f.button(ui, "obj:frame".into(), tr.t("MONKEY_EME_OBJ_FRAME").to_owned(), has_sel, false, None) {
+            f.push(EmeUiCommand::Objects(EmeObjectsCmd::Frame));
+        }
+        if f.button(
+            ui,
+            "obj:duplicate".into(),
+            tr.t("MONKEY_EME_OBJ_DUPLICATE").to_owned(),
+            can_mutate && has_sel,
+            false,
+            lock_tip.clone(),
+        ) {
+            f.push(EmeUiCommand::Objects(EmeObjectsCmd::Duplicate));
+        }
+        if f.button(
+            ui,
+            "obj:delete".into(),
+            tr.t("MONKEY_EME_OBJ_DELETE").to_owned(),
+            can_mutate && has_sel,
+            false,
+            lock_tip.clone(),
+        ) {
+            f.push(EmeUiCommand::Objects(EmeObjectsCmd::Delete));
+        }
+    });
+    ui.label(RichText::new(tr.t("MONKEY_EME_OBJ_HOTKEYS")).small().weak());
+    if v.pending > 0 {
+        ui.label(
+            RichText::new(tr.f("MONKEY_EME_OBJ_PENDING", &[&v.pending.to_string()])).color(m.theme.warn),
+        );
+    }
+    ui.separator();
+
+    // Outliner.
+    ui.horizontal(|ui| {
+        ui.label(tr.t("MONKEY_EME_OBJ_SEARCH"));
+        let r = ui.add(egui::TextEdit::singleline(x.search).desired_width(150.0));
+        f.rec("obj:search".into(), &r, true, None);
+    });
+    let q = x.search.trim().to_lowercase();
+    let shown: Vec<&eme_core::service::EmeObjectRow> =
+        v.rows.iter().filter(|r| obj_row_matches(r, &q)).collect();
+    let ctrl = ui.input(|i| i.modifiers.ctrl);
+    if v.rows.is_empty() {
+        ui.label(if v.loading {
+            tr.t("MONKEY_EME_OBJ_LOADING")
+        } else {
+            tr.t("MONKEY_EME_OBJ_EMPTY")
+        });
+    } else if shown.is_empty() {
+        ui.label(tr.t("MONKEY_EME_OBJ_NO_MATCH"));
+    } else {
+        ui.label(RichText::new(tr.f("MONKEY_EME_OBJ_COUNT", &[&shown.len().to_string()])).small().weak());
+    }
+    egui::ScrollArea::vertical()
+        .id_salt("eme_obj_rows")
+        .max_height(210.0)
+        .show(ui, |ui| {
+            for r in shown.iter().take(OBJ_ROWS_SHOWN) {
+                let sel = v.selected.contains(&r.guid);
+                let name = r.name.as_deref().filter(|n| !n.is_empty()).unwrap_or("?");
+                let label = format!("{name}  #{}  ({:.0}, {:.0}, {:.0})", r.entry, r.x, r.y, r.z);
+                let resp = ui.selectable_label(sel, label);
+                f.rec(format!("obj:row:{}", r.guid), &resp, true, None);
+                if resp.clicked() {
+                    if ctrl {
+                        f.push(EmeUiCommand::Objects(EmeObjectsCmd::ToggleSelect(r.guid)));
+                    } else {
+                        f.push(EmeUiCommand::Objects(EmeObjectsCmd::Select(r.guid)));
+                        f.push(EmeUiCommand::Objects(EmeObjectsCmd::Frame));
+                    }
+                }
+            }
+        });
+    if v.truncated
+        && f.button(ui, "obj:more".into(), tr.t("MONKEY_EME_OBJ_MORE").to_owned(), true, false, None)
+    {
+        f.push(EmeUiCommand::Objects(EmeObjectsCmd::LoadMore));
+    }
+    ui.separator();
+
+    objects_inspector(ui, f, x, can_mutate, lock_tip);
+    ui.separator();
+    objects_spawn(ui, f, x);
+}
+
+/// Why object editing is locked (a rank-2 viewer, or no project yet), if it is.
+fn obj_lock_tip(f: &Frame) -> Option<String> {
+    let tr = f.m.tr;
+    if !f.can_edit {
+        Some(tr.t("MONKEY_EME_NEEDS_EDIT").to_owned())
+    } else if f.needs_project {
+        Some(tr.t("MONKEY_EME_NEEDS_PROJECT").to_owned())
+    } else {
+        None
+    }
+}
+
+fn objects_inspector(ui: &mut Ui, f: &mut Frame, x: &mut ObjTexts, can_mutate: bool, lock_tip: Option<String>) {
+    let m = f.m;
+    let tr = m.tr;
+    let v = m.objects;
+    ui.label(RichText::new(tr.t("MONKEY_EME_OBJ_INSPECTOR")).strong());
+    let Some(p) = &v.primary else {
+        ui.label(if v.primary_loading {
+            tr.t("MONKEY_EME_OBJ_LOADING")
+        } else {
+            tr.t("MONKEY_EME_OBJ_NONE_SELECTED")
+        });
+        return;
+    };
+    if v.selected.len() > 1 {
+        ui.label(tr.f("MONKEY_EME_OBJ_MULTI", &[&v.selected.len().to_string()]));
+    }
+    let owner = p
+        .owner
+        .as_ref()
+        .map(|o| o.name.clone())
+        .unwrap_or_else(|| tr.t("MONKEY_EME_OBJ_OWNER_NONE").to_owned());
+    egui::Grid::new("eme_obj_info").num_columns(2).show(ui, |ui| {
+        ui.label(tr.t("MONKEY_EME_OBJ_F_ENTRY"));
+        ui.label(p.entry.to_string());
+        ui.end_row();
+        ui.label(tr.t("MONKEY_EME_OBJ_F_NAME"));
+        ui.label(p.name.clone().unwrap_or_default());
+        ui.end_row();
+        ui.label("GUID");
+        ui.label(p.guid.to_string());
+        ui.end_row();
+        ui.label(tr.t("MONKEY_EME_OBJ_F_OWNER"));
+        ui.label(owner);
+        ui.end_row();
+    });
+    // Refill the boxes when the object or its numbers changed - never under the user's cursor.
+    let ids: [egui::Id; 5] = std::array::from_fn(|i| egui::Id::new(("eme_obj_field", i)));
+    let editing = ui.ctx().memory(|mem| ids.iter().any(|id| mem.has_focus(*id)));
+    let sig = (p.guid, obj_row_sig(p));
+    if *x.fields_for != Some(sig) && !editing {
+        *x.fields = obj_field_texts(p);
+        *x.fields_for = Some(sig);
+    }
+    let fields = [
+        ("x", "X", EmeObjField::X),
+        ("y", "Y", EmeObjField::Y),
+        ("z", "Z", EmeObjField::Z),
+        ("o", tr.t("MONKEY_EME_OBJ_F_ORIENTATION"), EmeObjField::Orientation),
+        ("s", tr.t("MONKEY_EME_OBJ_F_SCALE"), EmeObjField::Scale),
+    ];
+    for (i, (key, label, field)) in fields.iter().enumerate() {
+        ui.horizontal(|ui| {
+            ui.label(*label);
+            let r = ui.add_enabled(
+                can_mutate,
+                egui::TextEdit::singleline(&mut x.fields[i]).id(ids[i]).desired_width(80.0),
+            );
+            f.rec(format!("obj:field:{key}"), &r, can_mutate, lock_tip.clone());
+            if r.lost_focus() {
+                let enter = ui.input(|inp| inp.key_pressed(egui::Key::Enter));
+                let parsed = x.fields[i]
+                    .trim()
+                    .replace(',', ".")
+                    .parse::<f32>()
+                    .ok()
+                    .filter(|v| v.is_finite());
+                if let (true, Some(value), true) = (enter, parsed, can_mutate) {
+                    f.push(EmeUiCommand::Objects(EmeObjectsCmd::SetField { field: *field, value }));
+                }
+                // Enter applies; anything else (Tab away, a typo) puts the real number back.
+                *x.fields_for = None;
+            }
+        });
+    }
+}
+
+fn objects_spawn(ui: &mut Ui, f: &mut Frame, x: &mut ObjTexts) {
+    let m = f.m;
+    let tr = m.tr;
+    let v = m.objects;
+    let can_mutate = f.can_edit && !f.needs_project;
+    let lock_tip = obj_lock_tip(f);
+    ui.label(RichText::new(tr.t("MONKEY_EME_OBJ_SPAWN_TITLE")).strong());
+    if let Some((entry, name)) = &v.armed {
+        let shown = name.clone().unwrap_or_else(|| format!("#{entry}"));
+        ui.label(RichText::new(tr.f("MONKEY_EME_OBJ_PLACING", &[&shown])).color(m.theme.ok));
+        if f.button(
+            ui,
+            "obj:cancel_place".into(),
+            tr.t("MONKEY_EME_OBJ_PLACING_CANCEL").to_owned(),
+            true,
+            false,
+            None,
+        ) {
+            f.push(EmeUiCommand::Objects(EmeObjectsCmd::DisarmSpawn));
+        }
+    }
+    ui.horizontal(|ui| {
+        ui.label(tr.t("MONKEY_EME_OBJ_SPAWN_ENTRY"));
+        let r = ui.add_enabled(
+            can_mutate,
+            egui::TextEdit::singleline(x.spawn_entry).char_limit(9).desired_width(80.0),
+        );
+        f.rec("obj:spawn_entry".into(), &r, can_mutate, lock_tip.clone());
+        let entry = x.spawn_entry.trim().parse::<u32>().ok().filter(|e| *e > 0);
+        let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+        let go = f.button(
+            ui,
+            "obj:place".into(),
+            tr.t("MONKEY_EME_OBJ_SPAWN_PLACE").to_owned(),
+            can_mutate && entry.is_some(),
+            false,
+            lock_tip.clone(),
+        );
+        if let (true, Some(entry)) = (go || (enter && can_mutate), entry) {
+            let name = v.templates.iter().find(|(e, _)| *e == entry).map(|(_, n)| n.clone());
+            f.push(EmeUiCommand::Objects(EmeObjectsCmd::ArmSpawn { entry, name }));
+        }
+    });
+    ui.horizontal(|ui| {
+        ui.label(tr.t("MONKEY_EME_OBJ_SPAWN_SEARCH"));
+        let r = ui.add(egui::TextEdit::singleline(x.spawn_search).desired_width(120.0));
+        f.rec("obj:spawn_search".into(), &r, true, None);
+    });
+    let q = x.spawn_search.trim().to_lowercase();
+    let list: Vec<&(u32, String)> = v
+        .templates
+        .iter()
+        .filter(|(e, n)| {
+            q.is_empty() || n.to_lowercase().contains(&q) || e.to_string() == q.trim_start_matches('#')
+        })
+        .collect();
+    if v.templates.is_empty() {
+        ui.label(RichText::new(tr.t("MONKEY_EME_OBJ_SPAWN_NONE")).small().weak());
+        return;
+    }
+    egui::ScrollArea::vertical()
+        .id_salt("eme_obj_templates")
+        .max_height(150.0)
+        .show(ui, |ui| {
+            for (entry, name) in list.iter().take(OBJ_TEMPLATES_SHOWN).map(|t| (t.0, &t.1)) {
+                let armed = v.armed.as_ref().is_some_and(|(e, _)| *e == entry);
+                if f.button(
+                    ui,
+                    format!("obj:spawn:{entry}"),
+                    format!("{name}  #{entry}"),
+                    can_mutate,
+                    armed,
+                    lock_tip.clone(),
+                ) {
+                    f.push(EmeUiCommand::Objects(EmeObjectsCmd::ArmSpawn {
+                        entry,
+                        name: Some(name.clone()),
+                    }));
+                }
+            }
+        });
 }

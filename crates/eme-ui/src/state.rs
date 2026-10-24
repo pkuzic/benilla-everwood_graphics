@@ -8,8 +8,8 @@ use eme_core::service::{
     EmeLogQuery, EmeLogRow, EmeProjectInfo, EmeProjectRef, EmeProjectRow, EmeSnapshotRow,
 };
 use eme_core::{
-    EmeCaps, EmeEntryId, EmeLink, EmeOptionValue, EmePermissions, EmeServiceRequest, EmeToolId,
-    EmeToolRegistry, EmeUndoStack,
+    EmeCaps, EmeEntryId, EmeLink, EmeObjectsCmd, EmeObjectsView, EmeOptionValue, EmePermissions,
+    EmeServiceRequest, EmeToolId, EmeToolRegistry, EmeUndoStack,
 };
 
 use crate::layout::EmeRightTab;
@@ -272,4 +272,11 @@ pub enum EmeUiCommand {
     ProjectFilter(EmeProjectFilter),
     /// MONKEY (EME projects): the `others_edited` conflict was answered (force sent or cancelled).
     DismissProjectConflict,
+    /// MONKEY (EME objects): a click in the Objects tab (select, frame, delete, duplicate, place…).
+    Objects(EmeObjectsCmd),
 }
+
+/// MONKEY (EME objects): the Objects tab's data, a snapshot of the editor the host refreshes when it
+/// changes.
+#[derive(Resource, Debug, Clone, Default, PartialEq)]
+pub struct EmeObjects(pub EmeObjectsView);

@@ -29,7 +29,7 @@ pub use shell::{
     EmeLogFilterUi, EmePending, EmeProbeEntry, EmeShell, EmeShellModel, EmeShellOutput,
 };
 pub use state::{
-    EmeLogTable, EmeNotice, EmeOtherStroke, EmeOthersHistory, EmeProjectConflict,
+    EmeLogTable, EmeNotice, EmeObjects, EmeOtherStroke, EmeOthersHistory, EmeProjectConflict,
     EmeProjectFilter, EmeProjects, EmeRestorePoints, EmeSession, EmeShellSource,
     EmeStandaloneSource, EmeStatus, EmeUiCommand,
 };
@@ -64,6 +64,7 @@ impl<S: EmeShellSource> Plugin for EmeUiPlugin<S> {
             .init_resource::<EmeNotice>()
             .init_resource::<EmeOthersHistory>()
             .init_resource::<EmeProjects>()
+            .init_resource::<EmeObjects>()
             .init_resource::<EmePointerOverUi>()
             .init_resource::<EmeUiWantsKeyboard>()
             .init_resource::<EmeTheme>()
@@ -88,6 +89,7 @@ struct ShellData<'w, S: EmeShellSource> {
     notice: Res<'w, EmeNotice>,
     others: Res<'w, EmeOthersHistory>,
     projects: Res<'w, EmeProjects>,
+    objects: Res<'w, EmeObjects>,
     i18n: Res<'w, EmeI18n>,
     lang: Res<'w, EmeLanguage>,
     theme: Res<'w, EmeTheme>,
@@ -142,6 +144,7 @@ fn shell_system<S: EmeShellSource>(
         notice: &data.notice,
         others: &data.others,
         projects: &data.projects,
+        objects: &data.objects.0,
         tr: data.i18n.tr(data.lang.0),
         theme: &data.theme,
     };

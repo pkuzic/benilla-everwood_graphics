@@ -91,6 +91,7 @@ struct World {
     notice: eme_ui::EmeNotice,
     others: eme_ui::EmeOthersHistory,
     projects: eme_ui::EmeProjects,
+    objects: eme_core::EmeObjectsView,
     i18n: EmeI18n,
     theme: EmeTheme,
     lang: EmeLang,
@@ -108,6 +109,7 @@ impl World {
             notice: Default::default(),
             others: Default::default(),
             projects: Default::default(),
+            objects: Default::default(),
             i18n: EmeI18n::builtin(),
             theme: EmeTheme::default(),
             lang: EmeLang::EnUs,
@@ -132,6 +134,7 @@ impl World {
             notice: &self.notice,
             others: &self.others,
             projects: &self.projects,
+            objects: &self.objects,
             tr: self.i18n.tr(self.lang),
             theme: &self.theme,
         }
@@ -861,4 +864,241 @@ fn project_conflict_needs_rank_four_to_force() {
             assert_eq!(click(&ctx, &mut shell, &w, "project:force:no"), vec![EmeUiCommand::DismissProjectConflict]);
         }
     }
+}
+
+// ---- MONKEY (EME objects): the Objects tab -----------------------------------------------------
+
+use eme_core::service::{EmeObjectKind, EmeObjectRow, EmeOwner};
+use eme_core::{EmeObjField, EmeObjectsCmd};
+
+fn obj_row(guid: u32, entry: u32, name: &str, x: f32) -> EmeObjectRow {
+    EmeObjectRow {
+        guid,
+        kind: EmeObjectKind::Go,
+        entry,
+        name: Some(name.into()),
+        map: 0,
+        x,
+        y: 20.0,
+        z: 3.0,
+        o: std::f32::consts::FRAC_PI_2,
+        scale: 1.5,
+        owner: Some(EmeOwner {
+            guid: 7,
+            name: "Geoff".into(),
+        }),
+        tx: None,
+    }
+}
+
+/// A world whose registry has the Objects tool, with the tool active and three rows loaded.
+fn objects_world(rank: u8) -> World {
+    let mut w = World::new(rank);
+    w.tools
+        .register(Box::new(TestTool {
+            id: "objects",
+            min_rank: 2,
+            strength: 0.0,
+        }))
+        .unwrap();
+    w.session.link = EmeLink::Up { server_version: 3 };
+    w.objects.active = true;
+    w.objects.can_edit = rank >= 3;
+    w.objects.rows = vec![
+        obj_row(11, 2910, "Chair", 10.0),
+        obj_row(12, 2911, "Table", 12.0),
+        obj_row(13, 2912, "Barrel", 14.0),
+    ];
+    w
+}
+
+fn open_objects_tab(shell: &mut EmeShell) {
+    shell.layout.right_open = true;
+    shell.layout.right_tab = EmeRightTab::Objects;
+}
+
+#[test]
+fn the_objects_tab_exists_only_where_the_tool_does() {
+    let ctx = egui::Context::default();
+    // No Objects tool registered: no tab.
+    let w = World::new(3);
+    let mut shell = probing_shell();
+    assert!(!drawn(&settle(&ctx, &mut shell, &w), "tab:objects"));
+    // Rank 2 and 3 get it; rank 1 does not.
+    for (rank, tab) in [(1u8, false), (2, true), (3, true)] {
+        let w = objects_world(rank);
+        let mut shell = probing_shell();
+        assert_eq!(drawn(&settle(&ctx, &mut shell, &w), "tab:objects"), tab, "rank {rank}");
+    }
+    // The server not listing the tool hides it.
+    let mut w = objects_world(3);
+    let reply = EmeServiceReply::ok(EmeRequestId(1)).with("rank", 3).with("tools", ["sculpt"]);
+    w.session.caps = Some(EmeCaps::from_reply(&reply).unwrap());
+    let mut shell = probing_shell();
+    assert!(!drawn(&settle(&ctx, &mut shell, &w), "tab:objects"));
+}
+
+#[test]
+fn clicking_an_outliner_row_selects_it_and_frames_the_camera() {
+    let w = objects_world(3);
+    let ctx = egui::Context::default();
+    let mut shell = probing_shell();
+    open_objects_tab(&mut shell);
+    let out = settle(&ctx, &mut shell, &w);
+    for g in [11, 12, 13] {
+        assert!(drawn(&out, &format!("obj:row:{g}")));
+    }
+    let cmds = click(&ctx, &mut shell, &w, "obj:row:12");
+    assert_eq!(
+        cmds,
+        vec![
+            EmeUiCommand::Objects(EmeObjectsCmd::Select(12)),
+            EmeUiCommand::Objects(EmeObjectsCmd::Frame)
+        ]
+    );
+}
+
+#[test]
+fn the_outliner_search_filters_by_name_entry_and_guid() {
+    let w = objects_world(3);
+    let ctx = egui::Context::default();
+    let mut shell = probing_shell();
+    open_objects_tab(&mut shell);
+    for (q, rows) in [("tab", vec![12]), ("2912", vec![13]), ("#2910", vec![11]), ("13", vec![13]), ("zzz", vec![]), ("", vec![11, 12, 13])] {
+        shell.obj_search = q.into();
+        let out = settle(&ctx, &mut shell, &w);
+        let got: Vec<u32> = [11u32, 12, 13]
+            .into_iter()
+            .filter(|g| drawn(&out, &format!("obj:row:{g}")))
+            .collect();
+        assert_eq!(got, rows, "query {q:?}");
+    }
+}
+
+#[test]
+fn the_inspector_shows_the_primary_and_enter_applies_a_field() {
+    let mut w = objects_world(3);
+    w.objects.selected = vec![11, 12];
+    w.objects.primary = Some(obj_row(12, 2911, "Table", 12.0));
+    let ctx = egui::Context::default();
+    let mut shell = probing_shell();
+    open_objects_tab(&mut shell);
+    let out = settle(&ctx, &mut shell, &w);
+    for f in ["x", "y", "z", "o", "s"] {
+        assert!(entry(&out, &format!("obj:field:{f}")).enabled, "{f}");
+    }
+    // The boxes hold the primary's numbers (heading in degrees).
+    assert_eq!(shell.obj_fields[0], "12.00");
+    assert_eq!(shell.obj_fields[3], "90.0");
+    assert_eq!(shell.obj_fields[4], "1.50");
+    // Focus the X box, type, press Enter: one SetField command.
+    click(&ctx, &mut shell, &w, "obj:field:x");
+    shell.obj_fields[0] = "13,5".into();
+    let enter = egui::Event::Key {
+        key: egui::Key::Enter,
+        physical_key: Some(egui::Key::Enter),
+        pressed: true,
+        repeat: false,
+        modifiers: egui::Modifiers::NONE,
+    };
+    let o = frame(&ctx, &mut shell, &w, 5.0, vec![enter]);
+    assert_eq!(
+        o.commands,
+        vec![EmeUiCommand::Objects(EmeObjectsCmd::SetField {
+            field: EmeObjField::X,
+            value: 13.5
+        })]
+    );
+}
+
+#[test]
+fn a_viewer_and_a_projectless_editor_cannot_change_objects() {
+    let ctx = egui::Context::default();
+    // Rank 2: read-only; the buttons are off and say why.
+    let mut w = objects_world(2);
+    w.objects.selected = vec![11];
+    w.objects.primary = Some(obj_row(11, 2910, "Chair", 10.0));
+    let mut shell = probing_shell();
+    open_objects_tab(&mut shell);
+    let out = settle(&ctx, &mut shell, &w);
+    for id in ["obj:delete", "obj:duplicate", "obj:place", "obj:field:x", "obj:spawn_entry"] {
+        assert!(!entry(&out, id).enabled, "{id}");
+    }
+    assert!(entry(&out, "obj:frame").enabled && entry(&out, "obj:refresh").enabled);
+    assert!(entry(&out, "obj:delete").tooltip.as_deref().unwrap().contains('3'));
+    assert!(click(&ctx, &mut shell, &w, "obj:delete").is_empty());
+
+    // Rank 3 with projects required and none open: locked too.
+    let mut w = objects_world(3);
+    w.session.projects_required = true;
+    w.objects.selected = vec![11];
+    w.objects.primary = Some(obj_row(11, 2910, "Chair", 10.0));
+    let mut shell = probing_shell();
+    open_objects_tab(&mut shell);
+    let out = settle(&ctx, &mut shell, &w);
+    assert!(!entry(&out, "obj:delete").enabled);
+    assert!(click(&ctx, &mut shell, &w, "obj:delete").is_empty());
+    // With a project they work.
+    w.session.project = Some(eme_core::EmeProjectRef {
+        id: 1,
+        name: "p".into(),
+        status: None,
+    });
+    let mut shell = probing_shell();
+    open_objects_tab(&mut shell);
+    assert_eq!(
+        click(&ctx, &mut shell, &w, "obj:delete"),
+        vec![EmeUiCommand::Objects(EmeObjectsCmd::Delete)]
+    );
+    assert_eq!(
+        click(&ctx, &mut shell, &w, "obj:duplicate"),
+        vec![EmeUiCommand::Objects(EmeObjectsCmd::Duplicate)]
+    );
+}
+
+#[test]
+fn the_spawn_list_arms_a_template_and_the_entry_box_places_by_id() {
+    let mut w = objects_world(3);
+    w.objects.templates = vec![(2910, "Chair".into()), (2911, "Table".into())];
+    let ctx = egui::Context::default();
+    let mut shell = probing_shell();
+    open_objects_tab(&mut shell);
+    let cmds = click(&ctx, &mut shell, &w, "obj:spawn:2911");
+    assert_eq!(
+        cmds,
+        vec![EmeUiCommand::Objects(EmeObjectsCmd::ArmSpawn {
+            entry: 2911,
+            name: Some("Table".into())
+        })]
+    );
+    // The Place button needs a number.
+    let out = settle(&ctx, &mut shell, &w);
+    assert!(!entry(&out, "obj:place").enabled);
+    shell.spawn_entry = "2910".into();
+    assert_eq!(
+        click(&ctx, &mut shell, &w, "obj:place"),
+        vec![EmeUiCommand::Objects(EmeObjectsCmd::ArmSpawn {
+            entry: 2910,
+            name: Some("Chair".into())
+        })]
+    );
+    // The list filter.
+    shell.spawn_search = "tab".into();
+    let out = settle(&ctx, &mut shell, &w);
+    assert!(drawn(&out, "obj:spawn:2911") && !drawn(&out, "obj:spawn:2910"));
+}
+
+#[test]
+fn an_inactive_tool_asks_to_be_picked_and_the_button_activates_it() {
+    let mut w = objects_world(3);
+    w.objects.active = false;
+    let ctx = egui::Context::default();
+    let mut shell = probing_shell();
+    open_objects_tab(&mut shell);
+    let out = settle(&ctx, &mut shell, &w);
+    assert!(!drawn(&out, "obj:row:11"));
+    assert_eq!(
+        click(&ctx, &mut shell, &w, "obj:activate"),
+        vec![EmeUiCommand::ActivateTool(EmeToolId("objects"))]
+    );
 }

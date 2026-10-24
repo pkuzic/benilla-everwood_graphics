@@ -21,6 +21,8 @@ pub enum EmeRightTab {
     Log,
     /// MONKEY (EME projects): create / open / close / revert projects.
     Projects,
+    /// MONKEY (EME objects): the outliner, inspector and spawn list of the Objects tool.
+    Objects,
 }
 
 /// The persisted layout.
