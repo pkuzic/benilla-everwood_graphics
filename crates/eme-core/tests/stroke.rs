@@ -215,3 +215,53 @@ fn tools_share_one_stroke_id_sequence() {
     assert_eq!((wrap.next_id(), wrap.next_id()), (u16::MAX, 1));
     assert_eq!(EmeStrokeIds::starting_at(0).next_id(), 1);
 }
+
+/// MONKEY (EME, live bug 2026-10-24): a hard dig held still while the cursor ray follows the pit
+/// floor down (the centre sinks ~a radius per edit) used to cut a 64-yd shaft in 2 s. One sphere
+/// per brush position: a centre that only sank is not due again.
+#[test]
+fn a_held_hard_dig_that_sinks_into_its_own_pit_sends_once() {
+    let mut b = EmeStrokeBuilder::default();
+    let (_, first) = b.begin(0, sample(0.0, mode::DIG));
+    assert!(first.is_some());
+    let mut sent = 0;
+    let mut t = 0;
+    let mut z = 10.0;
+    while t < 2000 {
+        t += 16;
+        z -= 0.5; // the aim hits the freshly dug floor
+        let mut s = sample(0.0, mode::DIG);
+        s.pos[2] = z;
+        if b.update(t, s).is_some() {
+            sent += 1;
+        }
+    }
+    assert_eq!(sent, 0, "no repeat in place");
+}
+
+/// Dragging a hard dig across its own pit never reaches deeper than one radius below the stroke's
+/// first centre (build: higher).
+#[test]
+fn a_hard_stroke_is_capped_at_one_radius_from_its_start() {
+    for (m, sign) in [(mode::DIG, -1.0f32), (mode::BUILD, 1.0)] {
+        let mut b = EmeStrokeBuilder::default();
+        b.begin(0, sample(0.0, m));
+        let mut extreme = 10.0f32;
+        let mut t = 0;
+        for i in 1..40 {
+            t += 130;
+            let mut s = sample(i as f32 * 2.5, m);
+            s.pos[2] = 10.0 + sign * 3.0 * i as f32; // the aim chases the ground it just changed
+            if let Some(e) = b.update(t, s) {
+                extreme = if sign < 0.0 { extreme.min(e.pos[2]) } else { extreme.max(e.pos[2]) };
+            }
+        }
+        assert!((extreme - (10.0 + sign * 4.0)).abs() < 1e-4, "mode {m}: {extreme}");
+    }
+    // Soft brushes and smooth are not capped (they move the ground by small steps).
+    let mut b = EmeStrokeBuilder::default();
+    b.begin(0, sample(0.0, mode::SMOOTH));
+    let mut s = sample(10.0, mode::SMOOTH);
+    s.pos[2] = -50.0;
+    assert_eq!(b.update(200, s).unwrap().pos[2], -50.0);
+}

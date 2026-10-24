@@ -10,6 +10,13 @@
 //! does not resend the same sphere every 125 ms — the result would be identical and every resend
 //! is a server row. Smooth / flatten / roughen keep the time trigger (holding them still keeps
 //! working the ground).
+//!
+//! MONKEY (EME, live bug 2026-10-24): a HARD dig held still for ~2 s cut a ~64-yd shaft — the
+//! cursor ray hits the floor of the pit just dug, so the "centre" sinks by about a radius every
+//! edit and the movement trigger fires again and again. Hard dig / build therefore (a) measure the
+//! brush's movement in the ground plane only (one sphere per brush POSITION: a centre that only
+//! sank into its own pit is not a new position), and (b) never reach deeper (dig) / higher
+//! (build) than [`EmeStrokeConfig::hard_depth_radii`] radii from where the stroke started.
 
 use crate::transport::{mode, EmeVoxelEdit};
 use std::collections::VecDeque;
@@ -27,6 +34,9 @@ pub struct EmeStrokeConfig {
     pub stationary_fraction: f32,
     /// Split into a new stroke after this many edits (host policy; the contract sets no cap).
     pub max_edits: Option<u32>,
+    /// MONKEY (EME): a hard dig (build) stroke reaches at most this many brush radii below (above)
+    /// its first centre, so holding the brush cannot drill a shaft (see the module docs).
+    pub hard_depth_radii: f32,
 }
 
 impl Default for EmeStrokeConfig {
@@ -36,6 +46,7 @@ impl Default for EmeStrokeConfig {
             move_fraction: 0.5,
             stationary_fraction: 0.05,
             max_edits: None,
+            hard_depth_radii: 1.0,
         }
     }
 }
@@ -74,6 +85,8 @@ struct Active {
     edits: u32,
     last_sent: Option<EmeBrushSample>,
     pending: Option<EmeBrushSample>,
+    /// The first centre's height (the hard-brush depth cap's origin).
+    start_z: f32,
 }
 
 /// The character's stroke-id counter, shared by every tool that opens strokes (voxel brushes and
@@ -218,6 +231,19 @@ impl EmeStrokeBuilder {
         }
     }
 
+    /// MONKEY (EME): a hard dig / build sample with its centre held inside the stroke's depth cap.
+    fn capped(&self, start_z: f32, mut s: EmeBrushSample) -> EmeBrushSample {
+        if mode::is_idempotent_edit(s.mode, s.param) {
+            let reach = self.config.hard_depth_radii.max(0.0) * s.radius;
+            if s.mode == mode::DIG {
+                s.pos[2] = s.pos[2].max(start_z - reach);
+            } else if s.mode == mode::BUILD {
+                s.pos[2] = s.pos[2].min(start_z + reach);
+            }
+        }
+        s
+    }
+
     /// Whether `s` is worth sending given the last sent sample of its stroke.
     fn due(&self, last: Option<&EmeBrushSample>, s: &EmeBrushSample) -> bool {
         let Some(last) = last else { return true };
@@ -229,13 +255,20 @@ impl EmeStrokeBuilder {
         {
             return true;
         }
-        let d = dist(last.pos, s.pos);
+        let hard = mode::is_idempotent_edit(s.mode, s.param);
+        // A hard sphere is placed per brush POSITION on the ground plane: the centre sinking into
+        // the pit it just dug (or rising onto the lump it just built) is not a new position.
+        let d = if hard {
+            ((last.pos[0] - s.pos[0]).powi(2) + (last.pos[1] - s.pos[1]).powi(2)).sqrt()
+        } else {
+            dist(last.pos, s.pos)
+        };
         let r = s.radius.max(f32::EPSILON);
         if d >= self.config.move_fraction * r {
             return true;
         }
         // The time trigger (≥ min interval, already required by the rate check).
-        !(mode::is_idempotent_edit(s.mode, s.param) && d < self.config.stationary_fraction * r)
+        !(hard && d < self.config.stationary_fraction * r)
     }
 
     /// Try to send the trailing release edit of an ended stroke.
@@ -258,6 +291,7 @@ impl EmeStrokeBuilder {
             edits: 0,
             last_sent: None,
             pending: Some(sample),
+            start_z: sample.pos[2],
         });
         let edit = self.tick(now_ms);
         (stroke, edit)
@@ -265,8 +299,9 @@ impl EmeStrokeBuilder {
 
     /// Hold: a new frame's sample. Returns an edit to send, if one is due and allowed.
     pub fn update(&mut self, now_ms: u64, sample: EmeBrushSample) -> Option<EmeVoxelEdit> {
-        if let Some(a) = self.active.as_mut() {
-            a.pending = Some(sample);
+        if let Some(start_z) = self.active.as_ref().map(|a| a.start_z) {
+            let s = self.capped(start_z, sample);
+            self.active.as_mut().expect("active").pending = Some(s);
         } else {
             return self.flush_trailing(now_ms);
         }
@@ -309,6 +344,8 @@ impl EmeStrokeBuilder {
     /// limited, or dropped if it adds nothing.
     pub fn end(&mut self, now_ms: u64, sample: Option<EmeBrushSample>) -> Option<EmeStrokeEnd> {
         if let Some(s) = sample {
+            let start_z = self.active.as_ref()?.start_z;
+            let s = self.capped(start_z, s);
             self.active.as_mut()?.pending = Some(s);
         }
         let edit = self.tick(now_ms);
