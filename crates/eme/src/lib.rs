@@ -13,7 +13,7 @@
 //! | [`dispatch`] | the frame loop: pump → tool → dispatcher → `MonkeyVoxelApi::submit`; F9 / undo / redo |
 //! | [`offline`] | an emulated server for offline runs (local-only undo) |
 //! | [`script`] | `WOW_EME_SCRIPT=<json>`: drives the same code paths headlessly (capture mode) |
-//! | [`tools`] | the built-in tools (`sculpt`: dig / build / smooth; `flatten`; `water`; `area`) |
+//! | [`tools`] | the built-in tools (`sculpt`: dig / build / smooth; `flatten`; `pushpull`; `bridge`; `water`; `waterfill`; `area`) |
 //! | [`areas`] | the area picker's catalog: the current map's `AreaTable` names |
 //! | [`ui`] | the `eme-ui` shell fed from [`EmeHost`] (toolbar, options, history, restore, log, status) |
 //!
@@ -179,8 +179,12 @@ impl Plugin for EmePlugin {
         let ids = app.world().resource::<EmeHost>().stroke_ids.clone();
         app.register_eme_tool(tools::sculpt::EmeSculptTool::new(ids.clone()));
         app.register_eme_tool(tools::flatten::EmeFlattenTool::new(ids.clone()));
+        // MONKEY (EME, CONTRACT v3.6, Planet-Zoo terraforming): sideways growth, bridges / tunnels.
+        app.register_eme_tool(tools::pushpull::EmePushPullTool::new(ids.clone()));
+        app.register_eme_tool(tools::bridge::EmeBridgeTool::new(ids.clone()));
         // MONKEY (EME, Phase 3 lanes K + L): the overlay tools.
         app.register_eme_tool(tools::water::EmeWaterTool::new(ids.clone()));
+        app.register_eme_tool(tools::waterfill::EmeWaterFillTool::new(ids.clone()));
         let catalog = tools::area::EmeAreaCatalog::default();
         app.insert_resource(areas::EmeAreas(catalog.clone()));
         app.register_eme_tool(tools::area::EmeAreaTool::new(ids, catalog));

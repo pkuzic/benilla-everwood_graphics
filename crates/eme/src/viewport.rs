@@ -68,6 +68,11 @@ pub struct EmeBrushPreviewState {
     pub active_chunks: usize,
     /// Ring colour (by mode).
     pub color: [f32; 4],
+    /// MONKEY (EME v3.6): extra line segments (WoW yards): a bridge / tunnel path, a push / pull
+    /// offset, water-fill cells.
+    pub lines: Vec<[[f32; 3]; 2]>,
+    /// MONKEY (EME v3.6): the ring is the active tool's cube shape (a square rim).
+    pub square: bool,
 }
 
 /// The ground outline of the selected restore point's radius (cached; refreshed twice a second).
@@ -257,18 +262,83 @@ pub(crate) fn update_cursor_and_aim(
     aim.hit = api.aim(origin, dir, AIM_REACH);
 }
 
+/// A horizontal circle (or the cube's square) at `c`, as closed line segments.
+fn rim_lines(c: [f32; 3], radius: f32, square: bool, out: &mut Vec<[[f32; 3]; 2]>) {
+    let pts: Vec<[f32; 3]> = if square {
+        [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)]
+            .iter()
+            .map(|(a, b)| [c[0] + a * radius, c[1] + b * radius, c[2]])
+            .collect()
+    } else {
+        (0..32)
+            .map(|i| {
+                let a = i as f32 / 32.0 * std::f32::consts::TAU;
+                [c[0] + radius * a.cos(), c[1] + radius * a.sin(), c[2]]
+            })
+            .collect()
+    };
+    for i in 0..pts.len() {
+        out.push([pts[i], pts[(i + 1) % pts.len()]]);
+    }
+}
+
 /// Resolve the active tool's preview against the world and draw it.
 pub(crate) fn resolve_preview(
     preview: Option<EmePreview>,
     mode: u8,
+    shape: u8,
     hit: Option<&MonkeyVoxelHit>,
     api: &MonkeyVoxelApi,
     out: &mut EmeBrushPreviewState,
 ) {
     *out = EmeBrushPreviewState::default();
+    let square = shape == eme_core::transport::mode::SHAPE_CUBE;
     let (center, radius, plane) = match preview {
         Some(EmePreview::Ring { center, radius, .. }) => (center, radius, false),
         Some(EmePreview::Plane { center, radius }) => (center, radius, true),
+        // MONKEY (EME v3.6): a path (bridge / tunnel / push-pull offset): the centre line, the
+        // cross-section at both ends, a ring on the surface at the first point.
+        Some(EmePreview::Path { points, radius, mode }) => {
+            let Some(&first) = points.first() else { return };
+            let last = *points.last().expect("non-empty");
+            for w in points.windows(2) {
+                out.lines.push([w[0], w[1]]);
+            }
+            rim_lines(first, radius, square, &mut out.lines);
+            if points.len() > 1 {
+                rim_lines(last, radius, square, &mut out.lines);
+                // Posts at the ends (how high the deck / tunnel sits).
+                for p in [first, last] {
+                    out.lines.push([[p[0], p[1], p[2] - radius], [p[0], p[1], p[2] + radius]]);
+                }
+            }
+            out.visible = true;
+            out.center = first;
+            out.radius = radius;
+            out.normal = hit.map_or([0.0, 0.0, 1.0], |h| h.normal);
+            out.color = mode_color(mode);
+            out.square = square;
+            return;
+        }
+        // MONKEY (EME v3.6): water-fill cells as squares at the level.
+        Some(EmePreview::Cells { cells, level, .. }) => {
+            let cell = crate::tools::water::LIQ_CELL;
+            let z = level.unwrap_or(hit.map_or(0.0, |h| h.pos[2])) + 0.05;
+            for (cx, cy) in cells.iter().take(4096) {
+                let (x0, y0) = (*cx as f32 * cell, *cy as f32 * cell);
+                let (x1, y1) = (x0 + cell, y0 + cell);
+                out.lines.push([[x0, y0, z], [x1, y0, z]]);
+                out.lines.push([[x1, y0, z], [x1, y1, z]]);
+                out.lines.push([[x1, y1, z], [x0, y1, z]]);
+                out.lines.push([[x0, y1, z], [x0, y0, z]]);
+            }
+            out.visible = !out.lines.is_empty();
+            if let Some(&(cx, cy)) = cells.first() {
+                out.center = [(cx as f32 + 0.5) * cell, (cy as f32 + 0.5) * cell, z];
+            }
+            out.color = [0.2, 0.55, 1.0, 1.0];
+            return;
+        }
         _ => return,
     };
     let p = api.brush_preview(center, radius, RING_SEGMENTS);
@@ -285,9 +355,29 @@ pub(crate) fn resolve_preview(
                 ]
             })
             .collect()
+    } else if square {
+        // MONKEY (EME v3.6): the cube's square rim, projected onto the surface.
+        let reach = radius.max(2.0) + 2.0;
+        let per_side = RING_SEGMENTS / 4;
+        let corners = [(-1.0f32, -1.0f32), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)];
+        (0..4)
+            .flat_map(|s| {
+                let (a, b) = (corners[s], corners[(s + 1) % 4]);
+                (0..per_side).map(move |i| {
+                    let t = i as f32 / per_side as f32;
+                    (a.0 + (b.0 - a.0) * t, a.1 + (b.1 - a.1) * t)
+                })
+            })
+            .map(|(u, v)| {
+                let (x, y) = (center[0] + u * radius, center[1] + v * radius);
+                let z = api.surface_z(x, y, center[2], reach).unwrap_or(center[2]);
+                [x, y, z]
+            })
+            .collect()
     } else {
         p.ring
     };
+    out.square = square;
     out.center = center;
     out.radius = radius;
     out.normal = hit.map_or([0.0, 0.0, 1.0], |h| h.normal);
@@ -295,6 +385,20 @@ pub(crate) fn resolve_preview(
     out.chunks = p.chunks.len();
     out.active_chunks = p.active;
     out.color = mode_color(mode);
+}
+
+/// MONKEY (EME v3.6): the active tool's `shape` option (`mode::SHAPE_*`; 0 = sphere / none).
+pub(crate) fn active_shape(host: &EmeHost) -> u8 {
+    host.registry
+        .active_id()
+        .and_then(|id| host.registry.get(id.as_str()))
+        .and_then(|t| {
+            t.options_ui_model().into_iter().find_map(|f| match (f.key, f.value, f.disabled) {
+                ("shape", EmeOptionValue::Choice(i), false) => Some(i as u8),
+                _ => None,
+            })
+        })
+        .unwrap_or(0)
 }
 
 /// The active tool's `mode` option (the ring colour), if it has one.
@@ -365,6 +469,13 @@ fn draw_preview(
         })
         .collect();
     gizmos.linestrip(inner, dim);
+    // MONKEY (EME v3.6): a path / cells preview is just its lines.
+    for l in &state.lines {
+        gizmos.line(lift(l[0], 0.1), lift(l[1], 0.1), color);
+    }
+    if state.ring.is_empty() {
+        return;
+    }
     let n = state.normal;
     let c0 = lift(state.center, 0.05);
     let tip = wow_to_bevy([

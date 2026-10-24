@@ -642,11 +642,25 @@ mod tests {
             .unwrap();
         let ids = eme_core::EmeStrokeIds::default();
         let sculpt = crate::tools::sculpt::EmeSculptTool::new(ids.clone());
-        let flatten = crate::tools::flatten::EmeFlattenTool::new(ids);
-        let mut keys: Vec<String> = Vec::new();
+        let flatten = crate::tools::flatten::EmeFlattenTool::new(ids.clone());
+        let pushpull = crate::tools::pushpull::EmePushPullTool::new(ids.clone());
+        let bridge = crate::tools::bridge::EmeBridgeTool::new(ids.clone());
+        let waterfill = crate::tools::waterfill::EmeWaterFillTool::new(ids);
+        // MONKEY (EME v3.6): the new tools' notices.
+        let mut keys: Vec<String> = [
+            "BRIDGE_PICK_B", "BRIDGE_READY", "BRIDGE_SENDING", "BRIDGE_TOO_LONG", "BRIDGE_TOO_MANY",
+            "BRIDGE_CANCELLED", "WATERFILL_PREVIEW", "WATERFILL_OPEN", "WATERFILL_TOO_BIG",
+            "WATERFILL_SHALLOW", "WATERFILL_NO_GROUND", "WATERFILL_DONE", "WATERFILL_CANCELLED",
+        ]
+        .iter()
+        .map(|k| format!("MONKEY_EME_{k}"))
+        .collect();
         for tool in [
             &sculpt as &dyn eme_core::EmeTool,
             &flatten as &dyn eme_core::EmeTool,
+            &pushpull as &dyn eme_core::EmeTool,
+            &bridge as &dyn eme_core::EmeTool,
+            &waterfill as &dyn eme_core::EmeTool,
         ] {
             for f in tool.options_ui_model() {
                 keys.push(f.label.clone());

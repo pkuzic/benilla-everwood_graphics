@@ -78,6 +78,33 @@ pub mod mode {
         SOFT | f as u16 | (h as u16) << 2
     }
 
+    /// CONTRACT v3.6: brush shape in `param` bits 9-10 (modes 0 / 1, hard and soft): a sphere
+    /// (every earlier edit) …
+    pub const SHAPE_SPHERE: u8 = 0;
+    /// … an axis-aligned cube (half-size = radius) …
+    pub const SHAPE_CUBE: u8 = 1;
+    /// … or a vertical cylinder (radius across, half-height = radius). 3 = reserved (a sphere).
+    pub const SHAPE_CYLINDER: u8 = 2;
+
+    /// `param` with its shape bits (9-10) set to `shape` (> 2 = sphere).
+    pub const fn with_shape(param: u16, shape: u8) -> u16 {
+        let s = if shape > 2 { 0 } else { shape as u16 };
+        (param & !(0x3 << 9)) | s << 9
+    }
+
+    /// The shape of `(mode, param)` (a sphere for every mode but dig / build, and for shape 3).
+    pub const fn shape_of(mode: u8, param: u16) -> u8 {
+        if !matches!(mode, DIG | BUILD) {
+            return SHAPE_SPHERE;
+        }
+        let s = ((param >> 9) & 0x3) as u8;
+        if s > 2 {
+            SHAPE_SPHERE
+        } else {
+            s
+        }
+    }
+
     /// [`is_idempotent`] for a whole edit: a soft dig / build accumulates (holding it still keeps
     /// raising / lowering), so it keeps the stroke builder's time trigger.
     pub const fn is_idempotent_edit(mode: u8, param: u16) -> bool {

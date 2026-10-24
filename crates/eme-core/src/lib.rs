@@ -51,8 +51,8 @@ pub use service::{
 };
 pub use stroke::{EmeBrushSample, EmeStrokeBuilder, EmeStrokeConfig, EmeStrokeEnd, EmeStrokeIds};
 pub use tool::{
-    EmeInputCtx, EmeOptionField, EmeOptionKind, EmeOptionValue, EmeOptions, EmePreview, EmeTool,
-    EmeToolId, EmeToolRegistry,
+    EmeInputCtx, EmeOptionField, EmeOptionKind, EmeOptionValue, EmeOptions, EmePreview, EmeTerrain,
+    EmeTool, EmeToolId, EmeToolNotice, EmeToolRegistry,
 };
 pub use transport::{
     EmeInbound, EmeLink, EmeLoopbackTransport, EmeRequestIdAlloc, EmeRejectReason, EmeTransport, EmeVoxelEdit,

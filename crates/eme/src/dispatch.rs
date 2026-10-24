@@ -13,7 +13,9 @@
 use bevy::prelude::*;
 
 use crate::camera::EmeFreeCam;
-use crate::viewport::{active_mode, resolve_preview, EmeAim, EmeBrushPreviewState, EmeCursor};
+use crate::viewport::{
+    active_mode, active_shape, resolve_preview, EmeAim, EmeBrushPreviewState, EmeCursor,
+};
 use crate::{
     now_ms, EmeActive, EmeEventMsg, EmeHost, EmeHostInput, EmePointerOverUi, EmeRequest, EmeSet,
     EmeToggleRequested, EmeUiWantsKeyboard, EmeWire,
@@ -33,7 +35,9 @@ const VIEW_MOVE_YD: f32 = 40.0;
 const VIEW_MIN_GAP_MS: u64 = 1_000;
 
 pub(crate) fn register(app: &mut App) {
-    app.init_resource::<EmeViewAnchor>().add_systems(
+    app.init_resource::<EmeViewAnchor>()
+        .init_resource::<EmeVirtualKeys>()
+        .add_systems(
         Update,
         (
             collect_voxel_events,
@@ -289,6 +293,7 @@ fn frame(
     mut preview: ResMut<EmeBrushPreviewState>,
     mut anchor: ResMut<EmeViewAnchor>,
     mut prev_primary: Local<bool>,
+    mut virtual_keys: ResMut<EmeVirtualKeys>,
 ) {
     let (host_input, over_ui, ui_keyboard, cursor, aim, free_cam) = ui;
     let now = now_ms(&time);
@@ -381,6 +386,17 @@ fn frame(
         bevy::input::mouse::MouseScrollUnit::Pixel => s.delta.y / 100.0,
     });
     let map = api.map().unwrap_or(0);
+    // MONKEY (EME v3.6 tools): Esc cancels a pending pick / preview, Enter confirms it (a script's
+    // `key` op sets the same one-shot flags).
+    let key_down = |code: KeyCode| !typing && keys.as_ref().is_some_and(|k| k.just_pressed(code));
+    let cancel = key_down(KeyCode::Escape) || std::mem::take(&mut virtual_keys.cancel);
+    let confirm = key_down(KeyCode::Enter)
+        || key_down(KeyCode::NumpadEnter)
+        || std::mem::take(&mut virtual_keys.confirm);
+    let view_dir = aim.ray.and_then(|(_, d)| {
+        let l = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+        (l > 1.0e-6).then(|| [d[0] / l, d[1] / l, d[2] / l])
+    });
     let ctx = EmeInputCtx {
         now_ms: now,
         map,
@@ -399,9 +415,20 @@ fn frame(
         wheel,
         pointer_over_ui,
         perms,
+        view_dir,
+        cancel,
+        confirm,
     };
     let mut sink = EmeCommandSink::new();
-    host.registry.feed(&ctx, host.dispatcher.caps(), &mut sink);
+    host.registry.feed_with_terrain(
+        &ctx,
+        host.dispatcher.caps(),
+        Some(&ApiTerrain(&api)),
+        &mut sink,
+    );
+    for (_, n) in host.registry.take_notices() {
+        host.notices.push((n.key, n.args, n.error));
+    }
     if !sink.is_empty() {
         host.errors = host.dispatcher.dispatch(now, &mut *wire, &mut sink);
         for e in &host.errors {
@@ -419,6 +446,7 @@ fn frame(
     resolve_preview(
         tool_preview,
         active_mode(host),
+        active_shape(host),
         aim.hit.as_ref(),
         &api,
         &mut preview,
@@ -444,6 +472,24 @@ fn frame(
                 anchor.sent_ms = now;
             }
         }
+    }
+}
+
+/// MONKEY (EME v3.6 tools): one-shot Esc / Enter presses from a script (`{"op":"key"}`).
+#[derive(Resource, Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct EmeVirtualKeys {
+    /// Esc this frame.
+    pub cancel: bool,
+    /// Enter this frame.
+    pub confirm: bool,
+}
+
+/// The voxel seam as the tools' terrain query (the voxel surface where edited, else the ADT).
+struct ApiTerrain<'a, 'w>(&'a MonkeyVoxelApi<'w>);
+
+impl eme_core::EmeTerrain for ApiTerrain<'_, '_> {
+    fn ground_z(&self, x: f32, y: f32, near_z: f32, reach: f32) -> Option<f32> {
+        self.0.surface_z(x, y, near_z, reach)
     }
 }
 

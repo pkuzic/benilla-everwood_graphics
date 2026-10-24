@@ -86,6 +86,13 @@ pub struct EmeInputCtx {
     pub pointer_over_ui: bool,
     /// The caller's permissions.
     pub perms: EmePermissions,
+    /// MONKEY (EME v3.6 tools): the camera's view direction through the cursor (WoW axes, unit),
+    /// `None` when unknown (push / pull's "along the view" option).
+    pub view_dir: Option<[f32; 3]>,
+    /// MONKEY (EME v3.6 tools): Esc went down this frame (cancel a pending pick / preview).
+    pub cancel: bool,
+    /// MONKEY (EME v3.6 tools): Enter went down this frame (confirm a pending preview).
+    pub confirm: bool,
 }
 
 impl EmeInputCtx {
@@ -101,6 +108,9 @@ impl EmeInputCtx {
             wheel: 0.0,
             pointer_over_ui: false,
             perms,
+            view_dir: None,
+            cancel: false,
+            confirm: false,
         }
     }
 }
@@ -186,6 +196,16 @@ pub enum EmePreview {
         /// Points, WoW yards.
         points: Vec<[f32; 3]>,
     },
+    /// MONKEY (EME v3.6): a picked path (bridge / tunnel): the centre line through `points` with
+    /// the brush cross-section `radius` drawn at both ends.
+    Path {
+        /// Line points, WoW yards (at least the start).
+        points: Vec<[f32; 3]>,
+        /// Cross-section radius, yards.
+        radius: f32,
+        /// Voxel mode (colour): 0 dig (tunnel), 1 build (bridge).
+        mode: u8,
+    },
     /// Overlay cells to tint.
     Cells {
         /// Layer.
@@ -197,10 +217,43 @@ pub enum EmePreview {
     },
 }
 
+/// MONKEY (EME v3.6): read-only terrain queries the host answers for tools that analyse the
+/// ground (water fill). Engine-free: benilla implements it over the voxel seam.
+pub trait EmeTerrain {
+    /// The ground height (voxel surface where edited, else the ADT ground) over `(x, y)` nearest
+    /// `near_z`, probed downward from `near_z + reach` over `2 * reach`; `None` = no ground there
+    /// (not resident, or a hole).
+    fn ground_z(&self, x: f32, y: f32, near_z: f32, reach: f32) -> Option<f32>;
+}
+
+/// MONKEY (EME v3.6): a message a tool wants on the UI's notice line (locale key + args).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmeToolNotice {
+    /// Locale key (`MONKEY_EME_*`).
+    pub key: String,
+    /// `{0}`, `{1}`, … arguments.
+    pub args: Vec<String>,
+    /// Shown as an error (red, longer).
+    pub error: bool,
+}
+
 /// One EME tool. Implement this in one file and register it; tools never reference each other.
 pub trait EmeTool: Send + Sync + 'static {
     /// Stable id.
     fn id(&self) -> EmeToolId;
+    /// MONKEY (EME v3.6): the server's name for the capability this tool uses (`caps.tools`): a
+    /// client-side tool built on another tool's wire (push / pull and bridge send sculpt edits,
+    /// water fill sends water cells) is offered whenever that one is. Default: [`Self::id`].
+    fn server_tool(&self) -> EmeToolId {
+        self.id()
+    }
+    /// MONKEY (EME v3.6): called on the ACTIVE tool every frame before [`Self::on_input`] with the
+    /// host's terrain queries (default: unused).
+    fn on_terrain(&mut self, _ctx: &EmeInputCtx, _terrain: &dyn EmeTerrain) {}
+    /// MONKEY (EME v3.6): a notice for the UI, drained once per frame (default: none).
+    fn take_notice(&mut self) -> Option<EmeToolNotice> {
+        None
+    }
     /// Lowest rank that may use the tool: 3 for every mutating tool, 2 for read-only ones.
     fn min_rank(&self) -> u8;
     /// Handle one frame of input; emit commands into `out`.
@@ -312,7 +365,8 @@ impl EmeToolRegistry {
         perms: &EmePermissions,
         caps: Option<&EmeCaps>,
     ) -> bool {
-        perms.allows_rank(tool.min_rank()) && caps.is_none_or(|c| c.offers_tool(tool.id().as_str()))
+        perms.allows_rank(tool.min_rank())
+            && caps.is_none_or(|c| c.offers_tool(tool.server_tool().as_str()))
     }
 
     /// The toolbar: usable tools in registration order.
@@ -375,16 +429,42 @@ impl EmeToolRegistry {
         caps: Option<&EmeCaps>,
         out: &mut EmeCommandSink,
     ) -> bool {
+        self.feed_with_terrain(ctx, caps, None, out)
+    }
+
+    /// MONKEY (EME v3.6): [`Self::feed`] with the host's terrain queries
+    /// ([`EmeTool::on_terrain`] runs first).
+    pub fn feed_with_terrain(
+        &mut self,
+        ctx: &EmeInputCtx,
+        caps: Option<&EmeCaps>,
+        terrain: Option<&dyn EmeTerrain>,
+        out: &mut EmeCommandSink,
+    ) -> bool {
         let Some(i) = self.active else { return false };
         if !Self::is_permitted(self.tools[i].as_ref(), &ctx.perms, caps) {
             self.deactivate(out);
             return false;
+        }
+        if let Some(t) = terrain {
+            self.tools[i].on_terrain(ctx, t);
         }
         let before = out.len();
         self.tools[i].on_input(ctx, out);
         let id = self.tools[i].id();
         out.stamp_origin(before, id);
         true
+    }
+
+    /// MONKEY (EME v3.6): the notices every tool queued (drained).
+    pub fn take_notices(&mut self) -> Vec<(EmeToolId, EmeToolNotice)> {
+        let mut out = Vec::new();
+        for t in &mut self.tools {
+            while let Some(n) = t.take_notice() {
+                out.push((t.id(), n));
+            }
+        }
+        out
     }
 
     /// Emit a raw command on behalf of tool `id` (e.g. a panel button).

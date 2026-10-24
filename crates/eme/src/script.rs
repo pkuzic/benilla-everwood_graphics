@@ -21,6 +21,7 @@
 //! ]}
 //! ```
 //! Other ops: `tool {id}`, `option {key, value}`, `redo`, `log {msg}`, `wait_active`,
+//! [v3.6] `click {x, y}` (one LMB click), `key {name: esc|enter}`,
 //! `tab {name: history|restore|log|projects}` / `panels {left, right}` (the shell's side panels),
 //! [EME projects] `wait_project {none?}`, `project_open_named {name}`, `project_revert {name?}`,
 //! `wait_conflict`, `project_force {cancel?}` (create / leave / close via `svc`),
@@ -159,9 +160,10 @@ fn run_script(
     mut commands: Commands,
     mut exit: MessageWriter<AppExit>,
     api: MonkeyVoxelApi,
-    (mut shell, mut ui_cmds): (
+    (mut shell, mut ui_cmds, mut vkeys): (
         ResMut<eme_ui::EmeShell>,
         MessageWriter<eme_ui::EmeUiCommand>,
+        ResMut<crate::dispatch::EmeVirtualKeys>,
     ),
     (restore, log_table, others, notice, wire, projects): (
         Res<eme_ui::EmeRestorePoints>,
@@ -244,7 +246,12 @@ fn run_script(
         }
         "option" => {
             if let (Some(k), Some(v)) = (step.get("key").and_then(Json::as_str), step.get("value")) {
-                let value = if k == "mode" { mode_value(v) } else { option_value(v) };
+                // `mode` takes dig / build / smooth (sculpt) or a tool's own word / number.
+                let value = if k == "mode" {
+                    mode_value(v).or_else(|| option_value(v))
+                } else {
+                    option_value(v)
+                };
                 if let Some(value) = value {
                     requests.write(EmeRequest::SetOption {
                         key: k.to_owned(),
@@ -305,6 +312,28 @@ fn run_script(
         "undo" => {
             requests.write(EmeRequest::Undo);
         }
+        // MONKEY (EME v3.6): one click (hover a frame, press ~0.1 s, release) at viewport fractions.
+        "click" => {
+            cursor.virtual_norm = Some(Vec2::new(
+                num(&step, "x").unwrap_or(0.5),
+                num(&step, "y").unwrap_or(0.5),
+            ));
+            if first {
+                cursor.virtual_primary = false;
+                done = false;
+            } else if t < 0.1 {
+                cursor.virtual_primary = true;
+                done = false;
+            } else {
+                cursor.virtual_primary = false;
+            }
+        }
+        // MONKEY (EME v3.6): `{"op":"key","name":"esc"|"enter"}` = Esc / Enter for the tools.
+        "key" => match step.get("name").and_then(Json::as_str).unwrap_or("") {
+            "esc" | "escape" => vkeys.cancel = true,
+            "enter" | "return" => vkeys.confirm = true,
+            other => warn!("EME script: key {other:?} unknown (esc / enter)"),
+        },
         "wait_caps" => {
             done = host.dispatcher.caps().is_some() || t > max_s;
             if t > max_s {

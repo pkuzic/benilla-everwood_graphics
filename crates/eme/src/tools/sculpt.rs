@@ -14,7 +14,10 @@
 //! Flatten (mode 3, the `flatten` tool) samples its plane at the press: every edit of the stroke carries
 //! `param = (plane − z) · 100` (cm, i16), so the whole stroke levels toward the clicked height.
 //!
-//! Options: `mode` (choice lower / raise / smooth; sculpt only), `radius` (0.5–16 yd), `strength`
+//! MONKEY (EME, CONTRACT v3.6): `shape` = sphere / cube / vertical cylinder (lower / raise, hard
+//! and soft: `param` bits 9-10; smooth is always a sphere).
+//!
+//! Options: `mode` (choice lower / raise / smooth; sculpt only), `radius` (0.5–16 yd), `shape`, `strength`
 //! (1–100 %), `falloff` (smooth / linear / flat) + `hardness` (0–100 %) + `hard` (sculpt only),
 //! `offset` (flatten plane offset, yards; flatten only).
 
@@ -42,6 +45,40 @@ pub const FALLOFF_LABELS: [&str; 3] = [
     "MONKEY_EME_SCULPT_FALLOFF_LINEAR",
     "MONKEY_EME_SCULPT_FALLOFF_FLAT",
 ];
+
+/// MONKEY (EME, CONTRACT v3.6): choice labels of every tool's `shape` option, in
+/// `mode::SHAPE_*` order (sphere, cube, vertical cylinder).
+pub const SHAPE_LABELS: [&str; 3] = [
+    "MONKEY_EME_SHAPE_SPHERE",
+    "MONKEY_EME_SHAPE_CUBE",
+    "MONKEY_EME_SHAPE_CYLINDER",
+];
+
+/// The `shape` option field of a tool (`label` = its locale key).
+pub fn shape_field(label: String, shape: u8, disabled: bool) -> EmeOptionField {
+    EmeOptionField {
+        key: "shape",
+        label,
+        kind: EmeOptionKind::Choice(SHAPE_LABELS.iter().map(|s| s.to_string()).collect()),
+        value: EmeOptionValue::Choice(shape as usize),
+        disabled,
+    }
+}
+
+/// A `shape` option value (choice index or a script's number) → `mode::SHAPE_*`.
+pub fn shape_value(value: &EmeOptionValue) -> Option<u8> {
+    match *value {
+        EmeOptionValue::Choice(i) if i <= 2 => Some(i as u8),
+        EmeOptionValue::Number(n) if (0.0..=2.0).contains(&n) => Some(n as u8),
+        EmeOptionValue::Text(ref s) => match s.as_str() {
+            "sphere" => Some(mode::SHAPE_SPHERE),
+            "cube" => Some(mode::SHAPE_CUBE),
+            "cylinder" => Some(mode::SHAPE_CYLINDER),
+            _ => None,
+        },
+        _ => None,
+    }
+}
 
 /// Default strength, percent, of the sculpt brush (soft lower / raise ~0.1 yd per edit) …
 pub const DEFAULT_STRENGTH: f32 = 20.0;
@@ -73,6 +110,8 @@ pub struct EmeSculptTool {
     pub hardness: f32,
     /// The old hard brush: CSG dig / build spheres, uniform smooth (`param` 0).
     pub hard: bool,
+    /// MONKEY (EME, CONTRACT v3.6): brush shape of lower / raise (`mode::SHAPE_*`).
+    pub shape: u8,
     /// Flatten plane offset from the sampled height, yards.
     pub offset: f32,
     /// The flatten plane of the held stroke (sampled at the press).
@@ -113,6 +152,7 @@ impl EmeSculptTool {
             falloff: mode::FALLOFF_SMOOTH,
             hardness: 0.0,
             hard: false,
+            shape: mode::SHAPE_SPHERE,
             offset: 0.0,
             plane: None,
             wheel_resizes: true,
@@ -143,6 +183,12 @@ impl EmeSculptTool {
             mode::soft_param(self.falloff, self.hardness.clamp(0.0, 100.0).round() as u8)
         } else {
             0
+        };
+        // MONKEY (EME, CONTRACT v3.6): the shape rides on lower / raise, hard and soft.
+        let param = if matches!(self.mode, mode::DIG | mode::BUILD) {
+            mode::with_shape(param, self.shape)
+        } else {
+            param
         };
         EmeBrushSample {
             map: ctx.map,
@@ -239,6 +285,11 @@ impl EmeTool for EmeSculptTool {
                 value: EmeOptionValue::Number(self.radius),
                 disabled: false,
             },
+            shape_field(
+                format!("{p}SHAPE"),
+                self.shape,
+                !matches!(self.mode, mode::DIG | mode::BUILD),
+            ),
             EmeOptionField {
                 key: "strength",
                 label: format!("{p}STRENGTH"),
@@ -288,7 +339,7 @@ impl EmeTool for EmeSculptTool {
             },
         ];
         if self.locked {
-            fields.retain(|f| !matches!(f.key, "mode" | "falloff" | "hardness" | "hard"));
+            fields.retain(|f| !matches!(f.key, "mode" | "falloff" | "hardness" | "hard" | "shape"));
         } else {
             fields.retain(|f| f.key != "offset");
         }
@@ -309,6 +360,12 @@ impl EmeTool for EmeSculptTool {
             }
             ("hardness", EmeOptionValue::Number(h)) => self.hardness = h.clamp(0.0, 100.0),
             ("hard", EmeOptionValue::Bool(b)) => self.hard = b,
+            ("shape", _) if self.locked => {}
+            ("shape", v) => {
+                if let Some(s) = shape_value(&v) {
+                    self.shape = s;
+                }
+            }
             ("offset", EmeOptionValue::Number(o)) => self.offset = o.clamp(-16.0, 16.0),
             _ => {}
         }
@@ -474,6 +531,35 @@ mod tests {
         assert_eq!(hard.len(), 1, "a hard sphere held still is sent once");
         assert_eq!((hard[0].1.param, hard[0].1.strength), (0, 255));
         let keys: Vec<_> = t.options_ui_model().iter().map(|f| f.key).collect();
-        assert_eq!(keys, ["mode", "radius", "strength", "falloff", "hardness", "hard"]);
+        assert_eq!(keys, ["mode", "radius", "shape", "strength", "falloff", "hardness", "hard"]);
+    }
+
+    /// MONKEY (EME, CONTRACT v3.6): the shape rides on lower / raise (hard and soft), never on smooth.
+    #[test]
+    fn shape_option_sets_param_bits_9_10() {
+        let mut t = EmeSculptTool::new(EmeStrokeIds::starting_at(1));
+        let press = EmeButton { pressed: true, held: true, released: false };
+        let release = EmeButton { pressed: false, held: false, released: true };
+        let mut sink = EmeCommandSink::new();
+        let mut first = |t: &mut EmeSculptTool, now: u64| {
+            t.on_input(&ctx(now, 0.0, press), &mut sink);
+            let e = edits(&mut sink)[0].1;
+            t.on_input(&ctx(now + 500, 0.0, release), &mut sink);
+            sink.drain();
+            e
+        };
+        t.set_option("shape", EmeOptionValue::Choice(1));
+        let e = first(&mut t, 0);
+        assert_eq!(e.param, mode::soft_param(mode::FALLOFF_SMOOTH, 0) | 0x0200);
+        assert_eq!(mode::shape_of(e.mode, e.param), mode::SHAPE_CUBE);
+        t.set_option("hard", EmeOptionValue::Bool(true));
+        t.set_option("shape", EmeOptionValue::Text("cylinder".into()));
+        let e = first(&mut t, 2000);
+        assert_eq!((e.param, e.strength), (0x0400, 255));
+        t.set_option("mode", EmeOptionValue::Choice(2));
+        let e = first(&mut t, 4000);
+        assert_eq!(e.param, 0, "smooth carries no shape");
+        let shape = t.options_ui_model().into_iter().find(|f| f.key == "shape").unwrap();
+        assert!(shape.disabled);
     }
 }

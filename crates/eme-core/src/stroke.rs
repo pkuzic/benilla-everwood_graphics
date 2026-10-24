@@ -37,6 +37,10 @@ pub struct EmeStrokeConfig {
     /// MONKEY (EME): a hard dig (build) stroke reaches at most this many brush radii below (above)
     /// its first centre, so holding the brush cannot drill a shaft (see the module docs).
     pub hard_depth_radii: f32,
+    /// MONKEY (EME v3.6): a hard dig / build counts only its GROUND-PLANE movement (true, the
+    /// default: one sphere per brush position, see the module docs). Push / pull and bridge set it
+    /// false: their centres advance along the surface normal / the path, also vertically.
+    pub plane_moves: bool,
 }
 
 impl Default for EmeStrokeConfig {
@@ -47,6 +51,7 @@ impl Default for EmeStrokeConfig {
             stationary_fraction: 0.05,
             max_edits: None,
             hard_depth_radii: 1.0,
+            plane_moves: true,
         }
     }
 }
@@ -258,7 +263,7 @@ impl EmeStrokeBuilder {
         let hard = mode::is_idempotent_edit(s.mode, s.param);
         // A hard sphere is placed per brush POSITION on the ground plane: the centre sinking into
         // the pit it just dug (or rising onto the lump it just built) is not a new position.
-        let d = if hard {
+        let d = if hard && self.config.plane_moves {
             ((last.pos[0] - s.pos[0]).powi(2) + (last.pos[1] - s.pos[1]).powi(2)).sqrt()
         } else {
             dist(last.pos, s.pos)

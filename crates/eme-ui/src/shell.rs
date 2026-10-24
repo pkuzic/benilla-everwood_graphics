@@ -662,7 +662,7 @@ fn options_panel(ui: &mut Ui, f: &mut Frame) {
 /// The overlay layer a tool edits (`water` → liquid, `area` → area).
 fn overlay_layer_of(tool: &str) -> Option<eme_core::service::EmeOverlayLayer> {
     match tool {
-        "water" => Some(eme_core::service::EmeOverlayLayer::Liquid),
+        "water" | "waterfill" => Some(eme_core::service::EmeOverlayLayer::Liquid),
         "area" => Some(eme_core::service::EmeOverlayLayer::Area),
         _ => None,
     }
