@@ -4,6 +4,11 @@
 //!
 //! The fill runs on the liquid cell grid (CONTRACT §11.1, 25/6-yd cells) over the ground heights
 //! the host reports at the cell centres (the voxel surface where edited, else the ADT ground):
+//!
+//! A cell's height is the LOWEST of nine ground samples (corners, edge midpoints, centre): a cell
+//! is wet when ANY part of its ground is below the level, and connectivity is 8-way, so the water
+//! reaches into every wall/corner cell and the terrain (higher than the flat water plane there)
+//! hides the surplus: the visible shoreline follows the real pit shape.
 //! 1. walk downhill from the clicked cell to the basin's lowest cell (≤ [`MAX_DESCENT`] steps,
 //!    else the ground is an open slope → refused);
 //! 2. a priority flood from there (4-connected, lowest cell first, ties by cell) until it reaches a
@@ -91,10 +96,32 @@ impl Ord for Key {
     }
 }
 
-const N4: [(i16, i16); 4] = [(1, 0), (-1, 0), (0, 1), (0, -1)];
+const N8: [(i16, i16); 8] = [
+    (1, 0),
+    (-1, 0),
+    (0, 1),
+    (0, -1),
+    (1, 1),
+    (1, -1),
+    (-1, 1),
+    (-1, -1),
+];
+
+/// The sample offsets inside a cell (corners, edge midpoints, centre), as fractions of the cell.
+pub const CELL_SAMPLES: [(f32, f32); 9] = [
+    (0.0, 0.0),
+    (0.5, 0.0),
+    (1.0, 0.0),
+    (0.0, 0.5),
+    (0.5, 0.5),
+    (1.0, 0.5),
+    (0.0, 1.0),
+    (0.5, 1.0),
+    (1.0, 1.0),
+];
 
 /// Flood-fill the basin around `seed` (see the module docs). `ground(cell)` = the ground height at
-/// the cell's centre, `None` = unknown (counts as a hole the water escapes into). `margin` = how far
+/// the LOWEST of the cell's nine samples (see [`CELL_SAMPLES`]), `None` = unknown (counts as a hole the water escapes into). `margin` = how far
 /// below the spill height the surface stays; `max_depth` = cap the level at `floor + max_depth`.
 pub fn flood_fill(
     seed: Cell,
@@ -166,7 +193,7 @@ pub fn flood_fill(
         if taken.len() > max_cells {
             return EmeFill::TooBig;
         }
-        for (dx, dy) in N4 {
+        for (dx, dy) in N8 {
             let n = (c.0.saturating_add(dx), c.1.saturating_add(dy));
             if seen.insert(n) {
                 heap.push(Reverse(Key(h(n, &mut cache), n)));
@@ -187,7 +214,7 @@ pub fn flood_fill(
     let mut q = VecDeque::from([floor]);
     cells.insert(floor);
     while let Some(c) = q.pop_front() {
-        for (dx, dy) in N4 {
+        for (dx, dy) in N8 {
             let n = (c.0.saturating_add(dx), c.1.saturating_add(dy));
             if under.contains_key(&n) && cells.insert(n) {
                 q.push_back(n);
@@ -265,8 +292,13 @@ impl EmeWaterFillTool {
     fn analyse(&mut self, at: [f32; 3], terrain: &dyn EmeTerrain) {
         let near = at[2];
         let mut ground = |c: Cell| {
-            let (x, y) = cell_centre(c);
-            terrain.ground_z(x, y, near, 40.0)
+            // The lowest of nine samples; any unknown sample makes the cell unknown (an escape).
+            let (x0, y0) = (c.0 as f32 * LIQ_CELL, c.1 as f32 * LIQ_CELL);
+            let mut low = f32::INFINITY;
+            for (fx, fy) in CELL_SAMPLES {
+                low = low.min(terrain.ground_z(x0 + fx * LIQ_CELL, y0 + fy * LIQ_CELL, near, 40.0)?);
+            }
+            Some(low)
         };
         let fill = flood_fill(
             cell_of(at[0], at[1]),
@@ -583,6 +615,73 @@ mod tests {
         assert_eq!(flood_fill((0, 0), &mut none, 64, 0.25, None), EmeFill::NoGround);
     }
 
+    /// A square pit (half-width `hw` yd, floor 0, wall to 5) on a continuous heightfield.
+    fn pit_z(x: f32, y: f32, hw: f32) -> f32 {
+        let d = x.abs().max(y.abs());
+        if d < hw { 0.0 } else { (5.0f32).min((d - hw) * 20.0) }
+    }
+
+    /// Run the fill over a continuous field `f(x, y)`, nine samples per cell like the tool.
+    fn fill_field(f: &dyn Fn(f32, f32) -> f32, seed: Cell) -> EmeFill {
+        let mut g = |c: Cell| {
+            let (x0, y0) = (c.0 as f32 * LIQ_CELL, c.1 as f32 * LIQ_CELL);
+            Some(CELL_SAMPLES.iter().map(|(fx, fy)| f(x0 + fx * LIQ_CELL, y0 + fy * LIQ_CELL)).fold(f32::INFINITY, f32::min))
+        };
+        flood_fill(seed, &mut g, MAX_CELLS, 0.25, None)
+    }
+
+    fn low_of(f: &dyn Fn(f32, f32) -> f32, cx: i16, cy: i16) -> f32 {
+        let (x0, y0) = (cx as f32 * LIQ_CELL, cy as f32 * LIQ_CELL);
+        CELL_SAMPLES.iter().map(|(a, b)| f(x0 + a * LIQ_CELL, y0 + b * LIQ_CELL)).fold(f32::INFINITY, f32::min)
+    }
+
+    #[test]
+    fn a_cube_pit_fills_every_partly_low_cell_without_holes() {
+        // Pit 10.3 yd half-width, off the cell grid: edge cells are only partly low.
+        let outer = |x: f32, y: f32| { let d = x.abs().max(y.abs()); if d > 14.0 { 5.0 - (d - 14.0) } else { pit_z(x, y, 10.3) } };
+        match fill_field(&outer, (0, 0)) {
+            EmeFill::Basin { level, cells, .. } => {
+                assert!(level > 0.5, "{level}");
+                let set: BTreeSet<Cell> = cells.iter().copied().collect();
+                for cx in -3i16..3 {
+                    for cy in -3i16..3 {
+                        let low = low_of(&outer, cx, cy);
+                        assert_eq!(set.contains(&(cx, cy)), low < level, "cell {cx},{cy} low {low}");
+                    }
+                }
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_round_bowl_covers_the_diagonals() {
+        let f = |x: f32, y: f32| {
+            let r = (x * x + y * y).sqrt();
+            if r < 9.4 { r * r / 90.0 } else if r < 12.0 { 0.98 + (r - 9.4) * 2.0 } else if r < 15.0 { 6.0 } else { 6.0 - (r - 15.0) }
+        };
+        match fill_field(&f, (0, 0)) {
+            EmeFill::Basin { level, cells, .. } => {
+                let set: BTreeSet<Cell> = cells.iter().copied().collect();
+                for cx in -3i16..3 {
+                    for cy in -3i16..3 {
+                        assert_eq!(set.contains(&(cx, cy)), low_of(&f, cx, cy) < level, "cell {cx},{cy}");
+                    }
+                }
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_pit_open_on_one_side_is_refused() {
+        let f = |x: f32, y: f32| {
+            let d = x.abs().max(y.abs());
+            if x > 0.0 && y.abs() < 3.0 { -(x * 0.3) } else if d < 6.0 { 0.0 } else { 5.0 }
+        };
+        assert!(!matches!(fill_field(&f, (0, 0)), EmeFill::Basin { .. }));
+    }
+
     struct Bowl;
     impl EmeTerrain for Bowl {
         fn ground_z(&self, x: f32, y: f32, _near: f32, _reach: f32) -> Option<f32> {
@@ -616,7 +715,7 @@ mod tests {
         t.on_input(&ctx(16, false), &mut sink);
         assert!(sink.is_empty(), "a click only previews");
         let (level, cells) = t.previewed().cloned().expect("a basin");
-        assert_eq!(level, 101.75);
+        assert!((100.0..101.75).contains(&level), "{level}");
         assert!(matches!(t.preview(&ctx(16, false)), Some(EmePreview::Cells { ref cells, .. }) if cells.len() == cells.len()));
         assert_eq!(t.take_notice().unwrap().key, "MONKEY_EME_WATERFILL_PREVIEW");
         // Esc drops it; a new click + Enter sends.
@@ -645,7 +744,7 @@ mod tests {
         assert!(batches.iter().all(|(s, b)| *s == 30 && b.len() <= BATCH_CELLS));
         let sent: usize = batches.iter().map(|(_, b)| b.len()).sum();
         assert_eq!(sent, cells.len());
-        assert!(batches.iter().flat_map(|(_, b)| b).all(|c| c.level == 101.75 && c.kind == EmeLiquidKind::Water));
+        assert!(batches.iter().flat_map(|(_, b)| b).all(|c| c.level == level && c.kind == EmeLiquidKind::Water));
         assert_eq!(batches.len(), cells.len().div_ceil(BATCH_CELLS));
         assert_eq!(t.server_tool(), WATER);
     }
