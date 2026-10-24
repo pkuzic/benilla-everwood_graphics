@@ -313,7 +313,12 @@ fn run_script(
                 cursor.virtual_norm = Some(from);
                 cursor.virtual_primary = false;
                 done = false;
-            } else if t < dur {
+            } else if t < dur || step.get("_held").and_then(Json::as_u64).unwrap_or(0) < 2 {
+                // At least two held frames, however slow the frames run (a 0.3-s stroke on a
+                // 4-fps frame must still press).
+                let held = step.get("_held").and_then(Json::as_u64).unwrap_or(0);
+                let i = script.idx;
+                script.steps[i]["_held"] = Json::from(held + 1);
                 cursor.virtual_norm = Some(from.lerp(to, (t / dur).clamp(0.0, 1.0)));
                 cursor.virtual_primary = true;
                 done = false;
