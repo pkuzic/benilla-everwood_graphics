@@ -555,8 +555,8 @@ fn run_script(
         // `obj_row {guid}`: click the outliner row (select + frame).
         "obj_row" => {
             let guid = num(&step, "guid").unwrap_or(0.0) as u32;
-            ui_cmds.write(eme_ui::EmeUiCommand::Objects(eme_core::EmeObjectsCmd::Select(guid)));
-            ui_cmds.write(eme_ui::EmeUiCommand::Objects(eme_core::EmeObjectsCmd::Frame));
+            if first { ui_cmds.write(eme_ui::EmeUiCommand::Objects(eme_core::EmeObjectsCmd::Select(guid))); }
+            if first { ui_cmds.write(eme_ui::EmeUiCommand::Objects(eme_core::EmeObjectsCmd::Frame)); }
             // The camera needs the editor to step once (it applies the command).
             done = t >= 0.3;
         }
@@ -577,7 +577,7 @@ fn run_script(
                 }
             };
             if let Some(c) = cmd {
-                ui_cmds.write(eme_ui::EmeUiCommand::Objects(c));
+                if first { ui_cmds.write(eme_ui::EmeUiCommand::Objects(c)); }
             }
             done = t >= 0.2;
         }
@@ -593,16 +593,16 @@ fn run_script(
                 _ => None,
             };
             if let (Some(field), Some(value)) = (field, num(&step, "value")) {
-                ui_cmds.write(eme_ui::EmeUiCommand::Objects(eme_core::EmeObjectsCmd::SetField { field, value }));
+                if first { ui_cmds.write(eme_ui::EmeUiCommand::Objects(eme_core::EmeObjectsCmd::SetField { field, value })); }
             }
             done = t >= 0.2;
         }
         // `obj_arm {entry}`: arm a template for placement (then `click` the ground).
         "obj_arm" => {
-            ui_cmds.write(eme_ui::EmeUiCommand::Objects(eme_core::EmeObjectsCmd::ArmSpawn {
+            if first { ui_cmds.write(eme_ui::EmeUiCommand::Objects(eme_core::EmeObjectsCmd::ArmSpawn {
                 entry: num(&step, "entry").unwrap_or(0.0) as u32,
                 name: None,
-            }));
+            })); }
             done = t >= 0.2;
         }
         // `obj_pick {guid}`: click the object itself in the world (its box centre, through the
@@ -616,7 +616,16 @@ fn run_script(
                 .iter()
                 .filter(|o| if let Some(e) = entry { o.entry == e } else { o.guid == guid })
                 .max_by_key(|o| o.guid)
-                .map(|o| o.obb.center);
+                .map(|o| o.obb.center)
+                // Not streamed to the client (far from the character): the editor's row stands in.
+                .or_else(|| {
+                    let v = objects.0.lock().ok()?.view();
+                    v.rows
+                        .iter()
+                        .filter(|r| if let Some(e) = entry { r.entry == e } else { r.guid == guid })
+                        .max_by_key(|r| r.guid)
+                        .map(|r| [r.x, r.y, r.z + 0.5 * r.scale])
+                });
             match at {
                 Some(p) => {
                     let i = script.idx;

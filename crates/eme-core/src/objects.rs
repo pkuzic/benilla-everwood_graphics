@@ -1038,7 +1038,7 @@ impl EmeObjectsEditor {
         let hover = if hover_handle.is_some() || self.spawn.is_some() {
             None
         } else {
-            pick_object(&self.world, o, d, PICK_REACH).map(|p| p.0)
+            self.pick(o, d)
         };
         if hover != self.hover || hover_handle != self.hover_handle {
             self.hover = hover;
@@ -1079,7 +1079,7 @@ impl EmeObjectsEditor {
             return;
         }
         // 3. Select what is under the cursor.
-        match pick_object(&self.world, o, d, PICK_REACH).map(|p| p.0) {
+        match self.pick(o, d) {
             Some(g) => {
                 if ctx.modifiers.ctrl {
                     self.toggle(g);
@@ -1290,13 +1290,44 @@ impl EmeObjectsEditor {
         }
     }
 
+    /// The object under the ray: the streamed world first, and (the server streams objects to the
+    /// client around the CHARACTER only, so far ones have no model) every listed row without a
+    /// streamed twin, as a small box at its position. The nearer hit wins.
+    fn pick(&self, o: V3, d: V3) -> Option<u32> {
+        let streamed = pick_object(&self.world, o, d, PICK_REACH);
+        let unstreamed: Vec<EmeWorldObject> = self
+            .rows
+            .values()
+            .filter(|r| !self.world.iter().any(|w| w.guid == r.guid))
+            .map(|r| EmeWorldObject {
+                guid: r.guid,
+                entry: r.entry,
+                name: None,
+                pos: [r.x, r.y, r.z],
+                obb: Self::row_box(r),
+            })
+            .collect();
+        let far = pick_object(&unstreamed, o, d, PICK_REACH);
+        match (streamed, far) {
+            (Some(a), Some(b)) => Some(if b.1 + 0.05 < a.1 { b.0 } else { a.0 }),
+            (Some(a), None) => Some(a.0),
+            (None, Some(b)) => Some(b.0),
+            (None, None) => None,
+        }
+    }
+
+    /// The box standing in for a row whose model the client does not have.
+    fn row_box(r: &EmeObjectRow) -> EmeObb {
+        EmeObb::point([r.x, r.y, r.z + 0.5 * r.scale], 0.5 * r.scale.max(0.3))
+    }
+
     fn obb_of(&self, guid: u32) -> Option<EmeObb> {
         if let Some(w) = self.world.iter().find(|w| w.guid == guid) {
             return Some(w.obb);
         }
         self.rows
             .get(&guid)
-            .map(|r| EmeObb::point([r.x, r.y, r.z + 0.5 * r.scale], 0.5 * r.scale.max(0.3)))
+            .map(Self::row_box)
     }
 
     /// What the viewport draws.
@@ -1488,6 +1519,24 @@ mod tests {
         assert_eq!(e.selection(), &[1]);
         step(&mut e, &ctx(1700, 3, Some([0.0, 40.0, 1.0]), press()));
         assert!(e.selection().is_empty());
+    }
+
+    #[test]
+    fn an_object_the_client_has_no_model_for_is_still_clickable_through_its_row() {
+        let mut e = editor();
+        // Streamed: object 1. Listed but not streamed (far from the character): row 2.
+        e.set_world(vec![world_obj(1, 0.0, 0.0, 0.0)]);
+        e.rows.insert(2, row(2, 9, 0.0, 10.0, 0.0));
+        step(&mut e, &ctx(1000, 3, Some([0.0, 10.0, 0.5]), idle_btn()));
+        assert_eq!(e.hover, Some(2));
+        step(&mut e, &ctx(1100, 3, Some([0.0, 10.0, 0.5]), press()));
+        assert_eq!(e.selection(), &[2]);
+        // A streamed object nearer to the eye still wins over a row behind it.
+        e.selection.clear();
+        e.rows.insert(3, row(3, 9, 0.0, 0.0, 0.0));
+        e.rows.remove(&3);
+        step(&mut e, &ctx(1200, 3, Some([0.0, 0.0, 1.0]), press()));
+        assert_eq!(e.selection(), &[1]);
     }
 
     #[test]

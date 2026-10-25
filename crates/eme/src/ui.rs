@@ -414,7 +414,7 @@ fn ui_replies(
                 };
                 notice.set(
                     key,
-                    vec![n.voxel.to_string(), n.liquid.to_string(), n.area.to_string()],
+                    vec![n.voxel.to_string(), n.liquid.to_string(), n.area.to_string(), n.object.to_string()],
                     false,
                 );
                 if projects.info.as_ref().is_some_and(|i| i.project.id == n.project_id) {
