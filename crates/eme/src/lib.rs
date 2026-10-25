@@ -180,6 +180,17 @@ impl Plugin for EmePlugin {
             .add_message::<EmeToggleRequested>()
             .add_message::<EmeRequest>()
             .add_message::<EmeEventMsg>();
+        // MONKEY (EME objects): object transaction ids must never repeat for a character across
+        // sessions (the server replays a repeat instead of acting): seed them from the clock.
+        {
+            let secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs());
+            app.world_mut().resource_mut::<EmeHost>().dispatcher = EmeDispatcher::new(
+                eme_core::EmeUndoStack::new().with_tx_start(eme_core::EmeUndoStack::tx_seed(secs)),
+                eme_core::bus::EME_REQUEST_TIMEOUT_MS,
+            );
+        }
         let ids = app.world().resource::<EmeHost>().stroke_ids.clone();
         app.register_eme_tool(tools::sculpt::EmeSculptTool::new(ids.clone()));
         app.register_eme_tool(tools::flatten::EmeFlattenTool::new(ids.clone()));

@@ -365,6 +365,19 @@ impl EmeUndoStack {
         self
     }
 
+    /// The first transaction id of a session that starts at `unix_secs`.
+    ///
+    /// The server keeps every `(character, tx)` it ever processed and ANSWERS A REPEAT FROM ITS
+    /// JOURNAL without doing anything (CONTRACT v3.7 `replayed`), so a client that restarted its
+    /// counter at 1 would have its first spawns silently "replayed" onto objects that no longer
+    /// exist (found live, 2026-10-25). Seeding from the clock (16 ids per second since
+    /// 2026-01-01, good until 2034) keeps sessions apart; a session would need to send more than
+    /// 16 object ops per second of the gap to the next one to collide.
+    pub fn tx_seed(unix_secs: u64) -> u32 {
+        const EPOCH_2026: u64 = 1_767_225_600;
+        (unix_secs.saturating_sub(EPOCH_2026).saturating_mul(16)).min(u64::from(u32::MAX - 1_000_000)) as u32 + 1
+    }
+
     /// Register a host hook (§2.5).
     pub fn add_hook(&mut self, hook: Box<dyn EmeHistoryHook>) {
         self.hooks.push(hook);

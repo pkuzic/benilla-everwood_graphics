@@ -80,3 +80,11 @@ draws them in the left panel when the tool is active, and emits `SetOption`. Rul
 `EmeShell::probe = true`, which records every drawn control (id, enabled, rect, tooltip) and lets
 tests synthesize clicks. Locale tests check both files have identical keys and placeholders and
 that every key literal in `src/` exists.
+
+## Objects tab (CONTRACT v3.7)
+
+`EmeRightTab::Objects` (offered where the registry offers the `objects` tool): outliner with search
+(name, `#entry`, entry, guid), Refresh / Frame / Duplicate / Delete, an inspector (entry, name, guid,
+owner, X / Y / Z / heading / scale text boxes: Enter applies) and a spawn section (template id +
+a list of the templates seen). The host fills `EmeObjects(EmeObjectsView)` and applies
+`EmeUiCommand::Objects(EmeObjectsCmd)`; mutating controls follow the usual rank-3 + project gate.

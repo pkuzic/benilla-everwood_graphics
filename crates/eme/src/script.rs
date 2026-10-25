@@ -608,11 +608,14 @@ fn run_script(
         // `obj_pick {guid}`: click the object itself in the world (its box centre, through the
         // camera): the real picking path.
         "obj_pick" => {
+            // By guid, or by template entry (the newest one: the highest guid).
             let guid = num(&step, "guid").unwrap_or(0.0) as u32;
+            let entry = num(&step, "entry").map(|e| e as u32);
             let at = world_objs
                 .objects
                 .iter()
-                .find(|o| o.guid == guid)
+                .filter(|o| if let Some(e) = entry { o.entry == e } else { o.guid == guid })
+                .max_by_key(|o| o.guid)
                 .map(|o| o.obb.center);
             match at {
                 Some(p) => {
@@ -683,6 +686,24 @@ fn run_script(
             let phase = if first { 0 } else { step.get("_phase").and_then(Json::as_u64).unwrap_or(0) };
             script.steps[i]["_phase"] = Json::from(phase + 1);
             done = false;
+            // The gizmo follows the ghost while dragging, so the grab and target points are
+            // fixed ONCE (phase 0) in viewport fractions: recomputing them each frame would chase
+            // the object it moves.
+            let (gp, tp) = if phase == 0 {
+                script.steps[i]["_gp"] = serde_json::json!([gp.x, gp.y]);
+                script.steps[i]["_tp"] = serde_json::json!([tp.x, tp.y]);
+                (gp, tp)
+            } else {
+                let read = |k: &str| {
+                    step.get(k).and_then(Json::as_array).map_or(Vec2::ZERO, |a| {
+                        Vec2::new(
+                            a.first().and_then(Json::as_f64).unwrap_or(0.0) as f32,
+                            a.get(1).and_then(Json::as_f64).unwrap_or(0.0) as f32,
+                        )
+                    })
+                };
+                (read("_gp"), read("_tp"))
+            };
             match phase {
                 // Hover the handle, press on it, then give the tool two frames to grab it.
                 0 => {

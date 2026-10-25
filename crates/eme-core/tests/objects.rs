@@ -333,3 +333,17 @@ fn a_rank_two_caller_cannot_dispatch_object_mutations() {
     assert_eq!(errs.len(), 1);
     assert!(w.t.sent_services.is_empty());
 }
+
+#[test]
+fn tx_ids_of_two_sessions_do_not_overlap() {
+    let a = EmeUndoStack::tx_seed(1_800_000_000);
+    let b = EmeUndoStack::tx_seed(1_800_000_000 + 60);
+    assert!(b - a >= 960, "a minute apart = 960 ids");
+    // A later session starts above everything an earlier one could have used in that minute.
+    let mut s = EmeUndoStack::new().with_tx_start(a);
+    let last = (0..500).map(|_| s.alloc_tx().0).last().unwrap();
+    assert!(last < b);
+    // Never 0, never past the u32 range even for an absurd clock.
+    assert!(EmeUndoStack::tx_seed(0) >= 1);
+    assert!(EmeUndoStack::tx_seed(u64::MAX) < u32::MAX);
+}

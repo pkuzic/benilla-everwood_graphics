@@ -438,3 +438,105 @@ mod tests {
         assert!(ev.contains(&EmeEvent::SelectionChanged(vec![4])));
     }
 }
+
+#[cfg(test)]
+mod hotkey_tests {
+    use super::*;
+    use crate::tools::objects::EmeObjectsTool;
+    use eme_core::{EmeCommandSink, EmeInputCtx, EmePermissions, EmeRank};
+
+    fn app_with_tool() -> (App, EmeObjectsShared) {
+        let mut app = App::new();
+        app.init_resource::<EmeHost>()
+            .init_resource::<EmeActive>()
+            .init_resource::<EmeHostInput>()
+            .init_resource::<EmeUiWantsKeyboard>()
+            .init_resource::<ButtonInput<KeyCode>>();
+        let shared: EmeObjectsShared = Default::default();
+        app.insert_resource(EmeObjectsHandle(shared.clone()));
+        app.world_mut().resource_mut::<EmeActive>().0 = true;
+        {
+            let mut host = app.world_mut().resource_mut::<EmeHost>();
+            host.registry
+                .register(Box::new(EmeObjectsTool::new(shared.clone())))
+                .unwrap();
+            let perms = EmePermissions::from_rank(EmeRank(3));
+            let mut sink = EmeCommandSink::new();
+            host.registry.activate("objects", &perms, None, &mut sink).unwrap();
+        }
+        app.add_systems(Update, hotkeys);
+        (app, shared)
+    }
+
+    /// Run the editor one step so queued commands apply.
+    fn step(shared: &EmeObjectsShared) {
+        let ctx = EmeInputCtx::idle(1_000, 0, EmePermissions::from_rank(EmeRank(3)));
+        lock(shared).step(&ctx, None, &mut EmeCommandSink::new());
+    }
+
+    fn press(app: &mut App, key: KeyCode) {
+        let mut keys = app.world_mut().resource_mut::<ButtonInput<KeyCode>>();
+        keys.release_all();
+        keys.clear();
+        keys.press(key);
+        app.update();
+    }
+
+    #[test]
+    fn t_r_g_pick_the_gizmo_and_x_flips_the_axes() {
+        let (mut app, shared) = app_with_tool();
+        for (key, mode) in [
+            (KeyCode::KeyR, EmeGizmoMode::Rotate),
+            (KeyCode::KeyG, EmeGizmoMode::Scale),
+            (KeyCode::KeyT, EmeGizmoMode::Translate),
+        ] {
+            press(&mut app, key);
+            step(&shared);
+            assert_eq!(lock(&shared).mode(), mode, "{key:?}");
+        }
+        press(&mut app, KeyCode::KeyX);
+        step(&shared);
+        assert_eq!(lock(&shared).space(), EmeGizmoSpace::Local);
+        press(&mut app, KeyCode::KeyX);
+        step(&shared);
+        assert_eq!(lock(&shared).space(), EmeGizmoSpace::World);
+    }
+
+    #[test]
+    fn typing_in_a_field_or_another_tool_blocks_the_hotkeys() {
+        let (mut app, shared) = app_with_tool();
+        app.world_mut().resource_mut::<EmeUiWantsKeyboard>().0 = true;
+        press(&mut app, KeyCode::KeyR);
+        step(&shared);
+        assert_eq!(lock(&shared).mode(), EmeGizmoMode::Translate, "an EME text field has the keyboard");
+        app.world_mut().resource_mut::<EmeUiWantsKeyboard>().0 = false;
+        app.world_mut().resource_mut::<EmeHostInput>().typing = true;
+        press(&mut app, KeyCode::KeyR);
+        step(&shared);
+        assert_eq!(lock(&shared).mode(), EmeGizmoMode::Translate, "the chat box has the keyboard");
+        app.world_mut().resource_mut::<EmeHostInput>().typing = false;
+        // Another active tool: the keys are not ours.
+        {
+            let mut host = app.world_mut().resource_mut::<EmeHost>();
+            let mut sink = EmeCommandSink::new();
+            host.registry.deactivate(&mut sink);
+        }
+        press(&mut app, KeyCode::KeyR);
+        step(&shared);
+        assert_eq!(lock(&shared).mode(), EmeGizmoMode::Translate);
+    }
+
+    #[test]
+    fn ctrl_d_duplicates_and_ctrl_blocks_the_letter_hotkeys() {
+        let (mut app, shared) = app_with_tool();
+        lock(&shared).activate();
+        {
+            let mut keys = app.world_mut().resource_mut::<ButtonInput<KeyCode>>();
+            keys.press(KeyCode::ControlLeft);
+            keys.press(KeyCode::KeyR);
+        }
+        app.update();
+        step(&shared);
+        assert_eq!(lock(&shared).mode(), EmeGizmoMode::Translate, "Ctrl+R is not Rotate");
+    }
+}

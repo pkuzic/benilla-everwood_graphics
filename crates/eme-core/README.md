@@ -86,3 +86,14 @@ stack; hooks see server-confirmed transitions only (push, commit, undo, redo, di
 `cargo test -p eme-core`. Example wire frames live in `tests/fixtures/` (`requests.json`,
 `replies.json`, `pushes.json` are the CONTRACT v3 examples, round-tripped; `replies_lua.json` holds the shapes a Lua
 JSON encoder emits — `{}` for an empty list, `0`/`1` for flags — which the types accept).
+
+## Objects (CONTRACT v3.7)
+
+| Module | What |
+|---|---|
+| `gizmo` | selection rays (`EmeObb::ray`, `pick_object`), the gizmo handles and drag solvers (axis, plane, yaw ring, uniform scale), `EmeSnap`, `apply_delta` |
+| `objects` | `EmeObjectsEditor`: outliner rows (`obj_nearby` paging by `after_guid`), selection, ghost preview, spawn placement, inspector fields, push handling; emits `EmeCommand::Object` (own `tx`, own undo entry) |
+
+Object mutations are sent with `EmeServiceClient::send_idempotent`: unanswered after 4 s, the SAME
+frame id and `tx` go out again (up to 2 times, `EmeTransport::resend_service`); the server answers a
+repeat with `replayed: true`. Only the yaw (`o`) is rotatable: the wire has no pitch / roll.
