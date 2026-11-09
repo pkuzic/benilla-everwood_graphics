@@ -73,6 +73,57 @@ fn mount_order(dir_names: &[String]) -> Result<Vec<String>> {
     Ok(order)
 }
 
+/// MONKEY (texture upscale): the folder (any case) inside `Data` whose archives mount last.
+const UPSCALE_DIR: &str = "Upscale";
+
+/// MONKEY (texture upscale): every `.mpq` (any case) in `data`'s `Upscale` folder, ascending by
+/// case-folded name (the last wins, as in the patch tier), or none: no folder, or
+/// `MONKEY_UPSCALE=0` / `off` (the stock chain, without touching the files).
+fn upscale_archives(data: &Path) -> Vec<std::path::PathBuf> {
+    if std::env::var("MONKEY_UPSCALE")
+        .is_ok_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "off" | "false"))
+    {
+        return Vec::new();
+    }
+    let Ok(entries) = std::fs::read_dir(data) else {
+        return Vec::new();
+    };
+    let Some(dir) = entries
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .find(|p| {
+            p.is_dir()
+                && p.file_name()
+                    .is_some_and(|n| n.to_string_lossy().eq_ignore_ascii_case(UPSCALE_DIR))
+        })
+    else {
+        return Vec::new();
+    };
+    upscale_order(&dir)
+}
+
+/// MONKEY (texture upscale): the `.mpq` files directly in `dir`, by case-folded name.
+fn upscale_order(dir: &Path) -> Vec<std::path::PathBuf> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut found: Vec<std::path::PathBuf> = entries
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| {
+            p.is_file()
+                && p.extension()
+                    .is_some_and(|x| x.to_string_lossy().eq_ignore_ascii_case("mpq"))
+        })
+        .collect();
+    found.sort_by_key(|p| {
+        p.file_name()
+            .map(|n| n.to_string_lossy().to_ascii_lowercase())
+            .unwrap_or_default()
+    });
+    found
+}
+
 impl Chain {
     /// Open a `Data` directory's archives in [`mount_order`], or a single `.MPQ` file.
     ///
@@ -98,6 +149,14 @@ impl Chain {
                 .with_context(|| format!("mounting the archives in {}", path.display()))?;
             for name in order {
                 let mpq = path.join(&name);
+                archives.push(
+                    Archive::open(&mpq).with_context(|| format!("opening {}", mpq.display()))?,
+                );
+            }
+            // MONKEY (texture upscale): the optional `Data\Upscale` folder's archives mount LAST,
+            // above every patch, so an upscaled texture wins over any copy in the chain. Absent
+            // folder (or `MONKEY_UPSCALE=0`) = the stock chain exactly.
+            for mpq in upscale_archives(path) {
                 archives.push(
                     Archive::open(&mpq).with_context(|| format!("opening {}", mpq.display()))?,
                 );
@@ -475,6 +534,22 @@ mod tests {
             &mount_order(&dir).unwrap()[10..],
             &owned(&["patch-2.MPQ", "patch-3.MPQ", "patch-a.MPQ", "patch-B.MPQ"])[..]
         );
+    }
+
+    // MONKEY (texture upscale): only `.mpq` files, case-folded order, sub-folders ignored.
+    #[test]
+    fn upscale_folder_mounts_its_mpqs_in_case_folded_order() {
+        let dir = std::env::temp_dir().join(format!("benilla_upscale_order_{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("sub.mpq")).unwrap();
+        for f in ["upscale-B.MPQ", "upscale-a.mpq", "notes.txt", "upscale-C.mpq.bak"] {
+            std::fs::write(dir.join(f), b"").unwrap();
+        }
+        let names: Vec<String> = upscale_order(&dir)
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(names, ["upscale-a.mpq", "upscale-B.MPQ"]);
     }
 
     #[test]
