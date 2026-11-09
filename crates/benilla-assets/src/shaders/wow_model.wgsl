@@ -1058,6 +1058,10 @@ const RELIEF_POM_STEPS_MAX: f32 = 12.0;
 const RELIEF_POM_STEPS_MIN: f32 = 4.0;
 // How hard the cavity channel darkens the lit result: `mix(1, B, k)`.
 const RELIEF_CAVITY: f32 = 0.35;
+// MONKEY (model relief): the interior WMO emboss gain (baked MOCV light has no direction).
+const RELIEF_EMBOSS: f32 = 1.6;
+// MONKEY (model relief): steepens the baked tangent tilt on models (see `relief_normal_ts`).
+const RELIEF_NORMAL_GAIN: f32 = 2.5;
 // The flat texel (zero tilt under the `(byte-128)/127` decode, open, top height).
 const RELIEF_FLAT: vec4<f32> = vec4<f32>(128.0 / 255.0, 128.0 / 255.0, 1.0, 1.0);
 // `clutter_fade.z` markers that never take relief: additive (bit 2), Mod (7), Mod2x (8), the zfill
@@ -1076,7 +1080,11 @@ fn relief_normal_ts(r: vec4<f32>) -> vec3<f32> {
     let raw = r.rg * 255.0 - 128.0;
     let xy = clamp(select(raw / 127.0, vec2<f32>(0.0), abs(raw) < vec2<f32>(0.01)),
         vec2<f32>(-1.0), vec2<f32>(1.0));
-    return vec3<f32>(xy, sqrt(max(1.0 - dot(xy, xy), 0.0)));
+    // MONKEY (model relief): the bake's normals are tuned for terrain seen from above; on walls and
+    // props at arm's length they read too soft, so the tilt is steepened by `RELIEF_NORMAL_GAIN`.
+    // Zero tilt stays exactly (0, 0, 1), so the flat-texel identity holds.
+    let n = vec3<f32>(xy, sqrt(max(1.0 - dot(xy, xy), 0.0)));
+    return normalize(vec3<f32>(n.xy * RELIEF_NORMAL_GAIN, n.z));
 }
 
 // MONKEY (model relief, sync 1109): `vertex_light`'s sky sum E (`monkey_vertex_sky`: no point
@@ -2098,6 +2106,17 @@ fn fragment(in: WowVsOut, @builtin(front_facing) is_front: bool) -> WowFragOut {
     // unlit/emissive path below never reaches it (`relief_on` excludes it anyway).
     if (relief_on) {
         lit_rgb = lit_rgb * mix(1.0, relief.b, RELIEF_CAVITY);
+        // MONKEY (model relief): interior WMO surfaces carry their light baked in the MOCV, with no
+        // direction to perturb, so the relief read only as the cavity there (the Goldshire inn looked
+        // unchanged). An emboss stands in for the baked light: a fixed key from above and toward the
+        // eye, as the difference between the shading and the geometric normal, so a flat texel is
+        // exactly 1.0 (n_shade == n_lit bit for bit) and only the relief changes the pixel.
+        if (is_wmo && is_interior) {
+            let to_eye = normalize(view.world_position - in.world_position.xyz);
+            let key = normalize(vec3<f32>(0.0, 0.0, 0.7) + to_eye);
+            let emboss = 1.0 + RELIEF_EMBOSS * (dot(n_shade, key) - dot(n_lit, key));
+            lit_rgb = clamp(lit_rgb * clamp(emboss, 0.55, 1.45), vec3<f32>(0.0), vec3<f32>(1.0));
+        }
     }
     // The unlit path: an M2's unlit program outputs `c28 + c29` (`0x70c663`-`0x70c693` fold the
     // tint·M2Color term into `c29` beside the highlight), so the texel modulates
