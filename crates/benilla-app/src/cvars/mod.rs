@@ -2167,7 +2167,7 @@ mod tests {
         // VideoConfig rows, 38 welds (MONKEY lampfog: + lampFog). MONKEY (wind): `foliageWind` is a world resource bridge.
         let welded: std::collections::BTreeSet<&str> = lighting.iter().map(|(n, _)| *n).collect();
         // MONKEY (volumetric fog): the atmospheric tier joins the default-consumer weld.
-        assert_eq!(welded.len(), 41, "the lighting lane welds 41 distinct rows");
+        assert_eq!(welded.len(), 43, "the lighting lane welds 43 distinct rows"); // MONKEY (ground relief): + groundRelief, groundReliefDepth
         for name in &welded {
             assert!(
                 REGISTERED.iter().any(|r| r.name == *name),
@@ -2345,7 +2345,7 @@ mod tests {
     /// disjointness that lets both labels be right at once.
     #[test]
     fn graphics_rows_are_registered_and_disjoint_from_the_lighting_ladder() {
-        assert_eq!(GRAPHICS_PRESETS.len(), 13, "add the row count with the row");
+        assert_eq!(GRAPHICS_PRESETS.len(), 14, "add the row count with the row"); // MONKEY (ground relief): + groundRelief
         let cvars = fresh_registry();
         for (k, values) in GRAPHICS_PRESETS {
             assert!(cvars.get(k).is_some(), "{k}: not registered");
