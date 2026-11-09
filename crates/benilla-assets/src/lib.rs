@@ -42,6 +42,9 @@ pub use model::{
 mod adt;
 mod terrain;
 mod wdt;
+// MONKEY (ground relief): the per-tile relief array (loose PNG relief maps per ground layer).
+mod relief;
+pub use relief::{monkey_relief_array, monkey_relief_dir, RELIEF_FLAT};
 pub use adt::{chunk_to_mesh, chunks_to_mesh, AdtLoader, AdtTile, ChunkShading};
 pub use wdt::{WdtIndex, WdtIndexLoader};
 mod blp;

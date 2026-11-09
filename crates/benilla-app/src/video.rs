@@ -196,6 +196,11 @@ pub(crate) struct VideoConfig {
     // GFX (moonlight): the additive moon term's multiplier, 0..2 (0 = the stock night exactly).
     // Bridged to `benilla_world::lighting::MoonLight` by `dynamic_interior::bridge`.
     pub(crate) moon_light: f32,
+    // MONKEY (ground relief): terrain relief mode 0..5 (0 = today's terrain exactly; 1 normals,
+    // 2 + parallax, 3 + parallax self-shadow, 4/5 debug) and the parallax depth (tiled-UV units).
+    // Bridged to `benilla_world::terrain_stream::GroundRelief` by `dynamic_interior::bridge`.
+    pub(crate) ground_relief: u8,
+    pub(crate) ground_relief_depth: f32,
     /// Brightness of lava lighting its surroundings, 0..4; 0 disables the glow.
     /// Published to `benilla_world::lighting::LavaLightGain` by `dynamic_interior::bridge`.
     pub(crate) lava_light_gain: f32,
@@ -472,6 +477,9 @@ impl Default for VideoConfig {
             volumetric_light: 0,
             volumetric_light_strength: 1.0,
             moon_light: 0.0,
+            // MONKEY (ground relief): opt-in experiment, off in every preset.
+            ground_relief: 0,
+            ground_relief_depth: 0.06,
             lava_light_gain: 1.0,
             fire_flicker: 1.0,
             display: if windowed_env() {
@@ -689,6 +697,9 @@ impl VideoKnobs<'_> {
             "volumetriclightstrength" => cfg.volumetric_light_strength = v.clamp(0.0, 2.0),
             // GFX (moonlight): 0 is meaningful (the stock night, bit for bit).
             "moonlight" => cfg.moon_light = v.clamp(0.0, 2.0),
+            // MONKEY (ground relief): 0 is meaningful (today's terrain, bit for bit).
+            "groundrelief" => cfg.ground_relief = v.clamp(0.0, 5.0) as u8,
+            "groundreliefdepth" => cfg.ground_relief_depth = v.clamp(0.0, 0.2),
             "lavalightgain" => cfg.lava_light_gain = v.clamp(0.0, 4.0),
             "worldshadows" => cfg.world_shadows = ev.flag(),
             "charactershadows" => cfg.character_shadows = ev.flag(),

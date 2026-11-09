@@ -33,6 +33,13 @@ pub struct AdtTile {
     pub alpha_array: Handle<Image>,
     /// `texture_2d_array` of per-chunk MCSH baked shadow maps.
     pub shadow_array: Handle<Image>,
+    /// MONKEY (ground relief): `texture_2d_array` of the layers' relief maps (normal XY, cavity,
+    /// height), indexed like `layer_array` (`[0]` and any layer without a map are flat).
+    pub relief_array: Handle<Image>,
+    /// MONKEY (ground relief): layers in `relief_array`, or 0 when no layer of the tile has a map
+    /// (then `relief_array` is a 1-layer flat dummy and the shader never samples it). A layer index
+    /// at or past this (EME paint appends layers later) reads flat.
+    pub relief_layers: u32,
     /// M2 doodad placements (raw WoW coords).
     pub doodads: Vec<Doodad>,
     /// WMO building placements (raw WoW coords).
@@ -227,12 +234,25 @@ impl AssetLoader for AdtLoader {
         let layer_array = layer_array_image(LAYER_TEX_SIZE, layer_count, packed);
         let alpha_array = alpha_array_image(ALPHA_MAP_SIZE, alpha_count, alpha_buf);
         let shadow_array = shadow_array_image(SHADOW_MAP_SIZE, shadow_count, shadow_buf);
+        // MONKEY (ground relief): one relief map per layer-array index, flat where none exists.
+        let relief_dir = crate::relief::monkey_relief_dir();
+        let (relief_array, relief_layers) =
+            crate::relief::monkey_relief_array(&layer_names, relief_dir);
+        if relief_dir.is_some() {
+            // One line per tile at most.
+            debug!(
+                "adt {}: relief {relief_layers} layer(s) for {layer_count} ground layer(s)",
+                ctx.path()
+            );
+        }
 
         Ok(AdtTile {
             shading,
             layer_array: ctx.add_labeled_asset("layer_array".to_string(), layer_array),
             alpha_array: ctx.add_labeled_asset("alpha_array".to_string(), alpha_array),
             shadow_array: ctx.add_labeled_asset("shadow_array".to_string(), shadow_array),
+            relief_array: ctx.add_labeled_asset("relief_array".to_string(), relief_array),
+            relief_layers,
             doodads: tile.doodads,
             wmos: tile.wmos,
             chunks: tile.chunks,

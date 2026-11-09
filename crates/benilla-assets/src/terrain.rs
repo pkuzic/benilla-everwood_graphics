@@ -286,7 +286,8 @@ pub(crate) fn shadow_array_image(size: u32, layer_count: u32, data: Vec<u8>) -> 
 
 /// A `2d_array` image with a `D2Array` view. `RENDER_WORLD` only: nothing reads a tile's arrays
 /// main-side, so no main-world copy stays resident.
-fn array_image(size: u32, layer_count: u32, format: TextureFormat) -> Image {
+// MONKEY (ground relief): crate-visible for `relief.rs`.
+pub(crate) fn array_image(size: u32, layer_count: u32, format: TextureFormat) -> Image {
     // `new_uninit`, not `new`, which would allocate a mip-0 dummy per tile; the caller sets `data`.
     let mut image = Image::new_uninit(
         Extent3d {

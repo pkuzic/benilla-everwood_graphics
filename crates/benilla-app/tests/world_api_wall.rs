@@ -194,6 +194,8 @@ const PUBLISHED: &[(&str, &str)] = &[
     ("world_unit::ViewerUnit", "wall"),
     ("world_unit::WorldUnit", "wall"),
     ("worldview::run", "record"),
+    // MONKEY (ground relief): the `groundRelief` cvars' engine resource, bridged like MoonLight.
+    ("terrain_stream::GroundRelief", "TF graphics seam audit"),
 ];
 
 /// The sorted leaks: crossings filed to close, with how. `CLOSE/absorb`: a facade takes the call;

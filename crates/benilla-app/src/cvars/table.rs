@@ -685,6 +685,18 @@ pub(crate) const REGISTERED: &[Registered] = &[
         "0",
         "benilla's own: moonlight on top of the stock night, 0..2 (0 = the reference night)",
     ),
+    // MONKEY (ground relief): normal-mapped / parallax terrain from offline relief maps.
+    ours(
+        "groundRelief",
+        "0",
+        "benilla's own: terrain ground relief from the MData\\Relief maps, 0 Off / 1 Normals / \
+         2 + Parallax / 3 + Parallax Shadows / 4 debug height / 5 debug normal",
+    ),
+    ours(
+        "groundReliefDepth",
+        "0.06",
+        "benilla's own: depth of the terrain parallax relief in texture tiles, 0..0.2 (0.06 = default)",
+    ),
     // MONKEY (p0 skyDither): the FFXGlow combine's deband dither (was env WOW_DITHER only).
     // Default 0 = the reference look; the Graphics preset's High sets 1.
     ours(

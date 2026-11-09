@@ -1281,6 +1281,8 @@ pub(crate) const GRAPHICS_PRESETS: &[(&str, [&str; 5])] = &[
     // moonlight is a few ALU per fragment, so every rung past Classic takes it.
     ("volumetricLight",      ["0",    "0",   "1",      "2",    "2"]),
     ("moonLight",            ["0",    "1",   "1",      "1",    "1"]),
+    // MONKEY (ground relief): an opt-in experiment — off on every rung.
+    ("groundRelief",         ["0",    "0",   "0",      "0",    "0"]),
 ];
 
 /// The column of a rung, matched case-insensitively; `None` for `Custom` or anything else.
@@ -2090,11 +2092,14 @@ mod tests {
         let shadows = VideoConfig::default();
         let flag = |b: bool| if b { 1.0 } else { 0.0 };
         // MONKEY (volumetric fog): include the atmospheric tier in this fixed-size default table.
-        let lighting: [(&str, f32); 41] = [
+        let lighting: [(&str, f32); 43] = [
             // GFX (volumetric light) / (moonlight): the three new rows.
             ("volumetricLight", shadows.volumetric_light as f32),
             ("volumetricLightStrength", shadows.volumetric_light_strength),
             ("moonLight", shadows.moon_light),
+            // MONKEY (ground relief): the terrain relief mode and its parallax depth.
+            ("groundRelief", shadows.ground_relief as f32),
+            ("groundReliefDepth", shadows.ground_relief_depth),
             ("waterQuality", shadows.water_quality as f32),
             // MONKEY (volumetric fog): weld registry and renderer defaults.
             ("volumetricFog", shadows.volumetric_fog as f32),
@@ -2657,6 +2662,8 @@ mod tests {
                     // GFX (volumetric light) / (moonlight)
                     "volumetricLight" => video.volumetric_light as f32,
                     "moonLight" => video.moon_light,
+                    // MONKEY (ground relief)
+                    "groundRelief" => video.ground_relief as f32,
                     _ => panic!("add the observer readback for {k}"),
                 };
                 assert_eq!(applied, value.parse::<f32>().unwrap(), "{name}/{k}");

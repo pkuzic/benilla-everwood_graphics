@@ -38,7 +38,15 @@ pub(crate) struct DynamicInteriorPlugin;
 impl Plugin for DynamicInteriorPlugin {
     fn build(&self, app: &mut App) {
         // MONKEY (sync 1108): after the UI lane drain, which can write `VideoConfig`.
-        app.add_systems(Update, bridge.after(crate::lanes::UiLanes));
+        // MONKEY (ground/model relief, sync 1109): before the world stream, where the relief
+        // dials this bridge writes seed new tiles (`WorldStage::Stream`) and are pushed into the
+        // live materials (`WorldStage::Present`).
+        app.add_systems(
+            Update,
+            bridge
+                .after(crate::lanes::UiLanes)
+                .before(benilla_world::schedule::WorldStage::Stream),
+        );
     }
 }
 
@@ -68,7 +76,18 @@ fn bridge(
     mut emissive: ResMut<EmissiveTier>,
     // GFX (moonlight): the additive moon term's dial (Option: absent in headless tests).
     moon_light: Option<ResMut<benilla_world::lighting::MoonLight>>,
+    // MONKEY (ground relief): the terrain relief mode + depth (Option: absent in headless tests).
+    ground_relief: Option<ResMut<benilla_world::terrain_stream::GroundRelief>>,
 ) {
+    if let Some(mut ground_relief) = ground_relief {
+        let want = benilla_world::terrain_stream::GroundRelief {
+            mode: video.ground_relief,
+            depth: video.ground_relief_depth,
+        };
+        if *ground_relief != want {
+            *ground_relief = want;
+        }
+    }
     if let Some(mut moon_light) = moon_light {
         if moon_light.0 != video.moon_light {
             moon_light.0 = video.moon_light;

@@ -68,6 +68,46 @@ pub use queries::{
 use residency::publish_terrain_residency;
 pub use residency::TerrainResidency;
 
+/// MONKEY (ground relief): the `groundRelief` / `groundReliefDepth` cvars as the terrain reads them
+/// (written by the app's settings bridge). `mode` 0 = off — today's terrain render, bit for bit —
+/// 1 normal mapping, 2 + parallax occlusion, 3 + parallax self-shadow, 4 / 5 debug (height /
+/// normal). `depth` is the POM depth in tiled-UV units. Packed into every tile material's
+/// `TerrainExtension::params` `.y` / `.w` at spawn and by [`monkey_sync_ground_relief`] on change.
+#[derive(Resource, Clone, Copy, Debug, PartialEq)]
+pub struct GroundRelief {
+    pub mode: u8,
+    pub depth: f32,
+}
+
+impl Default for GroundRelief {
+    fn default() -> Self {
+        Self {
+            mode: 0,
+            depth: 0.06,
+        }
+    }
+}
+
+/// MONKEY (ground relief): push a changed [`GroundRelief`] into every live tile material, touching
+/// only the materials whose lanes actually differ (a touched material re-prepares its bind group).
+fn monkey_sync_ground_relief(
+    relief: Res<GroundRelief>,
+    mut materials: ResMut<Assets<TerrainMaterial>>,
+) {
+    let (mode, depth) = (f32::from(relief.mode), relief.depth);
+    let stale: Vec<AssetId<TerrainMaterial>> = materials
+        .iter()
+        .filter(|(_, m)| m.extension.params.y != mode || m.extension.params.w != depth)
+        .map(|(id, _)| id)
+        .collect();
+    for id in stale {
+        if let Some(m) = materials.get_mut(id) {
+            m.extension.params.y = mode;
+            m.extension.params.w = depth;
+        }
+    }
+}
+
 /// Wall-clock per frame for spawning streamed tiles and placements before the rest waits a frame;
 /// uncapped, a cold start spawns the whole ring at once and blocks the main thread for seconds.
 const SPAWN_BUDGET: Duration = Duration::from_millis(4);
@@ -532,6 +572,16 @@ impl Plugin for TerrainPlugin {
             // MONKEY (reviewfix-a): the capture-only camera area (zone grading in captures).
             .init_resource::<CaptureCameraArea>()
             .init_resource::<queries::AreaMap>()
+            // MONKEY (ground relief): the relief dials, and their push into live tile materials.
+            .init_resource::<GroundRelief>()
+            .add_systems(
+                Update,
+                monkey_sync_ground_relief
+                    .run_if(resource_changed::<GroundRelief>)
+                    // MONKEY (ground relief, sync 1109): after the whole stream chain (its
+                    // exclusive read barrier included), so the push is ordered against it.
+                    .in_set(WorldStage::Present),
+            )
             // In `WorldStage::Stream`, between the teleport snap (Input) and the loading cover
             // (Present), so a swap never renders uncovered. Between the requests and the spawn
             // the frame waits for the inner window's tiles and attaches finished colliders, so the
@@ -998,8 +1048,11 @@ fn spawn_streamed_tiles(
     mut load_progress: Option<ResMut<WorldLoadProgress>>,
     // `None` only under `WOW_STATIC_GX=0`.
     mut staticgx: Option<ResMut<crate::static_gx::StaticGx>>,
+    // MONKEY (ground relief): the relief mode/depth every new tile material starts with.
+    ground_relief: Option<Res<GroundRelief>>,
 ) {
     let (mut materials, mut meshes, wdts, mut activity, torch) = asset_stores;
+    let ground_relief = ground_relief.as_deref().copied().unwrap_or_default();
     // MONKEY (outdoor torch shadows: terrain): the torch binds join the light buffer's gate. They
     // are born in the SAME Startup system (`assets::open_world_assets`), so in practice the two are
     // never split - but a tile material built against a missing depth image would never get a bind
@@ -1051,7 +1104,14 @@ fn spawn_streamed_tiles(
                 layer_array: adt.layer_array.clone(),
                 alpha_array: adt.alpha_array.clone(),
                 shadow_array: adt.shadow_array.clone(),
-                params: Vec4::new(benilla_formats::TERRAIN_LAYER_TILES, 0.0, 0.0, 0.0),
+                // MONKEY (ground relief): y = mode, z = this tile's relief layers, w = POM depth.
+                params: Vec4::new(
+                    benilla_formats::TERRAIN_LAYER_TILES,
+                    f32::from(ground_relief.mode),
+                    adt.relief_layers as f32,
+                    ground_relief.depth,
+                ),
+                relief_array: adt.relief_array.clone(),
                 light_buf: shared_light.0.clone(),
                 // MONKEY (outdoor torch shadows: terrain): cloned per tile like the light buffer -
                 // a handle + a `Buffer` (an Arc), so the per-tile cost is two refcount bumps and
@@ -1994,6 +2054,9 @@ mod inner_hold_tests {
             layer_array: Handle::default(),
             alpha_array: Handle::default(),
             shadow_array: Handle::default(),
+            // MONKEY (ground relief): no relief map on a test tile.
+            relief_array: Handle::default(),
+            relief_layers: 0,
             doodads: Vec::new(),
             wmos: Vec::new(),
             chunks,

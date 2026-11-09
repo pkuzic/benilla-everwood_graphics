@@ -32,6 +32,9 @@
 @group(#{MATERIAL_BIND_GROUP}) @binding(104) var alpha_array: texture_2d_array<f32>;
 @group(#{MATERIAL_BIND_GROUP}) @binding(105) var splat_samp: sampler;
 @group(#{MATERIAL_BIND_GROUP}) @binding(110) var shadow_array: texture_2d_array<f32>;
+// MONKEY (ground relief): the tile's relief maps, indexed like `layer_array` (RGBA linear: normal
+// X (+u) / Y (+v) as `(byte-128)/127`, B cavity, A height); sampled through `splat_samp`.
+@group(#{MATERIAL_BIND_GROUP}) @binding(107) var relief_array: texture_2d_array<f32>;
 
 // A fully covered character shadow retains 45% of the authored terrain colour.
 const SHADOW_SUN_FLOOR: f32 = 0.45;
@@ -39,7 +42,10 @@ const SHADOW_SUN_FLOOR: f32 = 0.45;
 // Per-tile Vec4 uniforms packed into ONE buffer (binding 106) — the field order here MUST match the
 // Rust `TerrainExtension` struct. Light + fog live in the shared global-light storage buffer (below);
 // what's left is just the per-tile layer tiling factor.
-//   params — x = layer tiling factor; yzw unused.
+//   params — x = layer tiling factor.
+//   MONKEY (ground relief): y = relief mode (`groundRelief`: 0 off, 1 normals, 2 +POM,
+//   3 +POM self-shadow, 4 debug height, 5 debug normal), z = this tile's relief layer count (0 = the
+//   tile has no relief map), w = POM depth in tiled-UV units (`groundReliefDepth`).
 struct TerrainParams {
     params: vec4<f32>,
 };
@@ -514,7 +520,9 @@ fn point_light_eval(sel: vec4<u32>, P: vec3<f32>, N: vec3<f32>) -> vec3<f32> {
 // the scan entirely wherever the unshadowed term is already invisible, which on terrain is most of
 // the frame (ground facing away from the fire, or far enough out that the falloff has taken the
 // term below a code).
-fn point_light_eval_shadowed(sel: vec4<u32>, P: vec3<f32>, N: vec3<f32>) -> vec3<f32> {
+// MONKEY (ground relief): `Ns` is the SHADING normal (the relief-perturbed one, or `N` itself with
+// the lane off); `N` stays the geometric normal the cube-map lookup normal-offsets along.
+fn point_light_eval_shadowed(sel: vec4<u32>, P: vec3<f32>, N: vec3<f32>, Ns: vec3<f32>) -> vec3<f32> {
     var sum = vec3<f32>(0.0);
     for (var s = 0u; s < EXT_SEL_K; s = s + 1u) {
         let idx = ext_sel_get(sel, s);
@@ -525,7 +533,7 @@ fn point_light_eval_shadowed(sel: vec4<u32>, P: vec3<f32>, N: vec3<f32>) -> vec3
         let to_light = fixture - P;
         let d = length(to_light);
         let atten = 1.0 / (0.7 * d + 0.03 * d * d);
-        let nl = max(dot(N, to_light / max(d, 1e-4)), 0.0);
+        let nl = max(dot(Ns, to_light / max(d, 1e-4)), 0.0);
         // MONKEY (torch lane perf): the occlusion is a factor on a term that is already zero on any
         // ground facing away from the fire.
         let ext_w = atten * nl;
@@ -557,6 +565,61 @@ fn mcnk_cell_anchor(P: vec3<f32>) -> vec3<f32> {
 // draw unit ranks by. The same grid constant as above, halved: 533.33333/16/2 = 16.666666. An
 // own-origin unit passes 0 instead. MIRRORED in wow_model.wgsl / static_gx.wgsl - keep in sync.
 const MCNK_CELL_HALF: f32 = 533.33333 / 32.0;
+
+// ── MONKEY (ground relief) ───────────────────────────────────────────────────────────────────────
+// Per-pixel normal mapping, parallax occlusion mapping (POM) and parallax self-shadowing on the
+// splat, from the offline relief maps in `relief_array`. Everything hangs off `relief_on` in the
+// fragment (a UNIFORM test: the mode cvar and this tile's relief layer count), so with the lane
+// off the fragment runs today's taps and today's light sum, instruction for instruction.
+//
+// The POM depth fades to zero between these camera distances (yd) and the loops are skipped past
+// the end; minified relief is flat anyway, and the fade hides the swim of a vanishing offset.
+const RELIEF_FADE_START: f32 = 25.0;
+const RELIEF_FADE_END: f32 = 45.0;
+// POM march steps: many at a grazing view, few looking straight down.
+const RELIEF_POM_STEPS_MAX: f32 = 16.0;
+const RELIEF_POM_STEPS_MIN: f32 = 4.0;
+// The self-shadow march toward the sun, and how hard a blocking crest darkens (per unit height).
+const RELIEF_SHADOW_STEPS: u32 = 8u;
+const RELIEF_SHADOW_K: f32 = 4.0;
+// A layer with no relief map (or one EME paint appended past the array) samples as this texel:
+// zero tilt under the `(byte-128)/127` decode, fully open, top height.
+const RELIEF_FLAT: vec4<f32> = vec4<f32>(128.0 / 255.0, 128.0 / 255.0, 1.0, 1.0);
+
+// One layer's relief texel. Explicit gradients: these taps run in loops and at offset uvs, where
+// implicit derivatives are meaningless (and illegal in non-uniform control flow).
+fn relief_tap(uv: vec2<f32>, layer: i32, count: i32, gx: vec2<f32>, gy: vec2<f32>) -> vec4<f32> {
+    if (layer < count) {
+        return textureSampleGrad(relief_array, splat_samp, uv, layer, gx, gy);
+    }
+    return RELIEF_FLAT;
+}
+
+// The four layers' relief, splat-blended exactly like the colour (`mix` by the alpha map).
+fn relief_blend(uv: vec2<f32>, li: vec4<i32>, a: vec4<f32>, count: i32, gx: vec2<f32>,
+    gy: vec2<f32>) -> vec4<f32> {
+    var r = relief_tap(uv, li.x, count, gx, gy);
+    r = mix(r, relief_tap(uv, li.y, count, gx, gy), a.r);
+    r = mix(r, relief_tap(uv, li.z, count, gx, gy), a.g);
+    r = mix(r, relief_tap(uv, li.w, count, gx, gy), a.b);
+    return r;
+}
+
+// Tangent-space normal from a blended texel: `(byte-128)/127`, so 128 is exactly flat.
+fn relief_normal_ts(r: vec4<f32>) -> vec3<f32> {
+    let xy = clamp((r.rg * 255.0 - 128.0) / 127.0, vec2<f32>(-1.0), vec2<f32>(1.0));
+    return vec3<f32>(xy, sqrt(max(1.0 - dot(xy, xy), 0.0)));
+}
+
+// The vertex stage's sun specular at an arbitrary normal (white material, row-9 colour, local
+// viewer), so the relief lane can swap the normal by DIFFERENCE and stay exact on flat relief.
+fn relief_sun_spec(n: vec3<f32>, P: vec3<f32>) -> vec3<f32> {
+    let l = -normalize(wow_light.light_sun.xyz);
+    let v = normalize(view.world_position.xyz - P);
+    let h = normalize(l + v);
+    let ndoth = max(dot(n, h), 0.0);
+    return clamp(wow_light.light_spec.rgb * pow(ndoth, wow_light.light_spec.w), vec3<f32>(0.0), vec3<f32>(1.0));
+}
 
 @vertex
 fn vertex(in: Vertex) -> TerrainVsOut {
@@ -616,17 +679,127 @@ fn fragment(in: TerrainVsOut) -> @location(0) vec4<f32> {
     let ai = i32(round(in.uv_b.x));
 
     let tiled = in.uv * t.params.x;
+    // The alpha and shadow maps (one untiled 64² grid per chunk) share the layers' repeat sampler,
+    // so a linear footprint at a chunk edge would wrap to the far edge; a half-texel inset clamps.
+    // MONKEY (ground relief): fetched BEFORE the layer taps (it was right after them; the two are
+    // independent) because the relief blend below needs the splat weights. Always on `in.uv`:
+    // parallax never moves the per-chunk alpha / MCSH / shadow lookups.
+    let auv = clamp(in.uv, vec2<f32>(0.5 / 64.0), vec2<f32>(1.0 - 0.5 / 64.0));
+    let a = textureSample(alpha_array, splat_samp, auv, ai);
+
+    // MONKEY (ground relief): the lane's gate is UNIFORM (this tile's material uniform), so the
+    // derivatives and the implicit-derivative taps below stay in uniform control flow.
+    let relief_mode = u32(max(t.params.y, 0.0) + 0.5);
+    let relief_layers = i32(max(t.params.z, 0.0) + 0.5);
+    let relief_on = relief_mode != 0u && relief_layers > 0;
+    let relief_pom = relief_on && relief_mode >= 2u;
+    var relief_uv = tiled;          // the parallax-offset tiled uv (== `tiled` without POM)
+    var relief = RELIEF_FLAT;       // the splat-blended relief texel at `relief_uv`
+    var relief_n = vec3<f32>(0.0);  // the perturbed world normal (set only when `relief_on`)
+    var relief_sun = 1.0;           // the self-shadow factor on the SUN arm only
+    var relief_gx = vec2<f32>(0.0); // the ORIGINAL tiled-uv gradients, mip-biased
+    var relief_gy = vec2<f32>(0.0);
+    // MONKEY (ground relief, sync 1109): the frame's derivatives are taken here, outside the gate,
+    // so no implicit derivative sits in a nested block (`derivative_samples_stay_in_uniform_control_
+    // flow`); unused, and so free, with the lane off.
+    let dp1 = dpdx(in.world_position.xyz);
+    let dp2 = dpdy(in.world_position.xyz);
+    let duv1 = dpdx(tiled);
+    let duv2 = dpdy(tiled);
+    if (relief_on) {
+        // Schüler's cotangent frame ("normal mapping without precomputed tangents"): T along +u,
+        // B along +v of the TILED uv, both in the plane of the geometric normal.
+        let rp = in.world_position.xyz;
+        let rn = normalize(in.world_normal);
+        let dp2perp = cross(dp2, rn);
+        let dp1perp = cross(rn, dp1);
+        let rt_raw = dp2perp * duv1.x + dp1perp * duv2.x;
+        let rb_raw = dp2perp * duv1.y + dp1perp * duv2.y;
+        let rt = rt_raw * inverseSqrt(max(dot(rt_raw, rt_raw), 1e-20));
+        let rb = rb_raw * inverseSqrt(max(dot(rb_raw, rb_raw), 1e-20));
+        // `view.mip_bias` folded into the gradients, as the biased taps take it.
+        let bias_scale = exp2(view.mip_bias);
+        relief_gx = duv1 * bias_scale;
+        relief_gy = duv2 * bias_scale;
+
+        let rdist = distance(rp, view.world_position.xyz);
+        let rfade = 1.0 - smoothstep(RELIEF_FADE_START, RELIEF_FADE_END, rdist);
+        let rdepth = max(t.params.w, 0.0) * rfade;
+        let to_eye = normalize(view.world_position.xyz - rp);
+        let v_ts = vec3<f32>(dot(to_eye, rt), dot(to_eye, rb), dot(to_eye, rn));
+        // The POM hit's height (1 = top, where an un-displaced sample sits).
+        var hit_h = 1.0;
+        if (relief_pom && rdepth > 1e-5 && v_ts.z > 0.0) {
+            // Steep parallax on the BLENDED height (depth = 1 - height), then a linear refinement
+            // between the last two layers (classic POM).
+            let steps = mix(RELIEF_POM_STEPS_MAX, RELIEF_POM_STEPS_MIN, clamp(v_ts.z, 0.0, 1.0));
+            let n_steps = u32(steps + 0.5);
+            let layer_d = 1.0 / f32(n_steps);
+            let duv = v_ts.xy / max(v_ts.z, 0.1) * rdepth * layer_d;
+            var cur_uv = tiled;
+            var cur_d = 0.0;
+            var cur_map = 1.0 - relief_blend(cur_uv, li, a, relief_layers, relief_gx, relief_gy).a;
+            var prev_uv = cur_uv;
+            var prev_map = cur_map;
+            for (var i = 0u; i < n_steps && cur_d < cur_map; i = i + 1u) {
+                prev_uv = cur_uv;
+                prev_map = cur_map;
+                cur_uv = cur_uv - duv;
+                cur_d = cur_d + layer_d;
+                cur_map = 1.0 - relief_blend(cur_uv, li, a, relief_layers, relief_gx, relief_gy).a;
+            }
+            let after = cur_map - cur_d;
+            let before = prev_map - (cur_d - layer_d);
+            let denom = after - before;
+            let w = select(0.0, clamp(after / denom, 0.0, 1.0), abs(denom) > 1e-6);
+            relief_uv = mix(cur_uv, prev_uv, w);
+            hit_h = 1.0 - mix(cur_d, cur_d - layer_d, w);
+        }
+        relief = relief_blend(relief_uv, li, a, relief_layers, relief_gx, relief_gy);
+        let nts = relief_normal_ts(relief);
+        relief_n = normalize(rt * nts.x + rb * nts.y + rn * nts.z);
+
+        // Mode 3+: march from the POM hit toward the sun; a crest above the ray shades the SUN arm
+        // only. Faded like POM, and by the sun's own shadow weight (0 at night: skipped).
+        let rsun_w = clamp(shadow_hook::sun_shadow_w(wow_light.fog_params.z), 0.0, 1.0);
+        if (relief_mode >= 3u && rdepth > 1e-5 && rsun_w > 0.01) {
+            let to_sun = -normalize(wow_light.light_sun.xyz);
+            let l_ts = vec3<f32>(dot(to_sun, rt), dot(to_sun, rb), dot(to_sun, rn));
+            let dh = (1.0 - hit_h) / f32(RELIEF_SHADOW_STEPS);
+            if (l_ts.z > 0.0 && dh > 1e-4) {
+                let suv = l_ts.xy / max(l_ts.z, 0.1) * rdepth * dh;
+                var occ = 0.0;
+                for (var i = 1u; i <= RELIEF_SHADOW_STEPS; i = i + 1u) {
+                    let fi = f32(i);
+                    let ray_h = hit_h + dh * fi;
+                    let hs = relief_blend(relief_uv + suv * fi, li, a, relief_layers, relief_gx,
+                        relief_gy).a;
+                    // Nearer crests weigh more: the penumbra softens with distance along the ray.
+                    occ = max(occ, (hs - ray_h) * (1.0 - (fi - 1.0) / f32(RELIEF_SHADOW_STEPS)));
+                }
+                let soft = 1.0 - clamp(occ * RELIEF_SHADOW_K, 0.0, 1.0);
+                relief_sun = mix(1.0, soft, rfade * rsun_w);
+            }
+        }
+    }
+
     // `.a` is the `_s` texture's sheen mask, 0 without an `_s`. `view.mip_bias` undoes the coarser
     // mip a render scale below 1 picks; the alpha and shadow arrays have one mip, so only the
     // layers take it.
-    let s0 = textureSampleBias(layer_array, splat_samp, tiled, li.x, view.mip_bias);
-    let s1 = textureSampleBias(layer_array, splat_samp, tiled, li.y, view.mip_bias);
-    let s2 = textureSampleBias(layer_array, splat_samp, tiled, li.z, view.mip_bias);
-    let s3 = textureSampleBias(layer_array, splat_samp, tiled, li.w, view.mip_bias);
-    // The alpha and shadow maps (one untiled 64² grid per chunk) share the layers' repeat sampler,
-    // so a linear footprint at a chunk edge would wrap to the far edge; a half-texel inset clamps.
-    let auv = clamp(in.uv, vec2<f32>(0.5 / 64.0), vec2<f32>(1.0 - 0.5 / 64.0));
-    let a = textureSample(alpha_array, splat_samp, auv, ai);
+    // MONKEY (ground relief, sync 1109): the stock taps run unconditionally (implicit derivatives
+    // stay in uniform control flow) and POM replaces them with explicit-gradient taps.
+    var s0 = textureSampleBias(layer_array, splat_samp, tiled, li.x, view.mip_bias);
+    var s1 = textureSampleBias(layer_array, splat_samp, tiled, li.y, view.mip_bias);
+    var s2 = textureSampleBias(layer_array, splat_samp, tiled, li.z, view.mip_bias);
+    var s3 = textureSampleBias(layer_array, splat_samp, tiled, li.w, view.mip_bias);
+    if (relief_pom) {
+        // MONKEY (ground relief): the parallax-offset uv with the ORIGINAL (biased) gradients, so
+        // the offset's discontinuities never pick a wrong mip.
+        s0 = textureSampleGrad(layer_array, splat_samp, relief_uv, li.x, relief_gx, relief_gy);
+        s1 = textureSampleGrad(layer_array, splat_samp, relief_uv, li.y, relief_gx, relief_gy);
+        s2 = textureSampleGrad(layer_array, splat_samp, relief_uv, li.z, relief_gx, relief_gy);
+        s3 = textureSampleGrad(layer_array, splat_samp, relief_uv, li.w, relief_gx, relief_gy);
+    }
 
     var color = s0.rgb;
     color = mix(color, s1.rgb, a.r);
@@ -675,17 +848,38 @@ fn fragment(in: TerrainVsOut) -> @location(0) vec4<f32> {
         wow_light.monkey.misc.w,
     );
     let world_shadow = shadow_terms.x;
+    // MONKEY (ground relief): the SHADING normal (lighting: points, moon, wet) and the sun/ambient
+    // inputs. With the lane off these are `n_lit` / `in.base_lit` / `in.primary` / `in.specular`
+    // themselves; `n_lit` stays the geometric normal for every shadow lookup and normal offset.
+    // On: the vertex sum used the smooth MCNR normal, so the sun arm is swapped by DIFFERENCE —
+    // `+ diffuse·(max(Np·L,0)·selfshadow − max(N·L,0))` — which is exactly 0 on flat relief
+    // (`Np == N`, self-shadow 1), keeping the authored Gouraud look wherever the map is flat.
+    var n_shade = n_lit;
+    var base_lit = in.base_lit;
+    var primary_in = in.primary;
+    var specular_in = in.specular;
+    if (relief_on) {
+        n_shade = relief_n;
+        let to_sun = -normalize(wow_light.light_sun.xyz);
+        let sun_delta = wow_light.light_diffuse.rgb
+            * (max(dot(relief_n, to_sun), 0.0) * relief_sun - max(dot(n_lit, to_sun), 0.0));
+        base_lit = in.base_lit + sun_delta;
+        primary_in = clamp(in.primary + sun_delta, vec3<f32>(0.0), vec3<f32>(1.0));
+        let spec_delta = relief_sun_spec(relief_n, in.world_position.xyz)
+            - relief_sun_spec(n_lit, in.world_position.xyz);
+        specular_in = clamp((in.specular + spec_delta) * relief_sun, vec3<f32>(0.0), vec3<f32>(1.0));
+    }
     // MONKEY (local-light consistency): per-pixel falloff on terrain, as on WMO and props.
     // Night adds each selected fixture's own occlusion on the existing smooth dusk clock.
-    var points = point_light_eval(in.ext_sel, in.world_position.xyz, n_lit);
+    var points = point_light_eval(in.ext_sel, in.world_position.xyz, n_shade);
     let ext_night_w = select(0.0, clamp(1.0 - sun_shadow_strength, 0.0, 1.0), torch_ext_on());
     if (ext_night_w > 0.0) {
         points = mix(points,
-            point_light_eval_shadowed(in.ext_sel, in.world_position.xyz, n_lit), ext_night_w);
+            point_light_eval_shadowed(in.ext_sel, in.world_position.xyz, n_lit, n_shade), ext_night_w);
     }
-    var primary = in.primary;
+    var primary = primary_in;
     if (ext_sel_get(in.ext_sel, 0u) != EXT_SEL_EMPTY) {
-        primary = clamp(in.base_lit + points, vec3<f32>(0.0), vec3<f32>(1.0));
+        primary = clamp(base_lit + points, vec3<f32>(0.0), vec3<f32>(1.0));
     }
 
     // MONKEY (moon shadows): attenuate the SKY (ambient AND directional) BEFORE adding points
@@ -693,13 +887,13 @@ fn fragment(in: TerrainVsOut) -> @location(0) vec4<f32> {
     // must remain 1 under a .35 moon shadow, not .93. Point lights keep their energy;
     // only the sky is attenuated before the final light-sum clamp.
     if (shadow_terms.y < 1.0) {
-        primary = clamp(in.base_lit * shadow_terms.y + points, vec3<f32>(0.0), vec3<f32>(1.0));
+        primary = clamp(base_lit * shadow_terms.y + points, vec3<f32>(0.0), vec3<f32>(1.0));
     }
     // GFX (moonlight): ADD the moon (cool, N·L, shadowed by the moon's own map) onto the stock
     // night. `moon.w` is exactly 0 by day and with `moonLight 0`, so the branch is not entered.
     if (wow_light.monkey.moon.w > 0.0) {
         primary = clamp(
-            primary + moonlight_hook::moon_light(n_lit, wow_light.monkey.moon) * shadow_terms.z,
+            primary + moonlight_hook::moon_light(n_shade, wow_light.monkey.moon) * shadow_terms.z,
             vec3<f32>(0.0),
             vec3<f32>(1.0),
         );
@@ -756,15 +950,20 @@ fn fragment(in: TerrainVsOut) -> @location(0) vec4<f32> {
         }
     }
     // MONKEY (wet): rain-darkened ground + puddles (wet_hook.wgsl); a dry frame returns `color`.
-    let wet = wet_hook::wet_puddles(wet_hook::wet_surface(color, n_lit, in.world_position.xyz,
-        wet_open, wow_light.monkey), n_lit, in.world_position.xyz, wet_open, wow_light.monkey);
+    // MONKEY (ground relief): `n_shade` is `n_lit` with the relief lane off.
+    let wet = wet_hook::wet_puddles(wet_hook::wet_surface(color, n_shade, in.world_position.xyz,
+        wet_open, wow_light.monkey), n_shade, in.world_position.xyz, wet_open, wow_light.monkey);
     color = wet.albedo;
-    let diffuse_term = color * primary * (0.3 * shadow_lit_eff + 0.7) * character_shadow_term;
-    let spec_term = in.specular * specmask * spec_gate;
+    var diffuse_term = color * primary * (0.3 * shadow_lit_eff + 0.7) * character_shadow_term;
+    // MONKEY (ground relief): a mild cavity darkening (B = 1 open), relief lane only.
+    if (relief_on) {
+        diffuse_term = diffuse_term * mix(1.0, relief.b, 0.5);
+    }
+    let spec_term = specular_in * specmask * spec_gate;
     var tuned = clamp(diffuse_term + spec_term, vec3<f32>(0.0), vec3<f32>(1.0));
     // MONKEY (wet): the wet sheen, and the authored `_s` sheen brightens with it.
     if (wet.boost > 0.0) {
-        tuned = clamp(tuned + spec_term * wet.boost + wet_hook::wet_sheen(wet.boost, n_lit,
+        tuned = clamp(tuned + spec_term * wet.boost + wet_hook::wet_sheen(wet.boost, n_shade,
             normalize(view.world_position - in.world_position.xyz), -normalize(wow_light.light_sun.xyz),
             wow_light.light_diffuse.rgb, wow_light.fog_color.rgb, spec_gate), vec3<f32>(0.0), vec3<f32>(1.0));
     }
@@ -795,6 +994,14 @@ fn fragment(in: TerrainVsOut) -> @location(0) vec4<f32> {
         // MONKEY (p0 fog hook): the shared fog law (fog_hook.wgsl); classic is bit-identical.
         tuned = fog_hook::apply_fog(tuned, wow_light.fog_color.xyz, wow_light.fog_params.xy, eye_z,
             in.world_position.xyz, view.world_position, true, wow_light.monkey);
+    }
+
+    // MONKEY (ground relief): the debug views (`groundRelief 4` = the blended height as grey,
+    // `5` = the perturbed normal as `Np*0.5+0.5`), unfogged so the map reads at any distance.
+    if (relief_on && relief_mode == 4u) {
+        tuned = vec3<f32>(relief.a);
+    } else if (relief_on && relief_mode >= 5u) {
+        tuned = relief_n * 0.5 + 0.5;
     }
 
     // Raw gamma out: the framebuffer holds gamma bytes and blends in gamma like the reference's;

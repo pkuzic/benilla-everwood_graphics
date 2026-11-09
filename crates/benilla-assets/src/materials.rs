@@ -509,9 +509,17 @@ pub struct TerrainExtension {
     /// Per-chunk MCSH shadow maps (`R` = shadowed); `UV1.y` is the layer, `-1` for none.
     #[texture(110, dimension = "2d_array", visibility(fragment))]
     pub shadow_array: Handle<Image>,
+    /// MONKEY (ground relief): the tile's relief maps (`AdtTile::relief_array`, Rgba8Unorm linear:
+    /// normal XY, cavity, height), indexed like `layer_array`; sampled through binding 105's
+    /// sampler like every other array here (Metal's 16-sampler budget).
+    #[texture(107, dimension = "2d_array", visibility(fragment))]
+    pub relief_array: Handle<Image>,
 
     // Binding 106's uniforms, in the field order of the WGSL `TerrainParams`.
-    /// `x` = texture tiling factor (repeats per chunk); other lanes unused.
+    /// `x` = texture tiling factor (repeats per chunk).
+    /// MONKEY (ground relief): `y` = relief mode (`groundRelief`: 0 off, 1 normals, 2 +POM,
+    /// 3 +self-shadow, 4/5 debug), `z` = this tile's `relief_layers`, `w` = POM depth in tiled-UV
+    /// units (`groundReliefDepth`). `y == 0` or `z == 0` is today's shader path exactly.
     #[uniform(106)]
     pub params: Vec4,
 
@@ -619,6 +627,31 @@ mod tests {
             "terrain's exterior torch lane is no longer gated on `ext_night_w > 0.0` — daylight is \
              now paying for (and possibly rendering) the night blend, and the day look is free to \
              drift by a rounding step"
+        );
+    }
+
+    /// MONKEY (ground relief): the relief lane's two silent contracts. The WGSL binding must match
+    /// the `#[texture(107)]` attribute (a mismatch is a bind-group validation failure — no ground),
+    /// and the whole lane must hang off ONE uniform gate, so `groundRelief 0` (or a tile with no
+    /// relief map) takes today's taps and today's light sum.
+    #[test]
+    fn the_relief_lane_is_bound_and_gated_on_its_uniform() {
+        let terrain = include_str!("shaders/terrain.wgsl");
+        assert!(
+            terrain.contains(
+                "@group(#{MATERIAL_BIND_GROUP}) @binding(107) var relief_array: texture_2d_array<f32>;"
+            ),
+            "terrain.wgsl no longer declares the relief array at binding 107"
+        );
+        assert!(
+            terrain.contains("let relief_on = relief_mode != 0u && relief_layers > 0;"),
+            "the relief lane is no longer gated on the mode and the tile's relief layer count"
+        );
+        assert!(
+            terrain.contains(
+                "s0 = textureSampleBias(layer_array, splat_samp, tiled, li.x, view.mip_bias);"
+            ),
+            "the relief-off colour taps are no longer today's biased taps on the tiled uv"
         );
     }
 
