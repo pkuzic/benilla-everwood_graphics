@@ -166,11 +166,24 @@ fn index() -> &'static Mutex<Index> {
     I.get_or_init(Default::default)
 }
 
+/// MONKEY (model relief): bumped on every [`register_model_relief`]. Unlike
+/// [`take_fresh_model_relief`] (drained by the material sync) any number of readers can poll it:
+/// `benilla-world`'s retained static pass re-resolves its items' relief layers when it moves.
+static GENERATION: AtomicU32 = AtomicU32::new(0);
+
 /// MONKEY (model relief): index `relief` as the map of the texture `texture`.
 pub fn register_model_relief(texture: AssetId<Image>, relief: Handle<Image>) {
     let mut ix = index().lock_recover();
     ix.map.insert(texture, relief);
     ix.fresh.push(texture);
+    // MONKEY (model relief): under the lock, so a reader that sees the new count finds the map.
+    GENERATION.fetch_add(1, Ordering::Release);
+}
+
+/// MONKEY (model relief): the index's registration count; a change means some texture may have
+/// gained a relief map since the last read.
+pub fn model_relief_generation() -> u32 {
+    GENERATION.load(Ordering::Acquire)
 }
 
 /// MONKEY (model relief): the relief map of the texture `texture`, if it has one (indexed yet).

@@ -139,6 +139,8 @@ pub(crate) struct GxWorld {
 }
 
 use super::pool::GxTexturePool;
+// MONKEY (model relief): the statics' relief array and the record bits it fills.
+use super::relief::{GxReliefPool, ReliefKey, RECORD_BASE_LAYER_MASK};
 
 /// Record column w, bit 14: the item's interior fog lane, read by `static_gx.wgsl`. Bit 0 is the
 /// kill bit and bits 1..=13 the probe slot.
@@ -205,7 +207,8 @@ struct GxCellGpu {
     /// One bind group per pool class the region's items touch: (pool class, bind group).
     bind_groups: Vec<(u16, BindGroup)>,
     record_table: Buffer,
-    #[allow(dead_code)] // held alive for the bind groups that reference it
+    // MONKEY (model relief): also read again when the relief array arrives and the bind groups
+    // are rebuilt (`sync_relief`).
     cell_uniform: Buffer,
     /// Per item, its index into `bind_groups`, kept for kill-driven run rebuilds.
     item_slot: Vec<u16>,
@@ -215,6 +218,10 @@ struct GxCellGpu {
     killed_applied: u32,
     /// The [`GxSel::fog`] the records were last written from; empty until the first sync.
     fog_applied: Vec<bool>,
+    /// MONKEY (model relief): what the records' relief half was last resolved against (`None`
+    /// until the first sync), and whether the bind groups bind the real relief array.
+    relief_key: Option<ReliefKey>,
+    relief_real: bool,
 }
 
 #[derive(Resource, Default)]
@@ -248,7 +255,16 @@ fn init_pipelines(
     mut commands: Commands,
     mesh_pipeline: Res<MeshPipeline>,
     render_device: Res<RenderDevice>,
+    // MONKEY (model relief): for the relief blit pipeline (`relief.rs`).
+    pipeline_cache: Res<PipelineCache>,
+    asset_server: Res<AssetServer>,
 ) {
+    // MONKEY (model relief): the relief pool (no array yet: allocated on first use).
+    commands.insert_resource(GxReliefPool::new(
+        &render_device,
+        &pipeline_cache,
+        &asset_server,
+    ));
     // Use Bevy's real mesh-view layout for the retained pass. Besides the view and light records,
     // this carries the directional shadow textures and comparison samplers produced for the
     // world camera. The old two-binding layout could render the city, but it had no legal way for
@@ -284,6 +300,10 @@ fn init_pipelines(
                 texture_2d_array(TextureSampleType::Float { filterable: true }),
                 sampler(SamplerBindingType::Filtering),
                 sampler(SamplerBindingType::Filtering),
+                // MONKEY (model relief): 5 the statics' relief array (`relief.rs`; a 1×1 dummy
+                // until allocated, so this layout never changes), 6 the `[mode, depth]` dials.
+                texture_2d_array(TextureSampleType::Float { filterable: true }),
+                uniform_buffer_sized(false, Some(std::num::NonZero::new(16).unwrap())),
             ),
         ),
     );
@@ -414,6 +434,8 @@ fn prepare_static_gx(
     gx: Res<GxWorld>,
     mut cache: ResMut<GxGpuCache>,
     mut pool: ResMut<GxTexturePool>,
+    // MONKEY (model relief): the statics' relief array (`relief.rs`).
+    mut relief: ResMut<GxReliefPool>,
     mut pipes: ResMut<GxPipelines>,
     pipeline_cache: Res<PipelineCache>,
     render_device: Res<RenderDevice>,
@@ -519,6 +541,9 @@ fn prepare_static_gx(
         if !pool.is_empty() {
             *pool = GxTexturePool::default();
         }
+        // MONKEY (model relief): the relief array resets with the map, like the base pool.
+        relief.reset();
+        relief.sync_dials(&render_queue);
         cache.cells.clear();
         cache.wmos.clear();
         cache.props.clear();
@@ -549,6 +574,7 @@ fn prepare_static_gx(
                     draw,
                     0, // a terrain cell belongs to no building (MONKEY, room gate)
                     &mut pool,
+                    &relief, // MONKEY (model relief)
                     &pipes,
                     &pipeline_cache,
                     &render_device,
@@ -569,6 +595,7 @@ fn prepare_static_gx(
                     draw,
                     entity.index().index(),
                     &mut pool,
+                    &relief, // MONKEY (model relief)
                     &pipes,
                     &pipeline_cache,
                     &render_device,
@@ -591,6 +618,7 @@ fn prepare_static_gx(
             draw,
             entity.index().index(),
             &mut pool,
+            &relief, // MONKEY (model relief)
             &pipes,
             &pipeline_cache,
             &render_device,
@@ -601,6 +629,50 @@ fn prepare_static_gx(
         }
     }
     pool.drain_pending(&render_device, &render_queue);
+
+    // MONKEY (model relief): land queued relief blits, push the dials, then re-resolve the relief
+    // half of every visible region's records whose key moved (a map arrived, a blit landed, the
+    // dial turned on). While the dial is off the key is constant, so this is one compare a region.
+    relief.drain(&render_device, &render_queue, &pipeline_cache, &images);
+    let relief_mode = relief.sync_dials(&render_queue);
+    let relief_key = relief.key(relief_mode != 0);
+    {
+        let cell_layout = pipeline_cache.get_bind_group_layout(&pipes.cell_layout);
+        let mut sync = |gpu: &mut GxCellGpu, draw: &GxCellDraw| {
+            sync_relief(
+                gpu,
+                draw,
+                relief_key,
+                &mut relief,
+                &pool,
+                &pipes,
+                &cell_layout,
+                &render_device,
+                &render_queue,
+            );
+        };
+        for vis in &gx.visible {
+            match vis {
+                GxDoodadVis::Cell(cell) => {
+                    if let (Some(gpu), Some(draw)) = (cache.cells.get_mut(cell), gx.cells.get(cell)) {
+                        sync(gpu, draw);
+                    }
+                }
+                GxDoodadVis::Prop(entity, _) => {
+                    if let (Some(gpu), Some(draw)) =
+                        (cache.props.get_mut(entity), gx.props.get(entity))
+                    {
+                        sync(gpu, draw);
+                    }
+                }
+            }
+        }
+        for (entity, _) in &gx.visible_wmos {
+            if let (Some(gpu), Some(draw)) = (cache.wmos.get_mut(entity), gx.wmos.get(entity)) {
+                sync(gpu, draw);
+            }
+        }
+    }
 
     // The kill-bit sync: on a new bitmap revision, rewrite the kill column, re-upload and rebuild
     // the runs. A cell that changed out of view syncs on re-entry.
@@ -662,6 +734,8 @@ fn assemble_region(
     // cell — half of the surface room key the interior lane gates on.
     room_instance: u32,
     pool: &mut GxTexturePool,
+    // MONKEY (model relief): binding 5 / 6 of every group-1 bind group.
+    relief: &GxReliefPool,
     pipes: &GxPipelines,
     pipeline_cache: &PipelineCache,
     render_device: &RenderDevice,
@@ -762,6 +836,9 @@ fn assemble_region(
                         pool.view(class),
                         &pipes.sampler,
                         &pipes.sampler_clamp,
+                        // MONKEY (model relief): the relief array (or its dummy) and the dials.
+                        relief.view(),
+                        relief.dial.as_entire_binding(),
                     )),
                 );
                 bind_groups.push((class, bg));
@@ -782,7 +859,67 @@ fn assemble_region(
         killed_applied: draw.killed_rev,
         // Empty, so the first fog sync always writes.
         fog_applied: Vec::new(),
+        // MONKEY (model relief): `None`, so the first relief sync always resolves.
+        relief_key: None,
+        relief_real: relief.is_real(),
     })
+}
+
+/// MONKEY (model relief): bring one region's relief state up to `key`: each item's record column
+/// `x` high half re-resolved through the pool (`(layer + 1) << 16`, 0 = none; all 0 with the dial
+/// off), the record table re-uploaded only if a column moved, and the bind groups rebuilt only
+/// when the relief array has appeared since they were made (binding 5 was the dummy).
+#[allow(clippy::too_many_arguments)]
+fn sync_relief(
+    gpu: &mut GxCellGpu,
+    draw: &GxCellDraw,
+    key: ReliefKey,
+    relief: &mut GxReliefPool,
+    pool: &GxTexturePool,
+    pipes: &GxPipelines,
+    cell_layout: &BindGroupLayout,
+    render_device: &RenderDevice,
+    render_queue: &RenderQueue,
+) {
+    if gpu.relief_key == Some(key) && gpu.relief_real == relief.is_real() {
+        return;
+    }
+    let mode_on = key.2;
+    let mut moved = false;
+    for (rec, item) in gpu.records.iter_mut().zip(&draw.draws) {
+        let bits = if mode_on {
+            relief.layer_bits(item.texture, render_device)
+        } else {
+            0
+        };
+        let x = (rec[0] & RECORD_BASE_LAYER_MASK) | bits;
+        if x != rec[0] {
+            rec[0] = x;
+            moved = true;
+        }
+    }
+    if moved {
+        render_queue.write_buffer(&gpu.record_table, 0, bytemuck::cast_slice(&gpu.records));
+    }
+    if gpu.relief_real != relief.is_real() {
+        for (class, bg) in &mut gpu.bind_groups {
+            *bg = render_device.create_bind_group(
+                "static_gx_cell",
+                cell_layout,
+                &BindGroupEntries::sequential((
+                    gpu.cell_uniform.as_entire_binding(),
+                    gpu.record_table.as_entire_binding(),
+                    pool.view(*class),
+                    &pipes.sampler,
+                    &pipes.sampler_clamp,
+                    relief.view(),
+                    relief.dial.as_entire_binding(),
+                )),
+            );
+        }
+        gpu.relief_real = relief.is_real();
+    }
+    gpu.relief_key = Some(key);
 }
 
 /// Coalesce adjacent live items sharing (slot, bucket, group) into draw runs; a killed item is

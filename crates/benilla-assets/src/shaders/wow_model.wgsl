@@ -854,7 +854,7 @@ fn interior_room_admits(i: u32, room_inst: u32, room_group: u32) -> bool {
 }
 // MONKEY (model relief): `Ns` is the SHADING normal (relief-perturbed, or `N` with the lane off),
 // used only by the wrapped Lambert; `N` stays the geometric normal of the torch-map normal offset.
-// (static_gx.wgsl's copy has no `Ns`: the retained pass carries no relief.)
+// (static_gx.wgsl's copy takes the same `Ns`: the retained pass carries the relief too.)
 fn interior_room_light(P: vec3<f32>, N: vec3<f32>, Ns: vec3<f32>, room_inst: u32, room_group: u32) -> vec3<f32> {
     let count = u32(wow_light.point_count.x);
     let k_fill = wow_light.point_count.z;

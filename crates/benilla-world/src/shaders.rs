@@ -21,6 +21,8 @@ pub(crate) fn plugin(app: &mut App) {
     bevy::asset::embedded_asset!(app, "shaders/static_gx.wgsl");
     // MONKEY (torch shadows Phase 1): the vertex-only depth-map shader for the interior-fixture pass.
     bevy::asset::embedded_asset!(app, "shaders/torch_depth.wgsl");
+    // MONKEY (model relief): the relief-array resample for the retained pass (`static_gx/relief.rs`).
+    bevy::asset::embedded_asset!(app, "shaders/static_gx_relief_blit.wgsl");
 }
 
 #[cfg(test)]
@@ -62,7 +64,8 @@ mod tests {
         // 8 since 2016 added `sky_vertex.wgsl` (the sky's shared far-depth vertex stage);
         // 9 since the torch-shadow Phase 1 added `torch_depth.wgsl` (the interior depth map).
         // MONKEY (sky): 10 with `sky_fx.wgsl`, the sky's Enhanced/High library.
-        assert_eq!(found, 10, "the engine's shader set changed size");
+        // MONKEY (model relief): 11 with `static_gx_relief_blit.wgsl`, the relief-array resample.
+        assert_eq!(found, 11, "the engine's shader set changed size");
     }
     /// The lines of `src` that take an implicit derivative (`textureSample`, `textureSampleBias`,
     /// `textureSampleCompare`, and the explicit builtins `dpdx`, `dpdy`, `fwidth` with their

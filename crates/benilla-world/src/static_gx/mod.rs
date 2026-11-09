@@ -22,6 +22,7 @@ mod bake;
 mod cull;
 mod pick;
 mod pool;
+mod relief; // MONKEY (model relief): the statics' relief array, its blit and the dial uniform
 mod render;
 mod shadow; // MONKEY (world shadows): CPU triangle collection for the static-world shadow caster
 mod torch_depth; // MONKEY (torch shadows Phase 1): the per-fixture depth-map render + its targets
