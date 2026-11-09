@@ -14,7 +14,7 @@ use benilla_assets::model_relief::{
 /// MONKEY (model relief): the `modelRelief` / `modelReliefDepth` cvars as the model lane reads
 /// them (written by the app's settings bridge). `mode` 0 = off — today's model render, bit for
 /// bit — 1 normal mapping, 2 / 3 + parallax occlusion on WMO batches, 4 / 5 debug (height /
-/// normal). `depth` is the parallax depth in base-texture UV units. Packed into the `relief`
+/// normal). `depth` is the parallax depth in world yards. Packed into the `relief`
 /// lane (`.y` / `.z`) of every material that HAS a relief map, by [`monkey_sync_model_relief`]
 /// on change; materials without a map keep a zero lane and are never touched.
 #[derive(Resource, Clone, Copy, Debug, PartialEq)]
@@ -33,7 +33,7 @@ impl Default for ModelRelief {
             .unwrap_or_default();
         Self {
             mode: env.first().map_or(0, |m| m.clamp(0.0, 5.0) as u8),
-            depth: env.get(1).map_or(0.03, |d| d.clamp(0.0, 0.1)),
+            depth: env.get(1).map_or(0.05, |d| d.clamp(0.0, 0.2)), // MONKEY (model relief): yards
         }
     }
 }

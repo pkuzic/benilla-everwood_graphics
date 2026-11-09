@@ -148,7 +148,7 @@ pub struct WowModelExt {
     pub stage1_uv: Vec4,
     /// MONKEY (model relief): `x` = 1 when `relief_texture` holds this batch's relief map, else 0;
     /// `y` = the `modelRelief` mode (0 off, 1 normals, 2/3 + WMO parallax, 4/5 debug), `z` = the
-    /// parallax depth (`modelReliefDepth`, UV units). Zero on every material without a map, so a
+    /// parallax depth (`modelReliefDepth`, world yards). Zero on every material without a map, so a
     /// dial change re-prepares only relief materials (`benilla_world`'s
     /// `monkey_sync_model_relief`). `x == 0` or `y == 0` is today's shader path exactly.
     #[uniform(100)]

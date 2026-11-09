@@ -79,7 +79,7 @@ struct ModelParams {
     stage1_uv: vec4<f32>,
     // MONKEY (model relief): x = 1 when `relief_texture` is this batch's relief map (else 0),
     // y = the `modelRelief` mode (0 off, 1 normals, 2/3 + WMO parallax, 4 debug height, 5 debug
-    // normal), z = the parallax depth in base-texture UV units (`modelReliefDepth`).
+    // normal), z = the parallax depth in world yards (`modelReliefDepth`).
     relief: vec4<f32>,
 };
 @group(#{MATERIAL_BIND_GROUP}) @binding(100) var<uniform> m: ModelParams;
@@ -1056,6 +1056,13 @@ const RELIEF_FADE_END: f32 = 40.0;
 // POM march steps: many near, few far.
 const RELIEF_POM_STEPS_MAX: f32 = 12.0;
 const RELIEF_POM_STEPS_MIN: f32 = 4.0;
+// MONKEY (model relief): the parallax depth dial is in WORLD YARDS; each axis converts it by the
+// texture's own uv-per-yard on this surface (a texture stretched over a long beam or a wide street
+// tile no longer gets a hole a tile-fraction deep). The view's tangent z is floored (offset
+// limiting) and the depth fades out toward grazing; the total uv shift is capped.
+const RELIEF_POM_MIN_VZ: f32 = 0.3;
+const RELIEF_POM_GRAZE_FADE: f32 = 0.05;
+const RELIEF_POM_MAX_UV: f32 = 0.08;
 // How hard the cavity channel darkens the lit result: `mix(1, B, k)`.
 const RELIEF_CAVITY: f32 = 0.35;
 // MONKEY (model relief): the interior WMO emboss gain (baked MOCV light has no direction).
@@ -1685,7 +1692,14 @@ fn fragment(in: WowVsOut, @builtin(front_facing) is_front: bool) -> WowFragOut {
                     clamp(rdist / RELIEF_FADE_END, 0.0, 1.0));
                 let n_steps = u32(steps + 0.5);
                 let layer_d = 1.0 / f32(n_steps);
-                let duv = v_ts.xy / max(v_ts.z, 0.1) * rdepth * layer_d;
+                // MONKEY (model relief): yards -> uv per axis (grad u = T_raw / det, Schueler).
+                let rdet = dot(dp1, dp2perp);
+                let uv_per_yd = vec2<f32>(length(rt_raw), length(rb_raw)) / max(abs(rdet), 1e-12);
+                let graze = smoothstep(RELIEF_POM_GRAZE_FADE, RELIEF_POM_MIN_VZ, v_ts.z);
+                var shift = v_ts.xy / max(v_ts.z, RELIEF_POM_MIN_VZ) * rdepth * graze * uv_per_yd;
+                let shift_len = length(shift);
+                shift = shift * min(1.0, RELIEF_POM_MAX_UV / max(shift_len, 1e-9));
+                let duv = shift * layer_d;
                 var cur_uv = ruv;
                 var cur_d = 0.0;
                 var cur_map = 1.0 - relief_tap(cur_uv, rgx, rgy).a;

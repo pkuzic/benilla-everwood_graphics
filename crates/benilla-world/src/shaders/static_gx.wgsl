@@ -108,7 +108,7 @@ struct GxCell {
 @group(1) @binding(5) var relief_array: texture_2d_array<f32>;
 // MONKEY (model relief): the live `modelRelief` dials, one buffer shared by every region: x = the
 // mode (0 off, 1 normals, 2/3 + WMO parallax, 4 debug height, 5 debug normal), y = the parallax
-// depth in base-texture UV units (`modelReliefDepth`). A dial change rewrites only this.
+// depth in world yards (`modelReliefDepth`). A dial change rewrites only this.
 struct GxReliefDial {
     dial: vec4<f32>,
 }
@@ -126,6 +126,13 @@ const RELIEF_FADE_START: f32 = 20.0;
 const RELIEF_FADE_END: f32 = 40.0;
 const RELIEF_POM_STEPS_MAX: f32 = 12.0;
 const RELIEF_POM_STEPS_MIN: f32 = 4.0;
+// MONKEY (model relief): the parallax depth dial is in WORLD YARDS; each axis converts it by the
+// texture's own uv-per-yard on this surface (a texture stretched over a long beam or a wide street
+// tile no longer gets a hole a tile-fraction deep). The view's tangent z is floored (offset
+// limiting) and the depth fades out toward grazing; the total uv shift is capped.
+const RELIEF_POM_MIN_VZ: f32 = 0.3;
+const RELIEF_POM_GRAZE_FADE: f32 = 0.05;
+const RELIEF_POM_MAX_UV: f32 = 0.08;
 const RELIEF_CAVITY: f32 = 0.35;
 const RELIEF_EMBOSS: f32 = 1.6;
 const RELIEF_NORMAL_GAIN: f32 = 2.5;
@@ -1786,7 +1793,14 @@ fn fragment(in: GxVsOut) -> @location(0) vec4<f32> {
                     clamp(rdist / RELIEF_FADE_END, 0.0, 1.0));
                 let n_steps = u32(steps + 0.5);
                 let layer_d = 1.0 / f32(n_steps);
-                let duv = v_ts.xy / max(v_ts.z, 0.1) * rdepth * layer_d;
+                // MONKEY (model relief): yards -> uv per axis (grad u = T_raw / det, Schueler).
+                let rdet = dot(r_dp1, dp2perp);
+                let uv_per_yd = vec2<f32>(length(rt_raw), length(rb_raw)) / max(abs(rdet), 1e-12);
+                let graze = smoothstep(RELIEF_POM_GRAZE_FADE, RELIEF_POM_MIN_VZ, v_ts.z);
+                var shift = v_ts.xy / max(v_ts.z, RELIEF_POM_MIN_VZ) * rdepth * graze * uv_per_yd;
+                let shift_len = length(shift);
+                shift = shift * min(1.0, RELIEF_POM_MAX_UV / max(shift_len, 1e-9));
+                let duv = shift * layer_d;
                 var cur_uv = ruv;
                 var cur_d = 0.0;
                 var cur_map = 1.0 - relief_tap(cur_uv, rl, wrap_x, wrap_y, rgx, rgy).a;

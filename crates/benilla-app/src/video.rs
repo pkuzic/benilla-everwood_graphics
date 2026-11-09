@@ -487,7 +487,7 @@ impl Default for VideoConfig {
             ground_relief_depth: 0.06,
             // MONKEY (model relief): opt-in experiment, off in every preset.
             model_relief: 0,
-            model_relief_depth: 0.03,
+            model_relief_depth: 0.05, // MONKEY (model relief): yards
             lava_light_gain: 1.0,
             fire_flicker: 1.0,
             display: if windowed_env() {
@@ -710,7 +710,7 @@ impl VideoKnobs<'_> {
             "groundreliefdepth" => cfg.ground_relief_depth = v.clamp(0.0, 0.2),
             // MONKEY (model relief): 0 is meaningful (today's models, bit for bit).
             "modelrelief" => cfg.model_relief = v.clamp(0.0, 5.0) as u8,
-            "modelreliefdepth" => cfg.model_relief_depth = v.clamp(0.0, 0.1),
+            "modelreliefdepth" => cfg.model_relief_depth = v.clamp(0.0, 0.2), // MONKEY (model relief): yards
             "lavalightgain" => cfg.lava_light_gain = v.clamp(0.0, 4.0),
             "worldshadows" => cfg.world_shadows = ev.flag(),
             "charactershadows" => cfg.character_shadows = ev.flag(),

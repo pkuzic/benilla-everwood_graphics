@@ -707,8 +707,8 @@ pub(crate) const REGISTERED: &[Registered] = &[
     ),
     ours(
         "modelReliefDepth",
-        "0.03",
-        "benilla's own: depth of the building parallax relief in texture UV units, 0..0.1 (0.03 = default)",
+        "0.05",
+        "benilla's own: depth of the building parallax relief in yards, 0..0.2 (0.05 = default)",
     ),
     // MONKEY (p0 skyDither): the FFXGlow combine's deband dither (was env WOW_DITHER only).
     // Default 0 = the reference look; the Graphics preset's High sets 1.
