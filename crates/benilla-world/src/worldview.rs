@@ -209,6 +209,24 @@ fn stubs(app: &mut App) {
     app.insert_resource(crate::schedule::WorldLive(true));
 }
 
+/// MONKEY (ground relief captures): the opening camera, `WOW_WORLDVIEW_CAM=<back>,<up>[,<yaw deg>]`.
+fn view_cam_transform(start: Vec3) -> (Transform, f32, f32) {
+    let c: Vec<f32> = std::env::var("WOW_WORLDVIEW_CAM")
+        .ok()
+        .map(|v| v.split(',').filter_map(|p| p.trim().parse().ok()).collect())
+        .unwrap_or_default();
+    let back = c.first().copied().unwrap_or(VIEW_START_HEIGHT);
+    let up = c.get(1).copied().unwrap_or(VIEW_START_HEIGHT);
+    let yaw = c.get(2).copied().unwrap_or(0.0).to_radians();
+    let offset = Quat::from_rotation_y(yaw) * Vec3::new(0.0, up, back);
+    // `fly` rebuilds the rotation from yaw/pitch every frame, so return those too.
+    // Unset keeps the viewer's historical opening look (pitch -0.5, which `fly` always imposed).
+    let pitch = if c.is_empty() { -0.5 } else { -up.atan2(back.max(1e-3)) };
+    let xf = Transform::from_translation(start + offset)
+        .with_rotation(Quat::from_euler(EulerRot::YXZ, yaw, pitch, 0.0));
+    (xf, yaw, pitch)
+}
+
 /// The viewer itself: the free-fly camera and its controller.
 fn plugin(app: &mut App) {
     app.add_systems(
@@ -262,6 +280,7 @@ struct ViewCam {
 
 fn spawn_view_camera(mut commands: Commands, msaa: Res<crate::view::MsaaSetting>) {
     let start = wow_to_bevy(view_start());
+    let (cam_xf, cam_yaw, cam_pitch) = view_cam_transform(start);
     let far = crate::view::CAM_FAR;
     commands.spawn((
         Camera3d::default(),
@@ -277,11 +296,12 @@ fn spawn_view_camera(mut commands: Commands, msaa: Res<crate::view::MsaaSetting>
         Hdr,
         Tonemapping::None,
         crate::ffx_glow::FfxGlow::WORLD,
-        Transform::from_translation(start + Vec3::new(0.0, VIEW_START_HEIGHT, VIEW_START_HEIGHT))
-            .looking_at(start, Vec3::Y),
+        // MONKEY (ground relief captures): `WOW_WORLDVIEW_CAM=<back>,<up>[,<yaw deg>]` places the
+        // camera `back` yd behind and `up` yd above the look-at point (default 60, 60, yaw 0).
+        cam_xf,
         ViewCam {
-            yaw: 0.0,
-            pitch: -0.5,
+            yaw: cam_yaw,
+            pitch: cam_pitch,
             speed: 100.0,
         },
     ));

@@ -81,9 +81,15 @@ pub struct GroundRelief {
 
 impl Default for GroundRelief {
     fn default() -> Self {
+        // MONKEY (ground relief): `MONKEY_GROUND_RELIEF=<mode>[,<depth>]` seeds the dials for
+        // captures and the cvar-less world viewer; the client's cvar bridge overrides it.
+        let env: Vec<f32> = std::env::var("MONKEY_GROUND_RELIEF")
+            .ok()
+            .map(|v| v.split(',').filter_map(|p| p.trim().parse().ok()).collect())
+            .unwrap_or_default();
         Self {
-            mode: 0,
-            depth: 0.06,
+            mode: env.first().map_or(0, |m| m.clamp(0.0, 5.0) as u8),
+            depth: env.get(1).map_or(0.06, |d| d.clamp(0.0, 0.2)),
         }
     }
 }
