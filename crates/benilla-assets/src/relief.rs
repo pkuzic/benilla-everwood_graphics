@@ -74,6 +74,12 @@ pub fn relief_rel_path(key: &str) -> String {
     if let Some(stem) = k.strip_suffix("_s.blp") {
         k = format!("{stem}.blp");
     }
+    blp_key_to_png(&k)
+}
+
+/// MONKEY (model relief): the shared tail of both relief path rules: a lowercased `/` key's
+/// `.blp` swapped for `.png` (appended when the key has no `.blp`).
+pub(crate) fn blp_key_to_png(k: &str) -> String {
     match k.strip_suffix(".blp") {
         Some(stem) => format!("{stem}.png"),
         None => format!("{k}.png"),

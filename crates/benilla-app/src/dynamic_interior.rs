@@ -78,7 +78,18 @@ fn bridge(
     moon_light: Option<ResMut<benilla_world::lighting::MoonLight>>,
     // MONKEY (ground relief): the terrain relief mode + depth (Option: absent in headless tests).
     ground_relief: Option<ResMut<benilla_world::terrain_stream::GroundRelief>>,
+    // MONKEY (model relief): the WMO + doodad relief mode + depth (Option: absent in headless tests).
+    model_relief: Option<ResMut<benilla_world::model_render::ModelRelief>>,
 ) {
+    if let Some(mut model_relief) = model_relief {
+        let want = benilla_world::model_render::ModelRelief {
+            mode: video.model_relief,
+            depth: video.model_relief_depth,
+        };
+        if *model_relief != want {
+            *model_relief = want;
+        }
+    }
     if let Some(mut ground_relief) = ground_relief {
         let want = benilla_world::terrain_stream::GroundRelief {
             mode: video.ground_relief,

@@ -14,9 +14,12 @@ mod batch;
 pub mod lazy;
 pub mod order;
 pub mod park;
+// MONKEY (model relief): the `modelRelief` dials + the material sync.
+mod relief;
 mod visibility;
 
 pub use batch::{BatchVariants, EntityUvLane, M2BatchMaterials, ModelMaterials, SkyboxBatch};
+pub use relief::ModelRelief;
 
 /// Yards of transparent sort bias per authored batch step of a batch the transparent order does
 /// not place ([`order`]): a WMO's coplanar batches draw in strict file order
@@ -403,6 +406,10 @@ fn model_material_impl(
             ..default()
         },
     };
+    // MONKEY (model relief): the base texture's relief map, if it has an indexed one (a map that
+    // is indexed later is attached by `monkey_sync_model_relief`).
+    let (relief_texture, relief) =
+        benilla_assets::model_relief::model_relief_lane(base.base_color_texture.as_ref());
     let handle = lazy::defer(
         materials,
         ExtendedMaterial {
@@ -503,7 +510,10 @@ fn model_material_impl(
                         .map_or([0.0, 0.0], |a| a.sample(0.0));
                     Vec4::new(0.0, 0.0, uv0[0], uv0[1])
                 },
+                // MONKEY (model relief): see `model_relief_lane` above.
+                relief,
                 stage1_texture: stage1.map(|s| s.texture.clone()),
+                relief_texture,
                 light_buf: light.clone(),
                 // MONKEY (torch shadows Phase 3A): the shared torch receiver bindings.
                 torch_depth: torch.depth.clone(),
@@ -650,7 +660,10 @@ pub fn zfill_material(
                 stage1: stage1_params(stage1, None),
                 // No transform, as stage 0 here: the twin is not on the UV lane.
                 stage1_uv: Vec4::ZERO,
+                // MONKEY (model relief): the depth-prime twin draws no colour: no relief.
+                relief: Vec4::ZERO,
                 stage1_texture: stage1.map(|s| s.texture.clone()),
+                relief_texture: None,
                 light_buf: light.clone(),
                 // MONKEY (torch shadows Phase 3A): the shared torch receiver bindings.
                 torch_depth: torch.depth.clone(),
@@ -1105,6 +1118,21 @@ pub fn plugin(app: &mut App) {
     // The material dedup cache and its evictors: by distance, and whole on a cross-map transition.
     app.init_resource::<ModelMaterials>()
         .add_systems(Update, (scope_model_materials, evict_model_materials));
+    // MONKEY (model relief): index world-art reliefs as their textures arrive, then attach them /
+    // push the dials into the materials (the tracker first, so a fresh map lands the same frame).
+    app.init_resource::<ModelRelief>().add_systems(
+        Update,
+        (
+            benilla_assets::model_relief::monkey_track_model_relief
+                .run_if(resource_exists::<Messages<AssetEvent<Image>>>),
+            relief::monkey_sync_model_relief
+                .run_if(resource_exists::<Messages<AssetEvent<WowModelMaterial>>>),
+        )
+            .chain()
+            // MONKEY (model relief, sync 1109): in the world's last stage, so the sync is ordered
+            // after the frame's exclusive input / net / lane / stream systems.
+            .in_set(crate::schedule::WorldStage::Present),
+    );
     // A material becomes an asset the frame something visible binds it: before the store
     // publishes its queued `Added` event and before `VisibilityPropagate` clears what it reads.
     app.add_systems(

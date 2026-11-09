@@ -762,6 +762,11 @@ impl WorldAssets {
         // World art uploads as the file stores it; nothing reads it main-side.
         let chain = model_texture_chain(&self.chain.lock_recover(), path)?;
         let handle = images.add(repeat_texture_authored(crate::for_upload(chain), wrap));
+        // MONKEY (model relief): this lane knows its id at once, so its relief map (if any) is
+        // indexed directly; `model_relief_image` is a no-op without a relief dir.
+        if let Some(relief) = crate::model_relief::model_relief_image(&key.0) {
+            crate::model_relief::register_model_relief(handle.id(), images.add(relief));
+        }
         self.textures.insert(key, handle.clone());
         Some(handle)
     }
@@ -1025,6 +1030,9 @@ impl WorldAssets {
                 ..default()
             },
         };
+        // MONKEY (model relief): the base texture's relief map, if it has an indexed one.
+        let (relief_texture, relief) =
+            crate::model_relief::model_relief_lane(base.base_color_texture.as_ref());
         let handle = materials.add(WowModelMaterial {
             base,
             extension: WowModelExt {
@@ -1043,7 +1051,10 @@ impl WorldAssets {
                 anim_slots: Vec4::ZERO,
                 stage1: Vec4::ZERO, // a tuft is one texture
                 stage1_uv: Vec4::ZERO,
+                // MONKEY (model relief): see `model_relief_lane` above.
+                relief,
                 stage1_texture: None,
+                relief_texture,
                 light_buf: self.shared_light.clone(),
                 order: None, // clutter sorts by its own centre
                 // MONKEY (torch shadows Phase 3A): the shared torch receiver bindings.

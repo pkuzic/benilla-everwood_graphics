@@ -88,12 +88,25 @@ impl AssetLoader for BlpImageLoader {
             ));
         }
         Ok(match settings.variant {
-            BlpVariant::WorldArt => world_art_image(
-                for_upload(blp_bytes_to_native_chain(&bytes).map_err(to_io)?),
-                // The address mode rides the asset path (`crate::texture_url`): one `.blp` can be
-                // uploaded under two samplers.
-                crate::sampler_mode_of(&ctx.path().to_string()),
-            ),
+            BlpVariant::WorldArt => {
+                let image = world_art_image(
+                    for_upload(blp_bytes_to_native_chain(&bytes).map_err(to_io)?),
+                    // The address mode rides the asset path (`crate::texture_url`): one `.blp` can
+                    // be uploaded under two samplers.
+                    crate::sampler_mode_of(&ctx.path().to_string()),
+                );
+                // MONKEY (model relief): decode this texture's relief map (if the relief dir has
+                // one) here on the IO pool, and park it for `monkey_track_model_relief`, which
+                // indexes it under this image's id once the image is inserted. Nothing without
+                // a relief dir; one disk probe per path otherwise.
+                if crate::monkey_relief_dir().is_some() {
+                    let rel = ctx.path().path().to_string_lossy().into_owned();
+                    if let Some(relief) = crate::model_relief::model_relief_image(&rel) {
+                        crate::model_relief::park_model_relief(ctx.path().to_string(), relief);
+                    }
+                }
+                image
+            }
             BlpVariant::Sprite => {
                 let (w, h, rgba) = blp_to_rgba(&bytes).map_err(to_io)?;
                 sprite_image(w, h, rgba)

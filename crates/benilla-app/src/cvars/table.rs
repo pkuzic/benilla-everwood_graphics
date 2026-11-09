@@ -697,6 +697,19 @@ pub(crate) const REGISTERED: &[Registered] = &[
         "0.06",
         "benilla's own: depth of the terrain parallax relief in texture tiles, 0..0.2 (0.06 = default)",
     ),
+    // MONKEY (model relief): normal-mapped WMO buildings + M2 doodads (and WMO parallax) from the
+    // same offline relief maps.
+    ours(
+        "modelRelief",
+        "0",
+        "benilla's own: building and prop relief from the MData\\Relief maps, 0 Off / 1 Normals / \
+         2 + Parallax (buildings) / 3 = 2 / 4 debug height / 5 debug normal",
+    ),
+    ours(
+        "modelReliefDepth",
+        "0.03",
+        "benilla's own: depth of the building parallax relief in texture UV units, 0..0.1 (0.03 = default)",
+    ),
     // MONKEY (p0 skyDither): the FFXGlow combine's deband dither (was env WOW_DITHER only).
     // Default 0 = the reference look; the Graphics preset's High sets 1.
     ours(

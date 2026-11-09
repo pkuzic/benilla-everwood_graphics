@@ -45,6 +45,8 @@ mod wdt;
 // MONKEY (ground relief): the per-tile relief array (loose PNG relief maps per ground layer).
 mod relief;
 pub use relief::{monkey_relief_array, monkey_relief_dir, RELIEF_FLAT};
+// MONKEY (model relief): relief maps for world-art textures on the model lane (WMO + doodads).
+pub mod model_relief;
 pub use adt::{chunk_to_mesh, chunks_to_mesh, AdtLoader, AdtTile, ChunkShading};
 pub use wdt::{WdtIndex, WdtIndexLoader};
 mod blp;
@@ -387,8 +389,9 @@ pub fn sampler_mode_of(path: &str) -> (bool, bool) {
 }
 
 /// The archive path under a [`texture_url`] marker; `None` when unmarked.
-#[cfg(test)]
-fn strip_sampler_marker(path: &str) -> Option<String> {
+// MONKEY (model relief): crate-visible (no longer test-only) for
+// `model_relief::model_relief_rel_path`.
+pub(crate) fn strip_sampler_marker(path: &str) -> Option<String> {
     parse_marker(path).map(|m| format!("{}.{}", m.base, m.ext))
 }
 

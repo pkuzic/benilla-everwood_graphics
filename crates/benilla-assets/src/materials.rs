@@ -146,10 +146,23 @@ pub struct WowModelExt {
     /// `anim_slots.x`, `anim_slots.z` and `sun_scale.zw` are stage 0's.
     #[uniform(100)]
     pub stage1_uv: Vec4,
+    /// MONKEY (model relief): `x` = 1 when `relief_texture` holds this batch's relief map, else 0;
+    /// `y` = the `modelRelief` mode (0 off, 1 normals, 2/3 + WMO parallax, 4/5 debug), `z` = the
+    /// parallax depth (`modelReliefDepth`, UV units). Zero on every material without a map, so a
+    /// dial change re-prepares only relief materials (`benilla_world`'s
+    /// `monkey_sync_model_relief`). `x == 0` or `y == 0` is today's shader path exactly.
+    #[uniform(100)]
+    pub relief: Vec4,
     /// Stage 1's texture, sampled when `stage1.x` is set; `None` binds the fallback image, unread.
     #[texture(101, visibility(fragment))]
     #[sampler(102, visibility(fragment))]
     pub stage1_texture: Option<Handle<Image>>,
+    /// MONKEY (model relief): the base texture's offline relief map (`Rgba8Unorm` linear: normal
+    /// XY, cavity, height; `crate::model_relief`), `None` (the fallback image) without one. No
+    /// sampler of its own: `wow_model.wgsl` samples it through `base_color_sampler`, so wrap and
+    /// filter match the base texture and the Metal 16-sampler budget is untouched.
+    #[texture(96, visibility(fragment))]
+    pub relief_texture: Option<Handle<Image>>,
     /// The shared global light (`lighting::global_light`), updated in place once a frame; the
     /// vertex stage reads its point-light table, since Bevy's clusterable lights are fragment-only.
     #[storage(90, read_only, buffer, visibility(vertex, fragment))]
@@ -627,6 +640,35 @@ mod tests {
             "terrain's exterior torch lane is no longer gated on `ext_night_w > 0.0` — daylight is \
              now paying for (and possibly rendering) the night blend, and the day look is free to \
              drift by a rounding step"
+        );
+    }
+
+    /// MONKEY (model relief): the model lane's relief contracts. The WGSL binding must match the
+    /// `#[texture(96)]` attribute, `ModelParams` must end with the `relief` lane right after
+    /// `stage1` (the `WowModelExt` field order), the map must be read through the base colour
+    /// sampler (no new sampler), and the lane must hang off ONE uniform gate.
+    #[test]
+    fn the_model_relief_lane_is_bound_and_gated_on_its_uniform() {
+        let model = include_str!("shaders/wow_model.wgsl").replace("\r\n", "\n");
+        assert!(
+            model.contains("@group(#{MATERIAL_BIND_GROUP}) @binding(96) var relief_texture: texture_2d<f32>;"),
+            "wow_model.wgsl no longer declares the relief map at binding 96"
+        );
+        let params = model
+            .split_once("struct ModelParams {")
+            .and_then(|(_, rest)| rest.split_once("};"))
+            .expect("ModelParams")
+            .0;
+        let stage1 = params.find("stage1: vec4<f32>,").expect("stage1 lane");
+        let relief = params.find("relief: vec4<f32>,").expect("relief lane");
+        assert!(stage1 < relief, "the relief lane must follow stage1, as in WowModelExt");
+        assert!(
+            model.contains("textureSampleGrad(relief_texture, pbr_bindings::base_color_sampler,"),
+            "the relief map must be sampled through the base colour sampler"
+        );
+        assert!(
+            model.contains("let relief_on = m.relief.x > 0.5 && relief_mode != 0u"),
+            "the model relief lane is no longer gated on its uniform lane"
         );
     }
 

@@ -77,11 +77,19 @@ struct ModelParams {
     // affine row, zw = its UV-scroll seed, as `anim_slots.x`, `anim_slots.z` and `sun_scale.zw`
     // are stage 0's.
     stage1_uv: vec4<f32>,
+    // MONKEY (model relief): x = 1 when `relief_texture` is this batch's relief map (else 0),
+    // y = the `modelRelief` mode (0 off, 1 normals, 2/3 + WMO parallax, 4 debug height, 5 debug
+    // normal), z = the parallax depth in base-texture UV units (`modelReliefDepth`).
+    relief: vec4<f32>,
 };
 @group(#{MATERIAL_BIND_GROUP}) @binding(100) var<uniform> m: ModelParams;
 // Stage 1's texture, sampled at `stage1_uv` when `m.stage1.x` is set.
 @group(#{MATERIAL_BIND_GROUP}) @binding(101) var stage1_texture: texture_2d<f32>;
 @group(#{MATERIAL_BIND_GROUP}) @binding(102) var stage1_sampler: sampler;
+// MONKEY (model relief): the base texture's offline relief map (RGBA linear: normal X (+u) / Y
+// (+v) as `(byte-128)/127`, B cavity, A height), the fallback image without one. No sampler of its
+// own: it is read through `pbr_bindings::base_color_sampler`, so wrap/filter match the base.
+@group(#{MATERIAL_BIND_GROUP}) @binding(96) var relief_texture: texture_2d<f32>;
 
 // A fully covered character shadow retains 45% of the authored model lighting.
 const SHADOW_SUN_FLOOR: f32 = 0.45;
@@ -702,7 +710,9 @@ fn point_light_eval(sel: vec4<u32>, P: vec3<f32>, N: vec3<f32>) -> vec3<f32> {
 // distance-ordered tail — the terms that make a torch's pool agree across a draw-unit boundary —
 // and they arrive unshadowed, which at their amplitude is not a look the eye can separate from a
 // shadowed one.
-fn point_light_eval_shadowed(sel: vec4<u32>, P: vec3<f32>, N: vec3<f32>) -> vec3<f32> {
+// MONKEY (model relief): `Ns` is the SHADING normal (the relief-perturbed one, or `N` itself with
+// the lane off); `N` stays the geometric normal the cube-map lookup normal-offsets along.
+fn point_light_eval_shadowed(sel: vec4<u32>, P: vec3<f32>, N: vec3<f32>, Ns: vec3<f32>) -> vec3<f32> {
     var sum = vec3<f32>(0.0);
     for (var s = 0u; s < EXT_SEL_K; s = s + 1u) {
         let idx = ext_sel_get(sel, s);
@@ -713,7 +723,7 @@ fn point_light_eval_shadowed(sel: vec4<u32>, P: vec3<f32>, N: vec3<f32>) -> vec3
         let to_light = fixture - P;
         let d = length(to_light);
         let atten = 1.0 / (0.7 * d + 0.03 * d * d);
-        let nl = max(dot(N, to_light / max(d, 1e-4)), 0.0);
+        let nl = max(dot(Ns, to_light / max(d, 1e-4)), 0.0);
         // MONKEY (torch lane perf, MIRRORED from static_gx.wgsl): the occlusion is a factor on a
         // term that is already zero on any surface facing away from the fire.
         let ext_w = atten * nl;
@@ -842,7 +852,10 @@ fn interior_window(d: f32, r: f32, p: f32) -> f32 {
 fn interior_room_admits(i: u32, room_inst: u32, room_group: u32) -> bool {
     return true;
 }
-fn interior_room_light(P: vec3<f32>, N: vec3<f32>, room_inst: u32, room_group: u32) -> vec3<f32> {
+// MONKEY (model relief): `Ns` is the SHADING normal (relief-perturbed, or `N` with the lane off),
+// used only by the wrapped Lambert; `N` stays the geometric normal of the torch-map normal offset.
+// (static_gx.wgsl's copy has no `Ns`: the retained pass carries no relief.)
+fn interior_room_light(P: vec3<f32>, N: vec3<f32>, Ns: vec3<f32>, room_inst: u32, room_group: u32) -> vec3<f32> {
     let count = u32(wow_light.point_count.x);
     let k_fill = wow_light.point_count.z;
     var direct = vec3<f32>(0.0);
@@ -894,7 +907,7 @@ fn interior_room_light(P: vec3<f32>, N: vec3<f32>, room_inst: u32, room_group: u
         let atten = INTERIOR_CORE_GAIN / (1.0 + (d / r0) * (d / r0));
         let window = interior_window(d, reach_yd, INTERIOR_DIRECT_POW);
         let nl = max(
-            (dot(N, to_light / max(d, 1e-4)) + INTERIOR_WRAP) / (1.0 + INTERIOR_WRAP),
+            (dot(Ns, to_light / max(d, 1e-4)) + INTERIOR_WRAP) / (1.0 + INTERIOR_WRAP),
             0.0,
         );
         // Phase 3A per-fixture cast shadow (keep in sync with static_gx.wgsl's
@@ -1023,6 +1036,63 @@ fn wmo_exterior_pick(P: vec3<f32>) -> vec4<u32> {
 }
 fn wmo_exterior_point_sum(P: vec3<f32>, N: vec3<f32>) -> vec3<f32> {
     return point_light_eval(wmo_exterior_pick(P), P, N);
+}
+
+// ── MONKEY (model relief) ────────────────────────────────────────────────────────────────────────
+// Per-pixel normal mapping (and, on WMO batches, parallax occlusion mapping) from the base
+// texture's offline relief map (`relief_texture`). Everything hangs off `relief_on` in the fragment,
+// a UNIFORM test (this material's `relief` lane, its markers and flags), so with `modelRelief 0` or
+// on a batch with no map the fragment runs today's instructions. With it on, the lighting is still
+// computed exactly as before (the sky PER VERTEX since upstream #2899), and the relief ADDS, per
+// fragment, the change the perturbed normal makes to that sky sum (`relief_sky_e`), lights the
+// point / room / moon terms and the wet look at the perturbed normal, plus a mild cavity
+// darkening; on a flat map (128,128,255,255) every one of those is the identity, so flat relief
+// renders today's look.
+//
+// The POM depth fades to zero between these camera distances (yd) and the march is skipped past the
+// end; minified relief is flat anyway, and the fade hides the swim of a vanishing offset.
+const RELIEF_FADE_START: f32 = 20.0;
+const RELIEF_FADE_END: f32 = 40.0;
+// POM march steps: many near, few far.
+const RELIEF_POM_STEPS_MAX: f32 = 12.0;
+const RELIEF_POM_STEPS_MIN: f32 = 4.0;
+// How hard the cavity channel darkens the lit result: `mix(1, B, k)`.
+const RELIEF_CAVITY: f32 = 0.35;
+// The flat texel (zero tilt under the `(byte-128)/127` decode, open, top height).
+const RELIEF_FLAT: vec4<f32> = vec4<f32>(128.0 / 255.0, 128.0 / 255.0, 1.0, 1.0);
+// `clutter_fade.z` markers that never take relief: additive (bit 2), Mod (7), Mod2x (8), the zfill
+// twin (9), env-mapped (12), the WMO skybox (13) and the eye-glow colouriser (14).
+const RELIEF_EXCLUDED_MARKERS: u32 = 0x7384u;
+
+// The relief texel at `uv`. Explicit gradients: the POM march taps at offset uvs inside a loop,
+// where implicit derivatives are meaningless.
+fn relief_tap(uv: vec2<f32>, gx: vec2<f32>, gy: vec2<f32>) -> vec4<f32> {
+    return textureSampleGrad(relief_texture, pbr_bindings::base_color_sampler, uv, gx, gy);
+}
+
+// Tangent-space normal from a relief texel: `(byte-128)/127`; a byte of 128 decodes to EXACTLY
+// zero tilt (snapped, so the float round trip of 128/255 cannot leave a 1e-7 lean).
+fn relief_normal_ts(r: vec4<f32>) -> vec3<f32> {
+    let raw = r.rg * 255.0 - 128.0;
+    let xy = clamp(select(raw / 127.0, vec2<f32>(0.0), abs(raw) < vec2<f32>(0.01)),
+        vec2<f32>(-1.0), vec2<f32>(1.0));
+    return vec3<f32>(xy, sqrt(max(1.0 - dot(xy, xy), 0.0)));
+}
+
+// MONKEY (model relief, sync 1109): `vertex_light`'s sky sum E (`monkey_vertex_sky`: no point
+// lights, unclamped) at an arbitrary normal — `vertex_light` ITSELF re-run in the fragment, so the
+// relief delta can never drift from upstream's per-vertex lanes (the WMO FFP sum and WINDOW
+// midpoint, INT's constant, the doodad SH lobe at its intensity band, the interior / rig probe).
+// The fragment adds `E(Np) − E(N)`; `has_probe` false (a merged blob, whose probe slot is per
+// vertex only) returns zero on the probe lanes so that delta is zero there.
+fn relief_sky_e(n: vec3<f32>, vcol: vec4<f32>, probe_slot: u32, raw_tag: u32, has_probe: bool)
+    -> vec3<f32> {
+    let probe_lane = m.model_flags.x < 0.5 && (m.model_flags.z > 0.5 || m.sun_scale.x >= 1.5);
+    if (probe_lane && !has_probe) {
+        return vec3<f32>(0.0);
+    }
+    _ = vertex_light(n, vec4<f32>(0.0), vcol, probe_slot, raw_tag);
+    return monkey_vertex_sky;
 }
 
 // The vertex input — bevy 0.18's `forward_io::Vertex` fields at bevy's shader locations (the
@@ -1556,6 +1626,82 @@ fn fragment(in: WowVsOut, @builtin(front_facing) is_front: bool) -> WowFragOut {
 #ifdef VERTEX_OUTPUT_INSTANCE_INDEX
     vo.instance_index = in.instance_index;
 #endif
+    // MONKEY (model relief): the lane's gate is UNIFORM (this material's `relief` lane, flags and
+    // markers): a map, a non-zero mode, and a lit, plain-blend, non-env, non-sky colour batch (not
+    // clutter: its normal is the ground's under the tuft, not the card's). The derivatives below
+    // therefore stay in uniform control flow. Runs BEFORE Bevy's base-colour sample because POM
+    // moves `vo.uv`, which every base-texture tap (Bevy's, the WMO alpha re-sample) then follows;
+    // uv_b, the MOCV and the stage-1 coordinate are never moved.
+    let relief_mode = u32(max(m.relief.y, 0.0) + 0.5);
+    let relief_on = m.relief.x > 0.5 && relief_mode != 0u && m.model_flags.w < 0.5
+        && m.clutter_fade.w < 0.5
+        && (u32(m.clutter_fade.z) & RELIEF_EXCLUDED_MARKERS) == 0u;
+    var relief = RELIEF_FLAT;                    // the relief texel at the (offset) sampling uv
+    var relief_t = vec3<f32>(0.0);               // the cotangent frame: T along +u, B along +v
+    var relief_b = vec3<f32>(0.0);
+    var relief_nts = vec3<f32>(0.0, 0.0, 1.0);   // the tangent-space normal of `relief`
+#ifdef VERTEX_UVS_A
+    if (relief_on) {
+        // Schüler's cotangent frame ("normal mapping without precomputed tangents") from the
+        // derivatives of the world position and of the SAMPLING uv (after the UV animation and the
+        // texture-transform affine), in the plane of the interpolated normal — the same normal
+        // `n_lit` below uses (Bevy's back-face flip undone), so the frame agrees with the lighting.
+        let rp = in.world_position.xyz;
+        let dp1 = dpdx(rp);
+        let dp2 = dpdy(rp);
+        let duv1 = dpdx(vo.uv);
+        let duv2 = dpdy(vo.uv);
+        let rn = wow_normalize(in.world_normal);
+        let dp2perp = cross(dp2, rn);
+        let dp1perp = cross(rn, dp1);
+        let rt_raw = dp2perp * duv1.x + dp1perp * duv2.x;
+        let rb_raw = dp2perp * duv1.y + dp1perp * duv2.y;
+        relief_t = rt_raw * inverseSqrt(max(dot(rt_raw, rt_raw), 1e-20));
+        relief_b = rb_raw * inverseSqrt(max(dot(rb_raw, rb_raw), 1e-20));
+        // `view.mip_bias` folded into the gradients, as Bevy's biased base-colour tap takes it.
+        let bias_scale = exp2(view.mip_bias);
+        let rgx = duv1 * bias_scale;
+        let rgy = duv2 * bias_scale;
+        var ruv = vo.uv;
+        // Mode 2 (3 = 2): parallax occlusion mapping, WMO batches only (`model_flags.x`).
+        if ((relief_mode == 2u || relief_mode == 3u) && m.model_flags.x > 0.5) {
+            let rdist = distance(rp, view.world_position.xyz);
+            let rfade = 1.0 - smoothstep(RELIEF_FADE_START, RELIEF_FADE_END, rdist);
+            let rdepth = max(m.relief.z, 0.0) * rfade;
+            let to_eye = normalize(view.world_position.xyz - rp);
+            let v_ts = vec3<f32>(dot(to_eye, relief_t), dot(to_eye, relief_b), dot(to_eye, rn));
+            if (rdepth > 1e-5 && v_ts.z > 0.0) {
+                // Steep parallax on the height (depth = 1 - A), then a linear refinement between
+                // the last two layers (classic POM).
+                let steps = mix(RELIEF_POM_STEPS_MAX, RELIEF_POM_STEPS_MIN,
+                    clamp(rdist / RELIEF_FADE_END, 0.0, 1.0));
+                let n_steps = u32(steps + 0.5);
+                let layer_d = 1.0 / f32(n_steps);
+                let duv = v_ts.xy / max(v_ts.z, 0.1) * rdepth * layer_d;
+                var cur_uv = ruv;
+                var cur_d = 0.0;
+                var cur_map = 1.0 - relief_tap(cur_uv, rgx, rgy).a;
+                var prev_uv = cur_uv;
+                var prev_map = cur_map;
+                for (var i = 0u; i < n_steps && cur_d < cur_map; i = i + 1u) {
+                    prev_uv = cur_uv;
+                    prev_map = cur_map;
+                    cur_uv = cur_uv - duv;
+                    cur_d = cur_d + layer_d;
+                    cur_map = 1.0 - relief_tap(cur_uv, rgx, rgy).a;
+                }
+                let after = cur_map - cur_d;
+                let before = prev_map - (cur_d - layer_d);
+                let denom = after - before;
+                let w = select(0.0, clamp(after / denom, 0.0, 1.0), abs(denom) > 1e-6);
+                ruv = mix(cur_uv, prev_uv, w);
+            }
+        }
+        relief = relief_tap(ruv, rgx, rgy);
+        relief_nts = relief_normal_ts(relief);
+        vo.uv = ruv;
+    }
+#endif
     var pbr_input = pbr_input_from_standard_material(vo, is_front);
     var base_color = pbr_input.material.base_color;
     // WMO MOCV alpha is lighting data (the TRANS lerp, the INT glow mask), and the reference's WMO
@@ -1703,6 +1849,14 @@ fn fragment(in: WowVsOut, @builtin(front_facing) is_front: bool) -> WowFragOut {
     let is_rig = m.sun_scale.x >= 1.5;
     let L = -normalize(wow_light.light_sun.xyz);
     let n_lit = wow_normalize(in.world_normal);
+    // MONKEY (model relief): the SHADING normal, `n_lit` itself with the lane off (and BIT FOR BIT
+    // on a flat texel). The per-fragment lanes below (points, moon, room, wet) read it, and the
+    // per-vertex sky sum takes the relief as an additive per-fragment delta (`relief_sky_e`).
+    var n_shade = n_lit;
+    if (relief_on) {
+        let np_raw = normalize(relief_t * relief_nts.x + relief_b * relief_nts.y + n_lit * relief_nts.z);
+        n_shade = select(np_raw, n_lit, relief_nts.x == 0.0 && relief_nts.y == 0.0);
+    }
     // MONKEY (shadow hook): the realtime shadow (fetch + edge/night fade) is computed by
     // `benilla::shadow_hook`. This lane keeps only the rig-skin SAMPLE-POINT choice + the
     // interior/rig exclusion + ambient-preserving apply below.
@@ -1774,12 +1928,13 @@ fn fragment(in: WowVsOut, @builtin(front_facing) is_front: bool) -> WowFragOut {
         let points_bound = ext_sel_get(exterior_selection, 0u) != EXT_SEL_EMPTY;
         var point_diffuse = vec3<f32>(0.0);
         if (points_bound) {
-            point_diffuse = point_light_eval(exterior_selection, in.world_position.xyz, n_lit);
+            // MONKEY (model relief): the SHADING normal (`n_lit` with the lane off).
+            point_diffuse = point_light_eval(exterior_selection, in.world_position.xyz, n_shade);
             let ext_night_w = select(0.0, clamp(1.0 - wow_light.fog_params.z, 0.0, 1.0), torch_ext_on());
             if (ext_night_w > 0.0) {
                 point_diffuse = mix(
                     point_diffuse,
-                    point_light_eval_shadowed(exterior_selection, in.world_position.xyz, n_lit),
+                    point_light_eval_shadowed(exterior_selection, in.world_position.xyz, n_lit, n_shade),
                     ext_night_w,
                 );
             }
@@ -1807,7 +1962,8 @@ fn fragment(in: WowVsOut, @builtin(front_facing) is_front: bool) -> WowFragOut {
             // GFX (moonlight): ADD the moon onto the exterior night. `moon.w` is exactly 0 by day
             // and with `moonLight 0`: the branch is not entered.
             if (moon_add) {
-                e += moonlight_hook::moon_light(n_lit, wow_light.monkey.moon) * player_moon_lit;
+                // MONKEY (model relief): `n_shade` is `n_lit` with the lane off.
+                e += moonlight_hook::moon_light(n_shade, wow_light.monkey.moon) * player_moon_lit;
             }
             lane_rgb = monkey_lane_colour(e + point_diffuse, lane_c, lane_emission, lane_clamp_e);
         }
@@ -1832,6 +1988,42 @@ fn fragment(in: WowVsOut, @builtin(front_facing) is_front: bool) -> WowFragOut {
             lit_rgb = select(base.rgb, base.rgb * m.tint.rgb, is_wmo) * lane_rgb;
         }
     }
+    // MONKEY (model relief): the relief's change to the vertex's sky light, added per fragment. The
+    // sky sum E is lit PER VERTEX (`vertex_light`, upstream #2899), so the perturbed normal cannot
+    // re-light it in place; the lane adds instead `C · (E(Np) − E(N))`, both E from `vertex_light`
+    // itself (`relief_sky_e`), C the lane's material colour. Exterior lanes scale the
+    // delta like the sun arm it is (the realtime shadow's `shadow_term`, the moon dim), so shadowed
+    // areas take no full-sun bumps. `tex · clamp(p + C·ΔE, 0, 1)` is written as the clamp of
+    // `lit_rgb + tex·C·ΔE` into `[0, tex]`. INT batches are unlit (ΔE = 0) and skip the clamp; a
+    // merged blob (`WOW_MERGED_SLOT`) carries its probe slot per vertex only, so its probe lane takes
+    // no delta. Off the lane (and on a flat texel) nothing here runs or changes.
+    if (relief_on) {
+#ifdef WOW_MERGED_SLOT
+        let relief_has_probe = false;
+#else
+        let relief_has_probe = true;
+#endif
+        let relief_probe_slot = (fade_tag >> 6u) & 0x1fffu;
+        var relief_de = relief_sky_e(n_shade, vcol, relief_probe_slot, raw_tag, relief_has_probe)
+            - relief_sky_e(n_lit, vcol, relief_probe_slot, raw_tag, relief_has_probe);
+        if (!is_interior && !is_rig) {
+            if (player_shadow < 0.999) {
+                relief_de = relief_de * mix(SHADOW_SUN_FLOOR, 1.0, player_shadow);
+            }
+            if (player_moon < 1.0) {
+                relief_de = relief_de * player_moon;
+            }
+        }
+        var relief_c = select(vcol.rgb * anim_tint * inst_tint, vcol.rgb, is_wmo);
+        if (is_wmo && is_interior && m.tint.w > 1.5) {
+            relief_c = relief_c * vcol.a; // TRANS: the lit pass's MOCV.a weight
+        }
+        let relief_int = is_wmo && is_interior && m.tint.w > 0.5 && m.tint.w < 1.5;
+        if (!relief_int) {
+            let relief_tex = select(base.rgb, base.rgb * m.tint.rgb, is_wmo);
+            lit_rgb = clamp(lit_rgb + relief_tex * relief_c * relief_de, vec3<f32>(0.0), relief_tex);
+        }
+    }
     // MONKEY (dynamic interiors, `interiorLight` on): an INDOOR unit / GameObject / WMO prop — the
     // entity's OWN light-node classification (tag bit 30, `interior_fogged`), never a WMO surface,
     // never the create booth's authored rig — takes the fixture-lit room light
@@ -1853,7 +2045,8 @@ fn fragment(in: WowVsOut, @builtin(front_facing) is_front: bool) -> WowFragOut {
     // in exterior material mode: in interior mode those bits are the probe slot.
     let matte_indoor = !is_interior && (fade_tag & 0x4000u) != 0u;
     if ((is_interior || matte_indoor) && !is_wmo && !is_rig && wow_light.wmo_fog_params.w > 0.5) {
-        let room = interior_room_light(in.world_position.xyz, n_lit, 0u, 0u);
+        // MONKEY (model relief): the room's fixtures light the SHADING normal (`n_lit` off-lane).
+        let room = interior_room_light(in.world_position.xyz, n_lit, n_shade, 0u, 0u);
         // MONKEY (indoor highlight): the hover/target emissive (`highlight`, tag bit 31) rides THIS
         // lane's light sum too. It is the same GL_EMISSION placement as the exterior branches above
         // — added to the material's ambient+diffuse product INSIDE the [0,1] saturate, with the
@@ -1900,6 +2093,12 @@ fn fragment(in: WowVsOut, @builtin(front_facing) is_front: bool) -> WowFragOut {
         let lane_w = select(f32((fade_tag >> 15u) & 0xfu) / 15.0, 1.0, is_interior);
         lit_rgb = mix(lit_rgb, room_rgb, lane_w);
     }
+    // MONKEY (model relief): a mild cavity darkening (B = 1 open) on the lit result — every lit
+    // lane including the unlit-by-design INT interior batches (whose only relief this is); the
+    // unlit/emissive path below never reaches it (`relief_on` excludes it anyway).
+    if (relief_on) {
+        lit_rgb = lit_rgb * mix(1.0, relief.b, RELIEF_CAVITY);
+    }
     // The unlit path: an M2's unlit program outputs `c28 + c29` (`0x70c663`-`0x70c693` fold the
     // tint·M2Color term into `c29` beside the highlight), so the texel modulates
     // `clamp(C·tint + highlight)`, C the M2Color. A WMO keeps the plain modulate.
@@ -1939,7 +2138,8 @@ fn fragment(in: WowVsOut, @builtin(front_facing) is_front: bool) -> WowFragOut {
                 wow_light.shelter[wet_st.idx.w], in.world_position.y, wow_light.shelter_cfg);
         }
     }
-    var wet = wet_hook::wet_surface(rgb, n_lit, in.world_position.xyz, // MONKEY: retained wetness may replace rain.
+    // MONKEY (model relief): the wet look takes the SHADING normal (`n_lit` with the lane off).
+    var wet = wet_hook::wet_surface(rgb, n_shade, in.world_position.xyz, // MONKEY: retained wetness may replace rain.
         select(1.0, 0.0, wet_dry) * wet_open, wow_light.monkey);
     // MONKEY: character parts share their slot even when unskinned; wetness survives indoor shelter.
     let surface_slot = (fade_tag >> 19u) & 0x7ffu;
@@ -1958,11 +2158,11 @@ fn fragment(in: WowVsOut, @builtin(front_facing) is_front: bool) -> WowFragOut {
         // MONKEY (motion verify 2): retained wetness is wet on every facing (`wet_body`); before,
         // the rain law's facing weight left a swum body's vertical sides ~6 % darker and unglossed.
         let rain_wet = select(clamp(wow_light.monkey.wet_a.y, 0.0, 1.0) * wet_open, 0.0, wet_dry);
-        wet = wet_hook::wet_body(rgb, n_lit, rain_wet, instance_wet);
+        wet = wet_hook::wet_body(rgb, n_shade, rain_wet, instance_wet);
     }
     rgb = wet.albedo;
     if (wet.boost > 0.0) {
-        rgb = min(rgb + wet_hook::wet_sheen(wet.boost, n_lit, normalize(view.world_position - in.world_position.xyz),
+        rgb = min(rgb + wet_hook::wet_sheen(wet.boost, n_shade, normalize(view.world_position - in.world_position.xyz),
             L, wow_light.light_diffuse.rgb, wow_light.fog_color.rgb, player_shadow), vec3<f32>(1.0));
     }
 
@@ -2015,6 +2215,13 @@ fn fragment(in: WowVsOut, @builtin(front_facing) is_front: bool) -> WowFragOut {
     }
     // Raw gamma out: blending happens in gamma like the reference's byte framebuffer; the frame
     // decodes once, in the FFXGlow combine.
+    // MONKEY (model relief): the debug views on relief batches only (`modelRelief 4` = the height
+    // as grey, `5` = the perturbed normal as `Np*0.5+0.5`), unfogged so the map reads at any range.
+    if (relief_on && relief_mode == 4u) {
+        out_rgb = vec3<f32>(relief.a);
+    } else if (relief_on && relief_mode >= 5u) {
+        out_rgb = n_shade * 0.5 + 0.5;
+    }
     out.color = vec4<f32>(out_rgb, select(faded_alpha, 1.0, opaque_intent));
     return out;
 }
