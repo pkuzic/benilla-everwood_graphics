@@ -94,12 +94,17 @@ pub fn sprite_candidates(path: &str) -> [String; 2] {
 /// `[tex+0x148]`; `0x770720`, `0x770790`) for a region with no authored size, one texel per
 /// FrameXML unit. Decoded, so layout gets the size the screen shows, and read by an
 /// interface texture's open ([`LooseOpen::Index`]).
+///
+/// MONKEY (texture upscale): the LOGICAL size, the decoded size over the pixel factor of the
+/// `Data\Upscale` copy that won (1 for any other copy), so a region with no authored size lays out
+/// exactly as with the stock art.
 pub fn sprite_dimensions(
     chain: &Mutex<Chain>,
     loose: &LooseFiles,
     path: &str,
 ) -> Option<(u32, u32)> {
-    decode_texture(chain, loose, path, LooseOpen::Index).map(|(w, h, _)| (w, h))
+    decode_sprite_scaled(chain, loose, path, LooseOpen::Index, OnRefusal::WhiteDefault)
+        .map(|(w, h, _, k)| ((w / k).max(1), (h / k).max(1)))
 }
 
 /// Decode the first of [`sprite_candidates`] that reads and decodes, each read by
@@ -151,6 +156,18 @@ fn decode_sprite_as(
     open: LooseOpen,
     on_refusal: OnRefusal,
 ) -> Option<(u32, u32, Vec<u8>)> {
+    decode_sprite_scaled(chain, loose, path, open, on_refusal).map(|(w, h, rgba, _)| (w, h, rgba))
+}
+
+/// [`decode_sprite_as`] plus the pixel factor of the copy that won (MONKEY (texture upscale):
+/// [`Chain::texture_scale`]; a loose file is always 1), so a caller can recover the logical size.
+fn decode_sprite_scaled(
+    chain: &Mutex<Chain>,
+    loose: &LooseFiles,
+    path: &str,
+    open: LooseOpen,
+    on_refusal: OnRefusal,
+) -> Option<(u32, u32, Vec<u8>, u32)> {
     let open = loose_open_for(path, open);
     let candidates = sprite_candidates(path);
     // Asked before the chain's lock, so an index build never stalls an archive reader.
@@ -162,8 +179,15 @@ fn decode_sprite_as(
             Some(file) => file.read(),
             None => chain.read_file(candidate).ok(),
         };
+        let scale = if hit.is_some() {
+            1
+        } else {
+            chain.texture_scale(candidate)
+        };
         match bytes.map(|b| decode_candidate(candidate, &b, on_refusal)) {
-            Some(Candidate::Pixels(width, height, rgba)) => return Some((width, height, rgba)),
+            Some(Candidate::Pixels(width, height, rgba)) => {
+                return Some((width, height, rgba, scale))
+            }
             Some(Candidate::Next) | None => {}
         }
     }
@@ -425,12 +449,54 @@ fn portrait_rgba(
 /// loose flag. It strips a three-letter extension (`0x449590` at `0x44963c`) and appends `.blp`
 /// (`0x449641`), and the bytes decode as a BLP (`0x449840`): `Foo.tga` opens `Foo.blp`, and no
 /// `.tga` is read.
+///
+/// MONKEY (texture upscale): an `Upscale` copy comes back box-filtered down to the stock size
+/// ([`box_downscale`]); every caller is a cursor, whose 32x32 the OS and `SetCursor`'s test fix.
 pub fn file_texture_rgba(
     chain: &Mutex<Chain>,
     loose: &LooseFiles,
     path: &str,
 ) -> Option<(u32, u32, Vec<u8>)> {
-    decode_blp_file(chain, loose, path, &format!("{}.blp", sprite_key(path)))
+    let name = format!("{}.blp", sprite_key(path));
+    let (w, h, rgba) = decode_blp_file(chain, loose, path, &name)?;
+    let open = loose_open_for(path, LooseOpen::Index);
+    let k = if loose.find(&name, open).is_some() {
+        1
+    } else {
+        chain.lock_recover().texture_scale(&name)
+    };
+    Some(box_downscale(w, h, rgba, k))
+}
+
+/// MONKEY (texture upscale): `rgba` of `w`x`h` averaged down by the integer factor `k` (a no-op
+/// for 1, or a size `k` does not divide), alpha-weighted so a transparent texel's colour does not
+/// bleed into the edge.
+pub fn box_downscale(w: u32, h: u32, rgba: Vec<u8>, k: u32) -> (u32, u32, Vec<u8>) {
+    if k <= 1 || w % k != 0 || h % k != 0 || rgba.len() < (w * h * 4) as usize {
+        return (w, h, rgba);
+    }
+    let (ow, oh) = (w / k, h / k);
+    let mut out = Vec::with_capacity((ow * oh * 4) as usize);
+    for y in 0..oh {
+        for x in 0..ow {
+            let (mut c, mut a) = ([0u32; 3], 0u32);
+            for dy in 0..k {
+                for dx in 0..k {
+                    let i = (((y * k + dy) * w + x * k + dx) * 4) as usize;
+                    let ta = u32::from(rgba[i + 3]);
+                    for (ch, sum) in c.iter_mut().enumerate() {
+                        *sum += u32::from(rgba[i + ch]) * ta;
+                    }
+                    a += ta;
+                }
+            }
+            for sum in c {
+                out.push(if a == 0 { 0 } else { ((sum + a / 2) / a) as u8 });
+            }
+            out.push(((a + k * k / 2) / (k * k)) as u8);
+        }
+    }
+    (ow, oh, out)
 }
 
 /// The loose files an open that sets the loose flag reads before the archive chain, as the
@@ -808,6 +874,16 @@ impl WorldAssets {
     /// read by `open`.
     pub fn decode_rgba(&mut self, path: &str, open: LooseOpen) -> Option<(u32, u32, Vec<u8>)> {
         decode_sprite(&self.chain, &self.loose, path, open)
+    }
+
+    /// [`Self::decode_rgba`] plus the pixel factor of the copy that won (MONKEY (texture upscale):
+    /// 2 for a `Data\Upscale` copy, else 1): the logical size is the decoded size over it.
+    pub fn decode_rgba_scaled(
+        &mut self,
+        path: &str,
+        open: LooseOpen,
+    ) -> Option<(u32, u32, Vec<u8>, u32)> {
+        decode_sprite_scaled(&self.chain, &self.loose, path, open, OnRefusal::Miss)
     }
 
     /// A UI sprite resampled to an exact pixel size by the caller's kernel, cached by size: the
@@ -1588,6 +1664,28 @@ mod tests {
         b[148 + 2] = r;
         b.extend(vec![0u8; (w * h) as usize]);
         b
+    }
+
+    /// MONKEY (texture upscale): a 2x copy averages back to the stock size, a clear texel's colour
+    /// does not bleed, and a factor of 1 is the same pixels.
+    #[test]
+    fn box_downscale_returns_the_stock_size_without_bleeding_clear_texels() {
+        // 4x2: left 2x2 block opaque red, right block opaque white over one clear black texel.
+        let mut px = Vec::new();
+        for y in 0..2 {
+            for x in 0..4 {
+                px.extend_from_slice(match (x, y) {
+                    (0..=1, _) => &[200, 0, 0, 255],
+                    (2, 0) => &[0, 0, 0, 0],
+                    _ => &[100, 100, 100, 255],
+                });
+            }
+        }
+        let (w, h, out) = box_downscale(4, 2, px.clone(), 2);
+        assert_eq!((w, h), (2, 1));
+        assert_eq!(&out[..4], &[200, 0, 0, 255]);
+        assert_eq!(&out[4..], &[100, 100, 100, 191], "the clear texel only lowers alpha");
+        assert_eq!(box_downscale(4, 2, px.clone(), 1), (4, 2, px));
     }
 
     /// `TextureCreate`'s solid texture, `0xff00ff00` (`0x447c00`), 8 by 8 (`0x44a900`).

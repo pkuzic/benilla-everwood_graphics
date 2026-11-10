@@ -76,6 +76,18 @@ fn mount_order(dir_names: &[String]) -> Result<Vec<String>> {
 /// MONKEY (texture upscale): the folder (any case) inside `Data` whose archives mount last.
 const UPSCALE_DIR: &str = "Upscale";
 
+/// MONKEY (texture upscale): the pixel factor of the textures in the `Upscale` folder's archives
+/// over the originals they replace (exactly 2x on each side).
+pub const UPSCALE_FACTOR: u32 = 2;
+
+/// MONKEY (texture upscale): whether `archive` sits directly in a folder named `Upscale`.
+fn is_upscale_archive(archive: &Path) -> bool {
+    archive
+        .parent()
+        .and_then(|d| d.file_name())
+        .is_some_and(|n| n.to_string_lossy().eq_ignore_ascii_case(UPSCALE_DIR))
+}
+
 /// MONKEY (texture upscale): every `.mpq` (any case) in `data`'s `Upscale` folder, ascending by
 /// case-folded name (the last wins, as in the patch tier), or none: no folder, or
 /// `MONKEY_UPSCALE=0` / `off` (the stock chain, without touching the files).
@@ -197,6 +209,16 @@ impl Chain {
     pub fn contains(&self, name: &str) -> bool {
         self.resolve(name)
             .is_some_and(|a| !a.is_delete_marker(name))
+    }
+
+    /// MONKEY (texture upscale): how many pixels per original pixel the winning copy of `name`
+    /// has: [`UPSCALE_FACTOR`] when it came from an archive in `Data\Upscale`, else 1. UI code
+    /// divides a decoded size by it to get the size the stock art has (the "logical" size).
+    pub fn texture_scale(&self, name: &str) -> u32 {
+        match self.resolve(name) {
+            Some(a) if is_upscale_archive(a.path()) => UPSCALE_FACTOR,
+            _ => 1,
+        }
     }
 
     /// The path of the archive `name` resolves to, for debugging and extraction.
@@ -550,6 +572,15 @@ mod tests {
             .collect();
         std::fs::remove_dir_all(&dir).unwrap();
         assert_eq!(names, ["upscale-a.mpq", "upscale-B.MPQ"]);
+    }
+
+    // MONKEY (texture upscale): only an archive directly inside an `Upscale` folder is the pack.
+    #[test]
+    fn only_archives_in_the_upscale_folder_are_the_pack() {
+        assert!(is_upscale_archive(Path::new("G:/wow/Data/Upscale/a.mpq")));
+        assert!(is_upscale_archive(Path::new("G:/wow/Data/UPSCALE/a.mpq")));
+        assert!(!is_upscale_archive(Path::new("G:/wow/Data/patch-3.mpq")));
+        assert!(!is_upscale_archive(Path::new("G:/wow/Data/Upscale/sub/a.mpq")));
     }
 
     #[test]

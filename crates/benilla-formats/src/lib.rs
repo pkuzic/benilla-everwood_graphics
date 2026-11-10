@@ -12,7 +12,7 @@ use benilla_dbc::{DbcParser, FieldType, Schema, SchemaField};
 pub use benilla_blp::{full_mip_count, BlpTexels};
 
 mod chain;
-pub use chain::{Chain, ChainEntry};
+pub use chain::{Chain, ChainEntry, UPSCALE_FACTOR};
 /// Loose `.tga` art, as addon folders ship it.
 mod tga;
 pub use tga::{tga_texture_size, tga_to_rgba, TGA_GATE_PREFIX};
