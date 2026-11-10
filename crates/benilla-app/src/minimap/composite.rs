@@ -20,7 +20,15 @@ use crate::ui_pass::UiQuadMaterial;
 
 /// The target's edge in texels (`0x4eda42`). A fidelity constant, not a quality knob: a larger
 /// target samples the bake's one-texel gaps and draws them as hairlines.
-pub(super) const RT_SIZE: u32 = 256;
+const RT_BASE_SIZE: u32 = 256;
+
+/// MONKEY (texture upscale): the target's edge for this run. With the Upscale pack the bake
+/// tiles are 2x, so the target is 2x too: the tile-texel to target-texel ratio, which is what the
+/// hairline warning above is about, stays the stock 1:1. Every caller turns target units into yards
+/// through this, so the on-screen size and zoom do not change.
+pub(super) fn rt_size() -> u32 {
+    RT_BASE_SIZE * if benilla_formats::upscale_active() { benilla_formats::UPSCALE_FACTOR } else { 1 }
+}
 
 /// The target's ortho half-extent as a multiple of the on-screen view radius (`0x80308c`).
 pub(super) const RT_HALF_EXTENT_SCALE: f32 = 1.5;
@@ -28,7 +36,7 @@ pub(super) const RT_HALF_EXTENT_SCALE: f32 = 1.5;
 /// The fraction of the target's edge the blit shows, netting 1.0 × radius on screen.
 pub(super) const RT_BLIT_FRACTION: f32 = 1.0 / RT_HALF_EXTENT_SCALE;
 
-/// One tile in target space: y-up, origin at the target's centre (the player), `RT_SIZE / 2`
+/// One tile in target space: y-up, origin at the target's centre (the player), `rt_size() / 2`
 /// units to an edge.
 pub(super) struct CompositeTile {
     pub(super) texture: Handle<Image>,
@@ -55,6 +63,9 @@ pub(super) struct MinimapComposite {
 pub(super) struct CompositeRig {
     /// The render target, sampled by the blit quad.
     pub(super) image: Handle<Image>,
+    /// MONKEY (texture upscale): the target's edge, fixed when it was built ([`rt_size`]), so the
+    /// per-frame yard scale always matches the texture actually allocated.
+    pub(super) size: u32,
     camera: Entity,
     quad: Handle<Mesh>,
     /// Materials by tile texture; a building's tile set is small, so this fills once per building.
@@ -75,8 +86,8 @@ pub(super) fn setup_composite(
 ) {
     let mut image = Image::new_fill(
         Extent3d {
-            width: RT_SIZE,
-            height: RT_SIZE,
+            width: rt_size(),
+            height: rt_size(),
             depth_or_array_layers: 1,
         },
         TextureDimension::D2,
@@ -112,10 +123,10 @@ pub(super) fn setup_composite(
             // One target unit = one target texel, origin at the centre.
             Projection::Orthographic(OrthographicProjection {
                 scaling_mode: ScalingMode::Fixed {
-                    #[allow(clippy::cast_precision_loss)] // 256 is exact in f32
-                    width: RT_SIZE as f32,
+                    #[allow(clippy::cast_precision_loss)] // 256 and 512 are exact in f32
+                    width: rt_size() as f32,
                     #[allow(clippy::cast_precision_loss)]
-                    height: RT_SIZE as f32,
+                    height: rt_size() as f32,
                 },
                 ..OrthographicProjection::default_2d()
             }),
@@ -124,6 +135,7 @@ pub(super) fn setup_composite(
 
     commands.insert_resource(CompositeRig {
         image,
+        size: rt_size(),
         camera,
         quad,
         materials: bevy::platform::collections::HashMap::default(),

@@ -80,6 +80,15 @@ const UPSCALE_DIR: &str = "Upscale";
 /// over the originals they replace (exactly 2x on each side).
 pub const UPSCALE_FACTOR: u32 = 2;
 
+/// MONKEY (texture upscale): whether the last opened chain mounted the Upscale tier, for code with
+/// no chain in hand (terrain layer size, minimap target) that must size itself to the art.
+static UPSCALE_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// MONKEY (texture upscale): [`Chain::upscale_mounted`] of the most recently opened chain.
+pub fn upscale_active() -> bool {
+    UPSCALE_ACTIVE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// MONKEY (texture upscale): whether `archive` sits directly in a folder named `Upscale`.
 fn is_upscale_archive(archive: &Path) -> bool {
     archive
@@ -183,6 +192,7 @@ impl Chain {
             locale: Locale::default(),
         };
         chain.locale = crate::wow_ini::client_locale(&chain);
+        UPSCALE_ACTIVE.store(chain.upscale_mounted(), std::sync::atomic::Ordering::Relaxed);
         Ok(chain)
     }
 
@@ -219,6 +229,12 @@ impl Chain {
             Some(a) if is_upscale_archive(a.path()) => UPSCALE_FACTOR,
             _ => 1,
         }
+    }
+
+    /// MONKEY (texture upscale): whether any archive of the Upscale tier mounted (the pack
+    /// is present and `MONKEY_UPSCALE` did not turn it off).
+    pub fn upscale_mounted(&self) -> bool {
+        self.archives.iter().any(|a| is_upscale_archive(a.path()))
     }
 
     /// The path of the archive `name` resolves to, for debugging and extraction.

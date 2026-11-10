@@ -19,6 +19,54 @@ pub(crate) const LAYER_TEX_SIZE: u32 = 256;
 /// Per-layer mip count, the authored count at 256²: 256 down to 1 (`0x5a4ac0`).
 pub(crate) const LAYER_MIP_COUNT: u32 = 9;
 
+/// MONKEY (texture upscale): the layer edge when the `Data\Upscale` pack is mounted, its 2x ground
+/// BLPs (256² stock) kept whole instead of resized down.
+pub(crate) const UPSCALED_LAYER_TEX_SIZE: u32 = LAYER_TEX_SIZE * benilla_formats::UPSCALE_FACTOR;
+
+/// MONKEY (texture upscale): the layer edge for a chain with (`true`) or without the pack.
+pub(crate) fn layer_size_for(upscaled: bool) -> u32 {
+    if upscaled {
+        UPSCALED_LAYER_TEX_SIZE
+    } else {
+        LAYER_TEX_SIZE
+    }
+}
+
+/// MONKEY (texture upscale): the layer edge a tile is packed at, before the memory budget: 512
+/// when the opened chain mounted the pack, else 256 (today's exact path).
+pub(crate) fn layer_size() -> u32 {
+    layer_size_for(benilla_formats::upscale_active())
+}
+
+/// MONKEY (texture upscale): the full mip chain of a square `size` layer, 1x1 last.
+pub(crate) fn mip_count_for(size: u32) -> u32 {
+    size.max(1).ilog2() + 1
+}
+
+/// MONKEY (texture upscale): a tile's decoded (RGBA8) layer array may take this many bytes at the
+/// upscaled size, else the tile packs at 256 as without the pack: ground textures are the biggest
+/// per-tile GPU cost (1.33 MiB a decoded 512² layer with mips, 0.33 MiB at 256²). Default 160 MiB
+/// (120 decoded layers), `MONKEY_TERRAIN_LAYER_MB` overrides.
+fn upscaled_tile_budget() -> usize {
+    std::env::var("MONKEY_TERRAIN_LAYER_MB")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(160)
+        << 20
+}
+
+/// MONKEY (texture upscale): the edge to pack a tile of `layer_count` layers (fallback included)
+/// at: `wanted`, unless that is above 256 and the decoded array would pass `budget` bytes.
+pub(crate) fn tile_layer_size(wanted: u32, layer_count: usize, budget: usize) -> u32 {
+    if wanted > LAYER_TEX_SIZE
+        && layer_count * mip_chain_byte_size(wanted, mip_count_for(wanted)) > budget
+    {
+        LAYER_TEX_SIZE
+    } else {
+        wanted
+    }
+}
+
 /// Non-sRGB, so sampling does not linearize and shader math stays in gamma byte space, as in the
 /// reference.
 fn color_format() -> TextureFormat {
@@ -35,7 +83,7 @@ fn block_color_format(texels: BlpTexels) -> TextureFormat {
     }
 }
 
-/// One ground texture's mip chain at [`LAYER_TEX_SIZE`]², level 0 first.
+/// One ground texture's mip chain at the layer size, level 0 first.
 pub(crate) struct LayerTexture {
     pub(crate) chain: Vec<u8>,
     pub(crate) mip_count: u32,
@@ -50,8 +98,9 @@ pub(crate) fn chain_to_layer(blp: BlpMipChain, target_size: u32) -> LayerTexture
         blp.is_rgba8(),
         "terrain layer packing indexes texels; it needs a decoded chain"
     );
-    let mut chain = Vec::with_capacity(mip_chain_byte_size(target_size, LAYER_MIP_COUNT));
-    for level in 0..LAYER_MIP_COUNT {
+    let mip_count = mip_count_for(target_size);
+    let mut chain = Vec::with_capacity(mip_chain_byte_size(target_size, mip_count));
+    for level in 0..mip_count {
         let level_w = (target_size >> level).max(1);
         let level_h = level_w; // tilesets are square in 1.12
         if blp.width >= level_w {
@@ -62,20 +111,30 @@ pub(crate) fn chain_to_layer(blp: BlpMipChain, target_size: u32) -> LayerTexture
             extend_nearest(&mut chain, &blp.mips[src_level], sw, sh, level_w, level_h);
         } else {
             // Authored smaller than this level: NEAREST-upsample mip 0.
-            extend_nearest(
-                &mut chain,
-                &blp.mips[0],
-                blp.width,
-                blp.height,
-                level_w,
-                level_h,
-            );
+            // MONKEY (texture upscale): above the stock 256 (a stock texture in an upscaled tile,
+            // 256 -> 512) a smooth filter, not blocky NEAREST; a 256 tile keeps NEAREST exactly.
+            if target_size > LAYER_TEX_SIZE {
+                extend_smooth(
+                    &mut chain,
+                    &blp.mips[0],
+                    blp.width,
+                    blp.height,
+                    level_w,
+                    level_h,
+                );
+            } else {
+                extend_nearest(
+                    &mut chain,
+                    &blp.mips[0],
+                    blp.width,
+                    blp.height,
+                    level_w,
+                    level_h,
+                );
+            }
         }
     }
-    LayerTexture {
-        chain,
-        mip_count: LAYER_MIP_COUNT,
-    }
+    LayerTexture { chain, mip_count }
 }
 
 /// One ground texture as read, blocks intact, until the whole tile picks its array's form.
@@ -85,11 +144,14 @@ pub(crate) struct RawLayer {
     pub(crate) matte: bool,
 }
 
-/// A tile's layer array: LayerMajor bytes, their format and level count.
+/// A tile's layer array: LayerMajor bytes, their format, edge and level count.
 pub(crate) struct PackedLayers {
     pub(crate) data: Vec<u8>,
     pub(crate) format: TextureFormat,
     pub(crate) mip_count: u32,
+    /// MONKEY (texture upscale): the layer edge (256, or 512 with the pack); the relief array of
+    /// the same tile is built at it so both share UVs texel for texel.
+    pub(crate) size: u32,
 }
 
 /// The block form the whole tile's layer array can upload in, or `None` to decode. Every layer
@@ -97,7 +159,7 @@ pub(crate) struct PackedLayers {
 /// exactly the sizes the form implies (checked in release: a wrong byte count corrupts every later
 /// layer instead of failing), and no matte stomp. [`crate::gpu_blp::bc_supported`] gates it all,
 /// so `WOW_NO_BC=1`, a device without BC and every headless test take the decoded path.
-fn passthrough_form(layers: &[RawLayer], bc_supported: bool) -> Option<BlpTexels> {
+fn passthrough_form(layers: &[RawLayer], bc_supported: bool, size: u32) -> Option<BlpTexels> {
     if !bc_supported {
         return None;
     }
@@ -106,13 +168,13 @@ fn passthrough_form(layers: &[RawLayer], bc_supported: bool) -> Option<BlpTexels
         && layers.iter().all(|l| {
             l.chain.texels == form
                 && !l.matte
-                && l.chain.width == LAYER_TEX_SIZE
-                && l.chain.height == LAYER_TEX_SIZE
-                && l.chain.mips.len() >= LAYER_MIP_COUNT as usize
-                && l.chain.mips[..LAYER_MIP_COUNT as usize]
+                && l.chain.width == size
+                && l.chain.height == size
+                && l.chain.mips.len() >= mip_count_for(size) as usize
+                && l.chain.mips[..mip_count_for(size) as usize]
                     .iter()
                     .enumerate()
-                    .all(|(i, level)| level.len() == form_level_bytes(form, i as u32))
+                    .all(|(i, level)| level.len() == form_level_bytes(form, size, i as u32))
         });
     uniform.then_some(form)
 }
@@ -121,19 +183,27 @@ fn passthrough_form(layers: &[RawLayer], bc_supported: bool) -> Option<BlpTexels
 /// `fallback` is layer 0, the solid placeholder for a texture that fails to load, synthesised in
 /// the form the tile picked.
 pub(crate) fn pack_layers(fallback: [u8; 4], layers: Vec<RawLayer>) -> PackedLayers {
-    pack(fallback, layers, crate::gpu_blp::bc_supported())
+    // MONKEY (texture upscale): the process layer size, held to 256 for a tile over the budget.
+    let size = tile_layer_size(layer_size(), layers.len() + 1, upscaled_tile_budget());
+    pack(fallback, layers, crate::gpu_blp::bc_supported(), size)
 }
 
 /// [`pack_layers`] with device support passed in, so a headless test can reach the block path.
-fn pack(fallback: [u8; 4], layers: Vec<RawLayer>, bc_supported: bool) -> PackedLayers {
-    if let Some(form) = passthrough_form(&layers, bc_supported) {
-        let per_layer: usize = (0..LAYER_MIP_COUNT)
-            .map(|i| form_level_bytes(form, i))
+fn pack(
+    fallback: [u8; 4],
+    layers: Vec<RawLayer>,
+    bc_supported: bool,
+    size: u32,
+) -> PackedLayers {
+    let mip_count = mip_count_for(size);
+    if let Some(form) = passthrough_form(&layers, bc_supported, size) {
+        let per_layer: usize = (0..mip_count)
+            .map(|i| form_level_bytes(form, size, i))
             .sum();
         let mut data = Vec::with_capacity((layers.len() + 1) * per_layer);
-        data.extend_from_slice(&solid_block_chain(form, fallback));
+        data.extend_from_slice(&solid_block_chain(form, fallback, size));
         for layer in &layers {
-            for level in layer.chain.mips.iter().take(LAYER_MIP_COUNT as usize) {
+            for level in layer.chain.mips.iter().take(mip_count as usize) {
                 data.extend_from_slice(level);
             }
         }
@@ -141,16 +211,16 @@ fn pack(fallback: [u8; 4], layers: Vec<RawLayer>, bc_supported: bool) -> PackedL
         return PackedLayers {
             data,
             format: block_color_format(form),
-            mip_count: LAYER_MIP_COUNT,
+            mip_count,
+            size,
         };
     }
 
-    let fb = solid_layer_chain(fallback);
-    let mip_count = fb.mip_count;
+    let fb = solid_layer_chain(fallback, size);
     let mut data = fb.chain;
     for layer in layers {
         let matte = layer.matte;
-        let mut packed = chain_to_layer(layer.chain.into_rgba8(), LAYER_TEX_SIZE);
+        let mut packed = chain_to_layer(layer.chain.into_rgba8(), size);
         if matte {
             packed
                 .chain
@@ -165,12 +235,14 @@ fn pack(fallback: [u8; 4], layers: Vec<RawLayer>, bc_supported: bool) -> PackedL
         data,
         format: color_format(),
         mip_count,
+        size,
     }
 }
 
-/// Bytes of one layer's array level in `form`, shared by the check, the packer and the fallback.
-fn form_level_bytes(form: BlpTexels, level: u32) -> usize {
-    let w = (LAYER_TEX_SIZE >> level).max(1);
+/// Bytes of one layer's array level in `form` at layer edge `size`, shared by the check, the packer
+/// and the fallback.
+fn form_level_bytes(form: BlpTexels, size: u32, level: u32) -> usize {
+    let w = (size >> level).max(1);
     form.level_bytes(w, w)
 }
 
@@ -192,12 +264,12 @@ fn solid_block(form: BlpTexels, rgba: [u8; 4]) -> Vec<u8> {
 }
 
 /// The block form of [`solid_layer_chain`], for layer 0 of a passthrough array.
-fn solid_block_chain(form: BlpTexels, rgba: [u8; 4]) -> Vec<u8> {
+fn solid_block_chain(form: BlpTexels, rgba: [u8; 4], size: u32) -> Vec<u8> {
     let block = solid_block(form, rgba);
     let mut out = Vec::new();
-    for level in 0..LAYER_MIP_COUNT {
+    for level in 0..mip_count_for(size) {
         // A level below 4x4 still takes one whole block, as the authored chains do.
-        for _ in 0..(form_level_bytes(form, level) / block.len()) {
+        for _ in 0..(form_level_bytes(form, size, level) / block.len()) {
             out.extend_from_slice(&block);
         }
     }
@@ -205,18 +277,16 @@ fn solid_block_chain(form: BlpTexels, rgba: [u8; 4]) -> Vec<u8> {
 }
 
 /// The decoded fallback layer 0: one colour at every level.
-pub(crate) fn solid_layer_chain(rgba: [u8; 4]) -> LayerTexture {
-    let mut chain = Vec::with_capacity(mip_chain_byte_size(LAYER_TEX_SIZE, LAYER_MIP_COUNT));
-    for level in 0..LAYER_MIP_COUNT {
-        let w = (LAYER_TEX_SIZE >> level).max(1);
+pub(crate) fn solid_layer_chain(rgba: [u8; 4], size: u32) -> LayerTexture {
+    let mip_count = mip_count_for(size);
+    let mut chain = Vec::with_capacity(mip_chain_byte_size(size, mip_count));
+    for level in 0..mip_count {
+        let w = (size >> level).max(1);
         for _ in 0..(w * w) {
             chain.extend_from_slice(&rgba);
         }
     }
-    LayerTexture {
-        chain,
-        mip_count: LAYER_MIP_COUNT,
-    }
+    LayerTexture { chain, mip_count }
 }
 
 /// Total bytes for a mip pyramid of `mip_count` levels starting at `top²` RGBA8.
@@ -244,12 +314,28 @@ pub(crate) fn extend_nearest(out: &mut Vec<u8>, src: &[u8], sw: u32, sh: u32, dw
     out.extend_from_slice(resized.as_raw());
 }
 
+/// MONKEY (texture upscale): [`extend_nearest`] with a Catmull-Rom filter, for the top level of a
+/// stock texture in an upscaled array. Only ever an UP-sample, so no gamma-byte averaging darkens it.
+pub(crate) fn extend_smooth(out: &mut Vec<u8>, src: &[u8], sw: u32, sh: u32, dw: u32, dh: u32) {
+    if sw == dw && sh == dh {
+        out.extend_from_slice(src);
+        return;
+    }
+    let Some(buf) = image::RgbaImage::from_raw(sw, sh, src.to_vec()) else {
+        out.extend(std::iter::repeat_n(0u8, (dw * dh * 4) as usize));
+        return;
+    };
+    let resized = image::imageops::resize(&buf, dw, dh, image::imageops::FilterType::CatmullRom);
+    out.extend_from_slice(resized.as_raw());
+}
+
 /// The tile's packed ground layers as a repeating, mipmapped `2d_array`.
 pub(crate) fn layer_array_image(size: u32, layer_count: u32, packed: PackedLayers) -> Image {
     let PackedLayers {
         data,
         format,
         mip_count,
+        ..
     } = packed;
     let mut image = array_image(size, layer_count, format);
     image.data = Some(data);
@@ -349,7 +435,7 @@ mod tests {
 
     #[test]
     fn solid_layer_chain_is_one_colour_at_every_mip() {
-        let layer = solid_layer_chain([10, 20, 30, 40]);
+        let layer = solid_layer_chain([10, 20, 30, 40], LAYER_TEX_SIZE);
         assert_eq!(
             layer.chain.len(),
             mip_chain_byte_size(LAYER_TEX_SIZE, LAYER_MIP_COUNT)
@@ -372,6 +458,7 @@ mod tests {
                 data: bytes,
                 format: color_format(),
                 mip_count: LAYER_MIP_COUNT,
+                size: LAYER_TEX_SIZE,
             },
         );
         assert_eq!(img.texture_descriptor.size.width, LAYER_TEX_SIZE);
@@ -419,33 +506,33 @@ mod tests {
                 raw(BlpTexels::Bc2, 256, 9, false),
             ]
         };
-        assert_eq!(passthrough_form(&ok(), true), Some(BlpTexels::Bc2));
+        assert_eq!(passthrough_form(&ok(), true, LAYER_TEX_SIZE), Some(BlpTexels::Bc2));
 
         // No device support.
-        assert_eq!(passthrough_form(&ok(), false), None);
+        assert_eq!(passthrough_form(&ok(), false, LAYER_TEX_SIZE), None);
         // Mixed block forms, the common case: a `_s` variant is DXT3, a base without one DXT1.
         let mixed = vec![
             raw(BlpTexels::Bc1, 256, 9, false),
             raw(BlpTexels::Bc2, 256, 9, false),
         ];
-        assert_eq!(passthrough_form(&mixed, true), None);
+        assert_eq!(passthrough_form(&mixed, true, LAYER_TEX_SIZE), None);
         // Not natively 256².
         let small = vec![raw(BlpTexels::Bc2, 128, 8, false)];
-        assert_eq!(passthrough_form(&small, true), None);
+        assert_eq!(passthrough_form(&small, true, LAYER_TEX_SIZE), None);
         // A short chain.
         let short = vec![raw(BlpTexels::Bc2, 256, 5, false)];
-        assert_eq!(passthrough_form(&short, true), None);
+        assert_eq!(passthrough_form(&short, true, LAYER_TEX_SIZE), None);
         // A matte layer.
         let matte = vec![raw(BlpTexels::Bc2, 256, 9, true)];
-        assert_eq!(passthrough_form(&matte, true), None);
+        assert_eq!(passthrough_form(&matte, true, LAYER_TEX_SIZE), None);
         // Raw1/Raw3 tilesets have no block form at all.
         let raw1 = vec![RawLayer {
             chain: synthetic_chain(256, 9),
             matte: false,
         }];
-        assert_eq!(passthrough_form(&raw1, true), None);
+        assert_eq!(passthrough_form(&raw1, true, LAYER_TEX_SIZE), None);
         // The fallback-only tile.
-        assert_eq!(passthrough_form(&[], true), None);
+        assert_eq!(passthrough_form(&[], true, LAYER_TEX_SIZE), None);
     }
 
     #[test]
@@ -455,12 +542,12 @@ mod tests {
             // A level of the wrong size must not reach the packer.
             let mut short = raw(form, 256, 9, false);
             short.chain.mips[3].truncate(4);
-            assert_eq!(passthrough_form(&[short], true), None, "{form:?}");
-            let packed = pack([107, 133, 82, 0], layers, true);
+            assert_eq!(passthrough_form(&[short], true, LAYER_TEX_SIZE), None, "{form:?}");
+            let packed = pack([107, 133, 82, 0], layers, true, LAYER_TEX_SIZE);
             assert_eq!(packed.format, block_color_format(form));
             assert_eq!(packed.mip_count, LAYER_MIP_COUNT);
             let per_layer: usize = (0..LAYER_MIP_COUNT)
-                .map(|i| form_level_bytes(form, i))
+                .map(|i| form_level_bytes(form, LAYER_TEX_SIZE, i))
                 .sum();
             // 3 layers: the synthesised fallback at index 0, then the two real ones.
             assert_eq!(packed.data.len(), 3 * per_layer, "{form:?}");
@@ -480,9 +567,9 @@ mod tests {
     fn the_synthesised_fallback_block_decodes_to_its_colour() {
         let rgba = [107u8, 133, 82, 0];
         for form in [BlpTexels::Bc1, BlpTexels::Bc2, BlpTexels::Bc3] {
-            let chain = solid_block_chain(form, rgba);
+            let chain = solid_block_chain(form, rgba, LAYER_TEX_SIZE);
             let per_layer: usize = (0..LAYER_MIP_COUNT)
-                .map(|i| form_level_bytes(form, i))
+                .map(|i| form_level_bytes(form, LAYER_TEX_SIZE, i))
                 .sum();
             assert_eq!(chain.len(), per_layer, "{form:?}");
             let top = BlpMipChain {
@@ -524,7 +611,7 @@ mod tests {
                 matte: false,
             },
         ];
-        let packed = pack([107, 133, 82, 0], layers, true);
+        let packed = pack([107, 133, 82, 0], layers, true, LAYER_TEX_SIZE);
         assert_eq!(packed.format, color_format());
         let per_layer = mip_chain_byte_size(LAYER_TEX_SIZE, LAYER_MIP_COUNT);
         assert_eq!(packed.data.len(), 3 * per_layer);
@@ -548,5 +635,60 @@ mod tests {
         let shadow = shadow_array_image(64, 2, vec![0u8; 2 * 64 * 64]);
         assert_eq!(shadow.texture_descriptor.size.depth_or_array_layers, 2);
         assert_eq!(shadow.texture_descriptor.format, TextureFormat::R8Unorm);
+    }
+
+    // MONKEY (texture upscale): the 512 layer mode.
+    #[test]
+    fn the_layer_size_follows_the_pack_and_the_chain_runs_to_one() {
+        assert_eq!(layer_size_for(false), 256);
+        assert_eq!(layer_size_for(true), 512);
+        assert_eq!(mip_count_for(256), LAYER_MIP_COUNT);
+        assert_eq!(mip_count_for(512), 10);
+        assert_eq!(mip_count_for(1), 1);
+    }
+
+    #[test]
+    fn a_tile_over_the_budget_packs_at_256_and_never_goes_below_it() {
+        let mib = 1usize << 20;
+        // 1.33 MiB a 512² decoded layer with its mips: 120 fit 160 MiB, 121 do not.
+        assert_eq!(mip_chain_byte_size(512, 10), 1_398_100);
+        assert_eq!(tile_layer_size(512, 120, 160 * mib), 512);
+        assert_eq!(tile_layer_size(512, 121, 160 * mib), 256);
+        // Today's path is never touched by the budget.
+        assert_eq!(tile_layer_size(256, 10_000, 0), 256);
+    }
+
+    #[test]
+    fn a_512_tile_passes_native_512_blocks_through_with_a_ten_level_chain() {
+        for form in [BlpTexels::Bc1, BlpTexels::Bc2, BlpTexels::Bc3] {
+            let layers = vec![raw(form, 512, 10, false), raw(form, 512, 10, false)];
+            let packed = pack([1, 2, 3, 0], layers, true, 512);
+            assert_eq!((packed.size, packed.mip_count), (512, 10));
+            let per_layer: usize = (0..10).map(|i| form_level_bytes(form, 512, i)).sum();
+            assert_eq!(packed.data.len(), 3 * per_layer, "{form:?}");
+            // A 256 BLP (a stock texture missing from the pack) is not the passthrough size.
+            let stock = vec![raw(form, 256, 9, false)];
+            assert_eq!(passthrough_form(&stock, true, 512), None);
+        }
+    }
+
+    #[test]
+    fn a_stock_256_texture_in_a_512_tile_is_smoothly_upsized_and_keeps_its_levels() {
+        let layer = chain_to_layer(synthetic_chain(256, 9), 512);
+        assert_eq!(layer.mip_count, 10);
+        assert_eq!(layer.chain.len(), mip_chain_byte_size(512, 10));
+        // A solid 200 stays 200 through the filter (no darkening, no overshoot).
+        assert!(layer.chain.iter().all(|&b| b == 200));
+        // The decoded path at 512 sizes the fallback and every layer alike.
+        let packed = pack(
+            [9, 9, 9, 0],
+            vec![RawLayer {
+                chain: synthetic_chain(256, 9),
+                matte: false,
+            }],
+            false,
+            512,
+        );
+        assert_eq!(packed.data.len(), 2 * mip_chain_byte_size(512, 10));
     }
 }

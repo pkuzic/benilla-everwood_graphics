@@ -19,7 +19,7 @@ use bevy::reflect::TypePath;
 
 use crate::coords::wow_to_bevy;
 use crate::terrain::{
-    alpha_array_image, layer_array_image, pack_layers, shadow_array_image, RawLayer, LAYER_TEX_SIZE,
+    alpha_array_image, layer_array_image, pack_layers, shadow_array_image, RawLayer,
 };
 
 /// A loaded ADT tile; the app builds its meshes with [`chunk_to_mesh`].
@@ -231,13 +231,16 @@ impl AssetLoader for AdtLoader {
             packed.format,
             packed.data.len() >> 10
         );
-        let layer_array = layer_array_image(LAYER_TEX_SIZE, layer_count, packed);
+        // MONKEY (texture upscale): the tile's own layer edge (256, or 512 with the pack), shared
+        // with its relief array below so both sample the same texels.
+        let layer_size = packed.size;
+        let layer_array = layer_array_image(layer_size, layer_count, packed);
         let alpha_array = alpha_array_image(ALPHA_MAP_SIZE, alpha_count, alpha_buf);
         let shadow_array = shadow_array_image(SHADOW_MAP_SIZE, shadow_count, shadow_buf);
         // MONKEY (ground relief): one relief map per layer-array index, flat where none exists.
         let relief_dir = crate::relief::monkey_relief_dir();
         let (relief_array, relief_layers) =
-            crate::relief::monkey_relief_array(&layer_names, relief_dir);
+            crate::relief::monkey_relief_array(&layer_names, relief_dir, layer_size);
         if relief_dir.is_some() {
             // One line per tile at most.
             debug!(

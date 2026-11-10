@@ -20,7 +20,7 @@ use bevy::image::{Image, ImageAddressMode, ImageFilterMode, ImageSampler, ImageS
 use bevy::prelude::*;
 use bevy::render::render_resource::{TextureDataOrder, TextureFormat};
 
-use crate::terrain::{array_image, LAYER_MIP_COUNT, LAYER_TEX_SIZE};
+use crate::terrain::{array_image, mip_count_for};
 
 /// MONKEY (ground relief): the flat texel — normal (0, 0, 1), fully open, top height. The shader
 /// decodes the normal as `(byte - 128) / 127`, so 128 is EXACTLY zero tilt.
@@ -86,9 +86,9 @@ pub(crate) fn blp_key_to_png(k: &str) -> String {
     }
 }
 
-/// MONKEY (ground relief): one layer's relief chain (`LAYER_TEX_SIZE`², `LAYER_MIP_COUNT` levels,
-/// RGBA8, level 0 first), or `None` when the dir has no (readable) map for `key`.
-pub fn read_relief_layer(dir: &Path, key: &str) -> Option<Vec<u8>> {
+/// MONKEY (ground relief): one layer's relief chain (`size`², a full mip chain, RGBA8, level 0
+/// first; `size` is the tile's layer edge so it lines up with the colour array), or `None` when the dir has no (readable) map for `key`.
+pub fn read_relief_layer(dir: &Path, key: &str, size: u32) -> Option<Vec<u8>> {
     let path = dir.join(relief_rel_path(key));
     let bytes = std::fs::read(&path).ok()?;
     let decoded = match image::load_from_memory_with_format(&bytes, image::ImageFormat::Png) {
@@ -98,29 +98,28 @@ pub fn read_relief_layer(dir: &Path, key: &str) -> Option<Vec<u8>> {
             return None;
         }
     };
-    Some(relief_chain(decoded))
+    Some(relief_chain(decoded, size))
 }
 
-/// MONKEY (ground relief): resize (triangle filter) to `LAYER_TEX_SIZE`² and box-filter the mips.
-fn relief_chain(img: image::RgbaImage) -> Vec<u8> {
-    let top = if img.width() == LAYER_TEX_SIZE && img.height() == LAYER_TEX_SIZE {
+/// MONKEY (ground relief): resize (triangle filter) to `size`² and box-filter the mips; an exact
+/// size passes through (the 512 maps on disk with the upscale pack).
+fn relief_chain(img: image::RgbaImage, size: u32) -> Vec<u8> {
+    let mip_count = mip_count_for(size);
+    let top = if img.width() == size && img.height() == size {
         img
     } else {
         image::imageops::resize(
             &img,
-            LAYER_TEX_SIZE,
-            LAYER_TEX_SIZE,
+            size,
+            size,
             image::imageops::FilterType::Triangle,
         )
     };
-    let mut chain = Vec::with_capacity(crate::terrain::mip_chain_byte_size(
-        LAYER_TEX_SIZE,
-        LAYER_MIP_COUNT,
-    ));
+    let mut chain = Vec::with_capacity(crate::terrain::mip_chain_byte_size(size, mip_count));
     let mut level = top.into_raw();
-    let mut w = LAYER_TEX_SIZE;
+    let mut w = size;
     chain.extend_from_slice(&level);
-    for _ in 1..LAYER_MIP_COUNT {
+    for _ in 1..mip_count {
         let nw = (w / 2).max(1);
         level = box_down(&level, w, nw);
         w = nw;
@@ -150,7 +149,7 @@ fn box_down(src: &[u8], w: u32, nw: u32) -> Vec<u8> {
 /// MONKEY (ground relief): build a tile's relief array from its `layer_names` (index 0 = the
 /// fallback slot, flat). Returns the image and `relief_layers`: the array's layer count, or 0 when
 /// no layer has a map (the image is then a 1-layer 4×4 flat dummy and the shader never samples it).
-pub fn monkey_relief_array(names: &[String], dir: Option<&Path>) -> (Image, u32) {
+pub fn monkey_relief_array(names: &[String], dir: Option<&Path>, size: u32) -> (Image, u32) {
     let maps: Vec<Option<Vec<u8>>> = match dir {
         Some(dir) => names
             .iter()
@@ -159,17 +158,17 @@ pub fn monkey_relief_array(names: &[String], dir: Option<&Path>) -> (Image, u32)
                 if i == 0 || n.is_empty() {
                     None
                 } else {
-                    read_relief_layer(dir, n)
+                    read_relief_layer(dir, n, size)
                 }
             })
             .collect(),
         None => Vec::new(),
     };
-    relief_array_from(names.len().max(1) as u32, maps)
+    relief_array_from(names.len().max(1) as u32, maps, size)
 }
 
 /// MONKEY (ground relief): [`monkey_relief_array`] over already-read chains (testable without IO).
-fn relief_array_from(layer_count: u32, maps: Vec<Option<Vec<u8>>>) -> (Image, u32) {
+fn relief_array_from(layer_count: u32, maps: Vec<Option<Vec<u8>>>, size: u32) -> (Image, u32) {
     if !maps.iter().any(Option::is_some) {
         let data = RELIEF_FLAT.repeat((DUMMY_SIZE * DUMMY_SIZE) as usize);
         let mut image = array_image(DUMMY_SIZE, 1, TextureFormat::Rgba8Unorm);
@@ -177,7 +176,8 @@ fn relief_array_from(layer_count: u32, maps: Vec<Option<Vec<u8>>>) -> (Image, u3
         set_sampler(&mut image);
         return (image, 0);
     }
-    let per_layer = crate::terrain::mip_chain_byte_size(LAYER_TEX_SIZE, LAYER_MIP_COUNT);
+    let mip_count = mip_count_for(size);
+    let per_layer = crate::terrain::mip_chain_byte_size(size, mip_count);
     let flat = RELIEF_FLAT.repeat(per_layer / 4);
     let mut data = Vec::with_capacity(per_layer * layer_count as usize);
     for i in 0..layer_count as usize {
@@ -186,9 +186,9 @@ fn relief_array_from(layer_count: u32, maps: Vec<Option<Vec<u8>>>) -> (Image, u3
             _ => data.extend_from_slice(&flat),
         }
     }
-    let mut image = array_image(LAYER_TEX_SIZE, layer_count, TextureFormat::Rgba8Unorm);
+    let mut image = array_image(size, layer_count, TextureFormat::Rgba8Unorm);
     image.data = Some(data);
-    image.texture_descriptor.mip_level_count = LAYER_MIP_COUNT;
+    image.texture_descriptor.mip_level_count = mip_count;
     image.data_order = TextureDataOrder::LayerMajor;
     set_sampler(&mut image);
     (image, layer_count)
@@ -210,6 +210,7 @@ fn set_sampler(image: &mut Image) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::terrain::LAYER_TEX_SIZE;
 
     #[test]
     fn the_relief_path_is_the_lowercased_base_key_as_png() {
@@ -225,7 +226,7 @@ mod tests {
 
     #[test]
     fn a_tile_without_maps_binds_the_small_flat_dummy() {
-        let (img, layers) = relief_array_from(5, vec![None, None, None, None, None]);
+        let (img, layers) = relief_array_from(5, vec![None, None, None, None, None], 256);
         assert_eq!(layers, 0);
         assert_eq!(img.texture_descriptor.size.width, DUMMY_SIZE);
         assert_eq!(img.texture_descriptor.size.depth_or_array_layers, 1);
@@ -239,17 +240,17 @@ mod tests {
             64,
             64,
             image::Rgba([10, 20, 30, 40]),
-        ));
-        let per_layer = crate::terrain::mip_chain_byte_size(LAYER_TEX_SIZE, LAYER_MIP_COUNT);
+        ), LAYER_TEX_SIZE);
+        let per_layer = crate::terrain::mip_chain_byte_size(LAYER_TEX_SIZE, mip_count_for(LAYER_TEX_SIZE));
         assert_eq!(
             chain.len(),
             per_layer,
             "resized to the layer size with a full chain"
         );
-        let (img, layers) = relief_array_from(3, vec![None, None, Some(chain)]);
+        let (img, layers) = relief_array_from(3, vec![None, None, Some(chain)], LAYER_TEX_SIZE);
         assert_eq!(layers, 3);
         assert_eq!(img.texture_descriptor.size.depth_or_array_layers, 3);
-        assert_eq!(img.texture_descriptor.mip_level_count, LAYER_MIP_COUNT);
+        assert_eq!(img.texture_descriptor.mip_level_count, mip_count_for(LAYER_TEX_SIZE));
         let data = img.data.as_ref().unwrap();
         assert_eq!(data.len(), per_layer * 3);
         assert_eq!(&data[..4], &RELIEF_FLAT, "layer 0 is the flat fallback");
@@ -271,5 +272,20 @@ mod tests {
             0u8, 0, 0, 0, 255, 255, 255, 255, 255, 255, 255, 255, 0, 0, 0, 0,
         ];
         assert_eq!(box_down(&src, 2, 1), vec![128, 128, 128, 128]);
+    }
+
+    // MONKEY (texture upscale): the relief chain follows the tile's layer size.
+    #[test]
+    fn relief_at_512_passes_a_512_map_through_and_resizes_a_256_one() {
+        let want = crate::terrain::mip_chain_byte_size(512, mip_count_for(512));
+        let native = relief_chain(image::RgbaImage::from_pixel(512, 512, image::Rgba([7, 8, 9, 10])), 512);
+        assert_eq!(native.len(), want);
+        assert_eq!(&native[..4], &[7, 8, 9, 10], "exact size is untouched");
+        let old = relief_chain(image::RgbaImage::from_pixel(256, 256, image::Rgba([7, 8, 9, 10])), 512);
+        assert_eq!(old.len(), want);
+        let (img, n) = relief_array_from(2, vec![None, Some(native)], 512);
+        assert_eq!(n, 2);
+        assert_eq!(img.texture_descriptor.size.width, 512);
+        assert_eq!(img.texture_descriptor.mip_level_count, 10);
     }
 }

@@ -60,8 +60,16 @@ const EDGE_BLEED_YD: f32 = 1.0;
 /// The reference's half-texel UV inset as a quad scale: a tile of `extent` yd baked at
 /// [`YD_PER_TEXEL`](benilla_assets::minimap_grid::YD_PER_TEXEL) is `W` texels wide, and mapping
 /// texel centres to the quad's edges stretches it by `W / (W − 1)`.
+///
+/// MONKEY (texture upscale): `W` counts the pack's 2x texels when the pack is mounted, so the inset
+/// stays the half texel of the art actually drawn.
 fn texel_stretch(extent_yd: f32) -> f32 {
-    let texels = extent_yd / benilla_assets::minimap_grid::YD_PER_TEXEL;
+    let scale = if benilla_formats::upscale_active() { benilla_formats::UPSCALE_FACTOR } else { 1 };
+    texel_stretch_at(extent_yd, scale)
+}
+
+fn texel_stretch_at(extent_yd: f32, scale: u32) -> f32 {
+    let texels = extent_yd / benilla_assets::minimap_grid::YD_PER_TEXEL * scale as f32;
     if texels > 1.0 {
         texels / (texels - 1.0)
     } else {
@@ -397,7 +405,7 @@ fn emit_minimap(
     }
     // The composite is off unless the interior branch below turns it on this frame.
     composite.active = false;
-    let Some(rt_image) = rig.map(|r| r.image.clone()) else {
+    let Some((rt_image, rt_size)) = rig.map(|r| (r.image.clone(), r.size)) else {
         return; // the composite rig's Startup system has not run yet
     };
     // `WOW_MM_ZOOM=0..5` forces both zoom indices, a capture instrument.
@@ -444,9 +452,9 @@ fn emit_minimap(
 
         // The tiles go into the reference's 256² target (`composite`), not the screen. Target
         // space: y-up, origin at the player, `RT_HALF_EXTENT_SCALE · radius` yd to an edge.
-        #[allow(clippy::cast_precision_loss)] // 256 is exact in f32
+        #[allow(clippy::cast_precision_loss)] // 256 and 512 are exact in f32
         let units_per_yd =
-            (composite::RT_SIZE as f32 * 0.5) / (composite::RT_HALF_EXTENT_SCALE * radius);
+            (rt_size as f32 * 0.5) / (composite::RT_HALF_EXTENT_SCALE * radius);
         // A model point to its north-up target position: placement to world, then up = +X north,
         // left = +Y west.
         let to_target = |m: [f32; 3]| {
@@ -458,7 +466,7 @@ fn emit_minimap(
         let x_axis = to_target([1.0, 0.0, 0.0]) - to_target([0.0, 0.0, 0.0]);
         let rotation = (-x_axis.y).atan2(x_axis.x);
         #[allow(clippy::cast_precision_loss)]
-        let rt_half = composite::RT_SIZE as f32 * 0.5;
+        let rt_half = rt_size as f32 * 0.5;
         composite.active = true;
 
         // The portal flood-fill from the player's group (`0x6a5020`) in the stored window. Its
@@ -1266,6 +1274,21 @@ mod art_tests {
 #[cfg(test)]
 mod tests {
     use super::minimap_day_tint;
+
+    // MONKEY (texture upscale): the half-texel inset follows the art's texel count, and the
+    // target scales with it so target units per yard keep the on-screen size.
+    #[test]
+    fn the_interior_inset_and_target_follow_the_art_scale() {
+        let w = 64.0 * benilla_assets::minimap_grid::YD_PER_TEXEL; // a 64-texel stock tile
+        assert!((super::texel_stretch_at(w, 1) - 64.0 / 63.0).abs() < 1e-6);
+        assert!((super::texel_stretch_at(w, 2) - 128.0 / 127.0).abs() < 1e-6);
+        // yards per target half-extent: (size / 2) / units_per_yd is size-independent.
+        let radius = 100.0_f32;
+        for size in [256.0_f32, 512.0] {
+            let units_per_yd = (size * 0.5) / (super::composite::RT_HALF_EXTENT_SCALE * radius);
+            assert!(((size * 0.5) / units_per_yd - 150.0).abs() < 1e-3);
+        }
+    }
 
     fn approx(a: [f32; 3], b: [f32; 3]) {
         for c in 0..3 {
