@@ -38,7 +38,7 @@ pub struct AdtTile {
     pub relief_array: Handle<Image>,
     /// MONKEY (ground relief): layers in `relief_array`, or 0 when no layer of the tile has a map
     /// (then `relief_array` is a 1-layer flat dummy and the shader never samples it). A layer index
-    /// at or past this (EME paint appends layers later) reads flat.
+    /// at or past this reads flat.
     pub relief_layers: u32,
     /// M2 doodad placements (raw WoW coords).
     pub doodads: Vec<Doodad>,
@@ -223,6 +223,14 @@ impl AssetLoader for AdtLoader {
         }
 
         let layer_count = layers.len() as u32 + 1;
+        // MONKEY (ground relief): each layer-array index's texture path (`[0]` = the fallback
+        // slot, empty), so the relief array is indexed like `layer_array`.
+        let mut layer_names = vec![String::new(); layer_count as usize];
+        for (name, &i) in &layer_index {
+            if let Some(slot) = layer_names.get_mut(i as usize) {
+                *slot = name.clone();
+            }
+        }
         let packed = pack_layers([107, 133, 82, 0], layers);
         // Per tile, so a log shows which tiles fell back to the decoded format.
         debug!(

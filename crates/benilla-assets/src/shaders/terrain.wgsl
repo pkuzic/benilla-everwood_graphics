@@ -586,7 +586,7 @@ const RELIEF_POM_STEPS_MIN: f32 = 4.0;
 // The self-shadow march toward the sun, and how hard a blocking crest darkens (per unit height).
 const RELIEF_SHADOW_STEPS: u32 = 8u;
 const RELIEF_SHADOW_K: f32 = 4.0;
-// A layer with no relief map (or one EME paint appended past the array) samples as this texel:
+// A layer with no relief map (or one past the array) samples as this texel:
 // zero tilt under the `(byte-128)/127` decode, fully open, top height.
 const RELIEF_FLAT: vec4<f32> = vec4<f32>(128.0 / 255.0, 128.0 / 255.0, 1.0, 1.0);
 
