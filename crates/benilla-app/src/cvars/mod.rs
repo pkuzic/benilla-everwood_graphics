@@ -1286,10 +1286,12 @@ pub(crate) const GRAPHICS_PRESETS: &[(&str, [&str; 5])] = &[
     // moonlight is a few ALU per fragment, so every rung past Classic takes it.
     ("volumetricLight",      ["0",    "0",   "1",      "2",    "2"]),
     ("moonLight",            ["0",    "1",   "1",      "1",    "1"]),
-    // MONKEY (ground relief): an opt-in experiment — off on every rung.
-    ("groundRelief",         ["0",    "0",   "0",      "0",    "0"]),
-    // MONKEY (model relief): the same opt-in experiment on WMO + doodad textures — off everywhere.
-    ("modelRelief",          ["0",    "0",   "0",      "0",    "0"]),
+    // MONKEY (ground relief): Classic and Low keep the reference's flat ground; Medium takes the
+    // normals only (one extra fetch per layer), High adds parallax, Ultra the parallax shadows.
+    ("groundRelief",         ["0",    "0",   "1",      "2",    "3"]),
+    // MONKEY (model relief): the same on WMO + doodad + armour textures; High/Ultra add the
+    // building parallax.
+    ("modelRelief",          ["0",    "0",   "1",      "2",    "2"]),
     // MONKEY (model gloss): the metal sun highlight is ALU-only (no fetch) and acts only where a
     // relief map is bound; Classic and Low keep the reference's flat models.
     ("modelGloss",           ["0",    "0",   "1",      "1",    "1"]),

@@ -5,7 +5,7 @@
 //! The maps are LOOSE PNGs, not MPQ content: for the layer `Tileset\Elwynn\ElwynnCobblestoneBase.blp`
 //! the map is `<relief dir>/tileset/elwynn/elwynncobblestonebase.png` (the normalised key
 //! lowercased, `\` → `/`, `.blp` → `.png`; an `_s.blp` key shares its base's map). `<relief dir>`
-//! is `$MONKEY_RELIEF_DIR`, else `MData\Relief` beside the executable, else `MData\Relief` beside
+//! is `$MONKEY_RELIEF_DIR`, else `EData\Relief` then `MData\Relief` beside the executable or beside
 //! the `Data` folder — the same two install bases (and order) `monkey-anims`' `Library` resolves
 //! `MData\Anims` from.
 //!
@@ -64,7 +64,16 @@ fn relief_dir_candidates() -> Vec<PathBuf> {
             bases.push(d);
         }
     }
-    out.extend(bases.into_iter().map(|b| b.join("MData").join("Relief")));
+    // MONKEY (relief deploy): `EData` first, then `MData`, in the order `monkey_anims` resolves
+    // `Anims` — the launcher's client keeps Everwood's loose data in `EData` (it deletes `MData`).
+    for folder in ["EData", "MData"] {
+        for b in &bases {
+            let p = b.join(folder).join("Relief");
+            if !out.contains(&p) {
+                out.push(p);
+            }
+        }
+    }
     out
 }
 
