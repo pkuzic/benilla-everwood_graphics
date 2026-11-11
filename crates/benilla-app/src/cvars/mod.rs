@@ -2094,7 +2094,7 @@ mod tests {
         let shadows = VideoConfig::default();
         let flag = |b: bool| if b { 1.0 } else { 0.0 };
         // MONKEY (volumetric fog): include the atmospheric tier in this fixed-size default table.
-        let lighting: [(&str, f32); 45] = [
+        let lighting: [(&str, f32); 47] = [
             // GFX (volumetric light) / (moonlight): the three new rows.
             ("volumetricLight", shadows.volumetric_light as f32),
             ("volumetricLightStrength", shadows.volumetric_light_strength),
@@ -2102,6 +2102,8 @@ mod tests {
             // MONKEY (ground relief): the terrain relief mode and its parallax depth.
             ("groundRelief", shadows.ground_relief as f32),
             ("groundReliefDepth", shadows.ground_relief_depth),
+            ("groundHeightBlend", flag(shadows.ground_height_blend)),
+            ("groundHeightBlendDepth", shadows.ground_height_blend_depth),
             // MONKEY (model relief): the model relief mode and its parallax depth.
             ("modelRelief", shadows.model_relief as f32),
             ("modelReliefDepth", shadows.model_relief_depth),
@@ -2172,7 +2174,7 @@ mod tests {
         // VideoConfig rows, 38 welds (MONKEY lampfog: + lampFog). MONKEY (wind): `foliageWind` is a world resource bridge.
         let welded: std::collections::BTreeSet<&str> = lighting.iter().map(|(n, _)| *n).collect();
         // MONKEY (volumetric fog): the atmospheric tier joins the default-consumer weld.
-        assert_eq!(welded.len(), 45, "the lighting lane welds 45 distinct rows"); // MONKEY (ground relief): + groundRelief, groundReliefDepth; MONKEY (model relief): + modelRelief, modelReliefDepth
+        assert_eq!(welded.len(), 47, "the lighting lane welds 47 distinct rows"); // MONKEY (ground height blend): + groundHeightBlend, groundHeightBlendDepth; // MONKEY (ground relief): + groundRelief, groundReliefDepth; MONKEY (model relief): + modelRelief, modelReliefDepth
         for name in &welded {
             assert!(
                 REGISTERED.iter().any(|r| r.name == *name),

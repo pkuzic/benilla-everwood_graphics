@@ -535,6 +535,11 @@ pub struct TerrainExtension {
     /// units (`groundReliefDepth`). `y == 0` or `z == 0` is today's shader path exactly.
     #[uniform(106)]
     pub params: Vec4,
+    /// MONKEY (ground height blend): second uniform lane of binding 106 (WGSL `TerrainParams.params_b`):
+    /// `x` = height-aware layer blend on (0/1), `y` = its transition depth (0.01..0.2). Only read
+    /// while the relief lane is on, so it never changes today's path.
+    #[uniform(106)]
+    pub params_b: Vec4,
 
     /// The shared global light, rows 0-5 (light, fog, farclip).
     #[storage(90, read_only, buffer)]
@@ -670,6 +675,74 @@ mod tests {
             model.contains("let relief_on = m.relief.x > 0.5 && relief_mode != 0u"),
             "the model relief lane is no longer gated on its uniform lane"
         );
+    }
+
+    /// MONKEY (ground height blend): a Rust mirror of `terrain.wgsl`'s `layer_weights` +
+    /// `height_blend_weights` (the formulas are the contract; the test below pins the WGSL text to
+    /// the same constants), so the edge cases are asserted here rather than eyeballed in a render.
+    fn mirror_layer_weights(a: [f32; 3]) -> [f32; 4] {
+        [
+            (1.0 - a[0]) * (1.0 - a[1]) * (1.0 - a[2]),
+            a[0] * (1.0 - a[1]) * (1.0 - a[2]),
+            a[1] * (1.0 - a[2]),
+            a[2],
+        ]
+    }
+
+    fn mirror_height_weights(w: [f32; 4], h: [f32; 4], depth: f32) -> [f32; 4] {
+        let g = w.map(|x| (x * 8.0).clamp(0.0, 1.0));
+        let score = [0, 1, 2, 3].map(|i| h[i] * g[i] + w[i]);
+        let m = score.iter().cloned().fold(f32::MIN, f32::max) - depth;
+        let b = [0, 1, 2, 3].map(|i| (score[i] - m).max(0.0) * g[i]);
+        let sum = b.iter().sum::<f32>().max(1e-6);
+        b.map(|x| x / sum)
+    }
+
+    #[test]
+    fn the_height_blend_keeps_zero_alpha_out_and_full_alpha_alone() {
+        // An unpainted layer 3 with the tallest height never shows; a fully painted layer 3 shows
+        // alone whatever the heights below it.
+        let h = [0.1, 0.2, 0.3, 1.0];
+        let w = mirror_height_weights(mirror_layer_weights([0.5, 0.5, 0.0]), h, 0.2);
+        assert_eq!(w[3], 0.0, "a zero alpha never shows: {w:?}");
+        let w = mirror_height_weights(mirror_layer_weights([0.0, 0.0, 1.0]), [1.0, 1.0, 1.0, 0.0], 0.2);
+        assert!((w[3] - 1.0).abs() < 1e-6 && w[0] + w[1] + w[2] < 1e-6, "no bleed: {w:?}");
+        // Fully unpainted: layer 0 only.
+        let w = mirror_height_weights(mirror_layer_weights([0.0; 3]), [0.0, 1.0, 1.0, 1.0], 0.2);
+        assert!((w[0] - 1.0).abs() < 1e-6, "{w:?}");
+    }
+
+    #[test]
+    fn the_height_blend_is_normalised_continuous_and_height_led() {
+        let h = [0.9, 0.1, 0.5, 0.5];
+        let mut prev: Option<[f32; 4]> = None;
+        for i in 0..=1000 {
+            let a = i as f32 / 1000.0;
+            let w = mirror_height_weights(mirror_layer_weights([a, 0.0, 0.0]), h, 0.2);
+            assert!((w.iter().sum::<f32>() - 1.0).abs() < 1e-5, "sums to 1 at a={a}: {w:?}");
+            if let Some(p) = prev {
+                for k in 0..4 {
+                    assert!((w[k] - p[k]).abs() < 0.08, "pops at a={a}: {p:?} -> {w:?}");
+                }
+            }
+            prev = Some(w);
+        }
+        // Half painted: the taller layer (0, height 0.9) holds on longer than a linear 50/50.
+        let w = mirror_height_weights(mirror_layer_weights([0.5, 0.0, 0.0]), h, 0.2);
+        assert!(w[0] > 0.5, "the taller layer pokes through: {w:?}");
+    }
+
+    #[test]
+    fn the_wgsl_uses_the_mirrored_formulas() {
+        let terrain = include_str!("shaders/terrain.wgsl");
+        for needle in [
+            "let g = clamp(w * 8.0, vec4<f32>(0.0), vec4<f32>(1.0));",
+            "let score = h * g + w;",
+            "let b = max(score - vec4<f32>(m), vec4<f32>(0.0)) * g;",
+            "let hb_on = relief_on && t.params_b.x > 0.5;",
+        ] {
+            assert!(terrain.contains(needle), "terrain.wgsl drifted from the mirror: {needle}");
+        }
     }
 
     /// MONKEY (ground relief): the relief lane's two silent contracts. The WGSL binding must match

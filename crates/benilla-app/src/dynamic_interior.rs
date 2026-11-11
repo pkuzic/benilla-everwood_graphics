@@ -94,6 +94,8 @@ fn bridge(
         let want = benilla_world::terrain_stream::GroundRelief {
             mode: video.ground_relief,
             depth: video.ground_relief_depth,
+            height_blend: video.ground_height_blend,
+            height_blend_depth: video.ground_height_blend_depth,
         };
         if *ground_relief != want {
             *ground_relief = want;

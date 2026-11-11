@@ -201,6 +201,9 @@ pub(crate) struct VideoConfig {
     // Bridged to `benilla_world::terrain_stream::GroundRelief` by `dynamic_interior::bridge`.
     pub(crate) ground_relief: u8,
     pub(crate) ground_relief_depth: f32,
+    /// MONKEY (ground height blend): height-aware layer blending toggle + its depth.
+    pub(crate) ground_height_blend: bool,
+    pub(crate) ground_height_blend_depth: f32,
     // MONKEY (model relief): WMO + doodad relief mode 0..5 (0 = today's models exactly; 1 normals,
     // 2/3 + WMO parallax, 4/5 debug) and the parallax depth (base-texture UV units). Bridged to
     // `benilla_world::model_render::ModelRelief` by `dynamic_interior::bridge`.
@@ -485,6 +488,8 @@ impl Default for VideoConfig {
             // MONKEY (ground relief): opt-in experiment, off in every preset.
             ground_relief: 0,
             ground_relief_depth: 0.06,
+            ground_height_blend: true,
+            ground_height_blend_depth: 0.2,
             // MONKEY (model relief): opt-in experiment, off in every preset.
             model_relief: 0,
             model_relief_depth: 0.05, // MONKEY (model relief): yards
@@ -708,6 +713,8 @@ impl VideoKnobs<'_> {
             // MONKEY (ground relief): 0 is meaningful (today's terrain, bit for bit).
             "groundrelief" => cfg.ground_relief = v.clamp(0.0, 5.0) as u8,
             "groundreliefdepth" => cfg.ground_relief_depth = v.clamp(0.0, 0.2),
+            "groundheightblend" => cfg.ground_height_blend = v != 0.0,
+            "groundheightblenddepth" => cfg.ground_height_blend_depth = v.clamp(0.01, 0.2),
             // MONKEY (model relief): 0 is meaningful (today's models, bit for bit).
             "modelrelief" => cfg.model_relief = v.clamp(0.0, 5.0) as u8,
             "modelreliefdepth" => cfg.model_relief_depth = v.clamp(0.0, 0.2), // MONKEY (model relief): yards

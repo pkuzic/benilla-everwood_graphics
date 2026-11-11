@@ -77,6 +77,19 @@ pub use residency::TerrainResidency;
 pub struct GroundRelief {
     pub mode: u8,
     pub depth: f32,
+    /// MONKEY (ground height blend): height-aware layer blending where relief exists (on by
+    /// default; only has an effect while `mode != 0`). `MONKEY_GROUND_HEIGHTBLEND=0|1`.
+    pub height_blend: bool,
+    /// The blend's transition depth, 0.01..0.2. `MONKEY_GROUND_HEIGHTBLEND_DEPTH=<f>`.
+    pub height_blend_depth: f32,
+}
+
+/// MONKEY (ground height blend): the env seeds for the two blend dials, parsed apart so a test can
+/// drive them (`None` = variable unset).
+fn height_blend_from_env(toggle: Option<&str>, depth: Option<&str>) -> (bool, f32) {
+    let on = toggle.and_then(|v| v.trim().parse::<f32>().ok()).map_or(true, |v| v != 0.0);
+    let d = depth.and_then(|v| v.trim().parse::<f32>().ok()).map_or(0.2, |d| d.clamp(0.01, 0.2));
+    (on, d)
 }
 
 impl Default for GroundRelief {
@@ -87,9 +100,15 @@ impl Default for GroundRelief {
             .ok()
             .map(|v| v.split(',').filter_map(|p| p.trim().parse().ok()).collect())
             .unwrap_or_default();
+        let (height_blend, height_blend_depth) = height_blend_from_env(
+            std::env::var("MONKEY_GROUND_HEIGHTBLEND").ok().as_deref(),
+            std::env::var("MONKEY_GROUND_HEIGHTBLEND_DEPTH").ok().as_deref(),
+        );
         Self {
             mode: env.first().map_or(0, |m| m.clamp(0.0, 5.0) as u8),
             depth: env.get(1).map_or(0.06, |d| d.clamp(0.0, 0.2)),
+            height_blend,
+            height_blend_depth,
         }
     }
 }
@@ -101,15 +120,21 @@ fn monkey_sync_ground_relief(
     mut materials: ResMut<Assets<TerrainMaterial>>,
 ) {
     let (mode, depth) = (f32::from(relief.mode), relief.depth);
+    let blend = Vec4::new(f32::from(u8::from(relief.height_blend)), relief.height_blend_depth, 0.0, 0.0);
     let stale: Vec<AssetId<TerrainMaterial>> = materials
         .iter()
-        .filter(|(_, m)| m.extension.params.y != mode || m.extension.params.w != depth)
+        .filter(|(_, m)| {
+            m.extension.params.y != mode
+                || m.extension.params.w != depth
+                || m.extension.params_b != blend
+        })
         .map(|(id, _)| id)
         .collect();
     for id in stale {
         if let Some(m) = materials.get_mut(id) {
             m.extension.params.y = mode;
             m.extension.params.w = depth;
+            m.extension.params_b = blend;
         }
     }
 }
@@ -1116,6 +1141,13 @@ fn spawn_streamed_tiles(
                     f32::from(ground_relief.mode),
                     adt.relief_layers as f32,
                     ground_relief.depth,
+                ),
+                // MONKEY (ground height blend): x = on, y = depth (`GroundRelief`).
+                params_b: Vec4::new(
+                    f32::from(u8::from(ground_relief.height_blend)),
+                    ground_relief.height_blend_depth,
+                    0.0,
+                    0.0,
                 ),
                 relief_array: adt.relief_array.clone(),
                 light_buf: shared_light.0.clone(),
@@ -2289,5 +2321,20 @@ mod inner_hold_tests {
             "the outer ring waits: the frame's cap went on the inner tile (got {})",
             outer.next_cell
         );
+    }
+}
+
+#[cfg(test)]
+mod height_blend_env_tests {
+    use super::height_blend_from_env;
+
+    /// MONKEY (ground height blend): on and 0.2 deep by default, the env overrides, and a bad or
+    /// out-of-range value clamps / falls back rather than panicking.
+    #[test]
+    fn the_height_blend_dials_seed_from_the_environment() {
+        assert_eq!(height_blend_from_env(None, None), (true, 0.2));
+        assert_eq!(height_blend_from_env(Some("0"), Some("0.05")), (false, 0.05));
+        assert_eq!(height_blend_from_env(Some("1"), Some("9")), (true, 0.2));
+        assert_eq!(height_blend_from_env(Some("x"), Some("-1")), (true, 0.01));
     }
 }

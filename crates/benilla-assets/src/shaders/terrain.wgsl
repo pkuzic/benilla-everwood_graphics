@@ -46,8 +46,10 @@ const SHADOW_SUN_FLOOR: f32 = 0.45;
 //   MONKEY (ground relief): y = relief mode (`groundRelief`: 0 off, 1 normals, 2 +POM,
 //   3 +POM self-shadow, 4 debug height, 5 debug normal), z = this tile's relief layer count (0 = the
 //   tile has no relief map), w = POM depth in tiled-UV units (`groundReliefDepth`).
+//   MONKEY (ground height blend): params_b — x = height-aware layer blend on, y = its depth.
 struct TerrainParams {
     params: vec4<f32>,
+    params_b: vec4<f32>,
 };
 @group(#{MATERIAL_BIND_GROUP}) @binding(106) var<uniform> t: TerrainParams;
 
@@ -605,6 +607,73 @@ fn relief_blend(uv: vec2<f32>, li: vec4<i32>, a: vec4<f32>, count: i32, gx: vec2
     return r;
 }
 
+// ── MONKEY (ground height blend) ────────────────────────────────────────────────────────────
+// Height-aware layer blending, where relief exists. `layer_weights` are the weights the stock
+// `mix` chain applies (layer 0 base, 1..3 painted over by their alpha), so a fully painted layer
+// still fully covers and an unpainted one contributes nothing. The height blend then lets the
+// taller layer win the transition: each layer's score is its height plus its weight, layers within
+// `depth` of the best score share the pixel, the rest drop out. A layer's height only counts as
+// its weight ramps in (`g`), which keeps w = 0 absolutely out (no bleed through a zero alpha) and
+// the result continuous in the alphas (no popping). The SAME weights drive colour, sheen mask,
+// relief normal / cavity and the POM height, so the surface stays one surface.
+fn layer_weights(a: vec4<f32>) -> vec4<f32> {
+    return vec4<f32>(
+        (1.0 - a.r) * (1.0 - a.g) * (1.0 - a.b),
+        a.r * (1.0 - a.g) * (1.0 - a.b),
+        a.g * (1.0 - a.b),
+        a.b,
+    );
+}
+
+fn height_blend_weights(w: vec4<f32>, h: vec4<f32>, depth: f32) -> vec4<f32> {
+    let g = clamp(w * 8.0, vec4<f32>(0.0), vec4<f32>(1.0));
+    let score = h * g + w;
+    let m = max(max(score.x, score.y), max(score.z, score.w)) - depth;
+    // The best-scoring layer has w > 0 (the top score is >= 0.25 and a zero-weight score is 0), so
+    // its term is `depth * g` > 0 and the sum below cannot vanish.
+    let b = max(score - vec4<f32>(m), vec4<f32>(0.0)) * g;
+    return b / max(dot(b, vec4<f32>(1.0)), 1e-6);
+}
+
+struct ReliefW {
+    r: vec4<f32>,   // the blended relief texel
+    w: vec4<f32>,   // the per-layer weights that produced it (colour uses the same ones)
+};
+
+// One relief tap per layer (the same four as `relief_blend`), blended by the height-aware weights.
+// A layer with no real relief map samples as the exact flat texel (top height), which would win
+// every height contest; such a layer, where it has any weight, pulls the pixel back toward today's
+// linear weights (`f`, continuous in the layer's weight).
+fn relief_blend_hb(uv: vec2<f32>, li: vec4<i32>, a: vec4<f32>, count: i32, gx: vec2<f32>,
+    gy: vec2<f32>, depth: f32) -> ReliefW {
+    let t0 = relief_tap(uv, li.x, count, gx, gy);
+    let t1 = relief_tap(uv, li.y, count, gx, gy);
+    let t2 = relief_tap(uv, li.z, count, gx, gy);
+    let t3 = relief_tap(uv, li.w, count, gx, gy);
+    let w = layer_weights(a);
+    let hw = height_blend_weights(w, vec4<f32>(t0.a, t1.a, t2.a, t3.a), depth);
+    let eps = vec4<f32>(1.0 / 512.0);
+    let is_flat = vec4<f32>(
+        f32(all(abs(t0 - RELIEF_FLAT) < eps)),
+        f32(all(abs(t1 - RELIEF_FLAT) < eps)),
+        f32(all(abs(t2 - RELIEF_FLAT) < eps)),
+        f32(all(abs(t3 - RELIEF_FLAT) < eps)),
+    );
+    let gate = clamp(w * 8.0, vec4<f32>(0.0), vec4<f32>(1.0)) * is_flat;
+    let f = 1.0 - max(max(gate.x, gate.y), max(gate.z, gate.w));
+    let wf = mix(w, hw, f);
+    return ReliefW(t0 * wf.x + t1 * wf.y + t2 * wf.z + t3 * wf.w, wf);
+}
+
+// The lane's one entry: the height-aware blend when `hb_on` (uniform), else today's `mix` chain.
+fn relief_sample(uv: vec2<f32>, li: vec4<i32>, a: vec4<f32>, count: i32, gx: vec2<f32>,
+    gy: vec2<f32>, hb_on: bool, depth: f32) -> ReliefW {
+    if (hb_on) {
+        return relief_blend_hb(uv, li, a, count, gx, gy, depth);
+    }
+    return ReliefW(relief_blend(uv, li, a, count, gx, gy), layer_weights(a));
+}
+
 // Tangent-space normal from a blended texel: `(byte-128)/127`, so 128 is exactly flat.
 fn relief_normal_ts(r: vec4<f32>) -> vec3<f32> {
     let xy = clamp((r.rg * 255.0 - 128.0) / 127.0, vec2<f32>(-1.0), vec2<f32>(1.0));
@@ -693,6 +762,10 @@ fn fragment(in: TerrainVsOut) -> @location(0) vec4<f32> {
     let relief_layers = i32(max(t.params.z, 0.0) + 0.5);
     let relief_on = relief_mode != 0u && relief_layers > 0;
     let relief_pom = relief_on && relief_mode >= 2u;
+    // MONKEY (ground height blend): uniform; only meaningful (and only read) with the lane on.
+    let hb_on = relief_on && t.params_b.x > 0.5;
+    let hb_depth = clamp(t.params_b.y, 0.01, 0.2);
+    var hb_w = vec4<f32>(0.0);      // the height-aware layer weights at `relief_uv` (set when `hb_on`)
     var relief_uv = tiled;          // the parallax-offset tiled uv (== `tiled` without POM)
     var relief = RELIEF_FLAT;       // the splat-blended relief texel at `relief_uv`
     var relief_n = vec3<f32>(0.0);  // the perturbed world normal (set only when `relief_on`)
@@ -738,7 +811,7 @@ fn fragment(in: TerrainVsOut) -> @location(0) vec4<f32> {
             let duv = v_ts.xy / max(v_ts.z, 0.1) * rdepth * layer_d;
             var cur_uv = tiled;
             var cur_d = 0.0;
-            var cur_map = 1.0 - relief_blend(cur_uv, li, a, relief_layers, relief_gx, relief_gy).a;
+            var cur_map = 1.0 - relief_sample(cur_uv, li, a, relief_layers, relief_gx, relief_gy, hb_on, hb_depth).r.a;
             var prev_uv = cur_uv;
             var prev_map = cur_map;
             for (var i = 0u; i < n_steps && cur_d < cur_map; i = i + 1u) {
@@ -746,7 +819,7 @@ fn fragment(in: TerrainVsOut) -> @location(0) vec4<f32> {
                 prev_map = cur_map;
                 cur_uv = cur_uv - duv;
                 cur_d = cur_d + layer_d;
-                cur_map = 1.0 - relief_blend(cur_uv, li, a, relief_layers, relief_gx, relief_gy).a;
+                cur_map = 1.0 - relief_sample(cur_uv, li, a, relief_layers, relief_gx, relief_gy, hb_on, hb_depth).r.a;
             }
             let after = cur_map - cur_d;
             let before = prev_map - (cur_d - layer_d);
@@ -755,7 +828,9 @@ fn fragment(in: TerrainVsOut) -> @location(0) vec4<f32> {
             relief_uv = mix(cur_uv, prev_uv, w);
             hit_h = 1.0 - mix(cur_d, cur_d - layer_d, w);
         }
-        relief = relief_blend(relief_uv, li, a, relief_layers, relief_gx, relief_gy);
+        let rs = relief_sample(relief_uv, li, a, relief_layers, relief_gx, relief_gy, hb_on, hb_depth);
+        relief = rs.r;
+        hb_w = rs.w;
         let nts = relief_normal_ts(relief);
         relief_n = normalize(rt * nts.x + rb * nts.y + rn * nts.z);
 
@@ -772,8 +847,8 @@ fn fragment(in: TerrainVsOut) -> @location(0) vec4<f32> {
                 for (var i = 1u; i <= RELIEF_SHADOW_STEPS; i = i + 1u) {
                     let fi = f32(i);
                     let ray_h = hit_h + dh * fi;
-                    let hs = relief_blend(relief_uv + suv * fi, li, a, relief_layers, relief_gx,
-                        relief_gy).a;
+                    let hs = relief_sample(relief_uv + suv * fi, li, a, relief_layers, relief_gx,
+                        relief_gy, hb_on, hb_depth).r.a;
                     // Nearer crests weigh more: the penumbra softens with distance along the ray.
                     occ = max(occ, (hs - ray_h) * (1.0 - (fi - 1.0) / f32(RELIEF_SHADOW_STEPS)));
                 }
@@ -805,6 +880,10 @@ fn fragment(in: TerrainVsOut) -> @location(0) vec4<f32> {
     color = mix(color, s1.rgb, a.r);
     color = mix(color, s2.rgb, a.g);
     color = mix(color, s3.rgb, a.b);
+    if (hb_on) {
+        // MONKEY (ground height blend): the colour takes the relief's own weights.
+        color = s0.rgb * hb_w.x + s1.rgb * hb_w.y + s2.rgb * hb_w.z + s3.rgb * hb_w.w;
+    }
 
     // The sheen mask, blended with the colour's splat weights (the fragment program's
     // `secondary · texture[0].w`).
@@ -812,6 +891,9 @@ fn fragment(in: TerrainVsOut) -> @location(0) vec4<f32> {
     specmask = mix(specmask, s1.a, a.r);
     specmask = mix(specmask, s2.a, a.g);
     specmask = mix(specmask, s3.a, a.b);
+    if (hb_on) {
+        specmask = s0.a * hb_w.x + s1.a * hb_w.y + s2.a * hb_w.z + s3.a * hb_w.w;
+    }
 
     // Sun/ambient arrives unclamped from the vertex stage; selected local lights join per
     // fragment before the light sum clamps and modulates the texture.

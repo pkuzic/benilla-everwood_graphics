@@ -697,6 +697,17 @@ pub(crate) const REGISTERED: &[Registered] = &[
         "0.06",
         "benilla's own: depth of the terrain parallax relief in texture tiles, 0..0.2 (0.06 = default)",
     ),
+    // MONKEY (ground height blend): height-aware layer blending where ground relief exists.
+    ours(
+        "groundHeightBlend",
+        "1",
+        "benilla's own: height-based terrain layer blending (grass fills gaps between cobbles) wherever ground relief is on, 0 Off / 1 On",
+    ),
+    ours(
+        "groundHeightBlendDepth",
+        "0.2",
+        "benilla's own: transition depth of the terrain height blend, 0.01..0.2 (0.2 = default, lower = harder edges)",
+    ),
     // MONKEY (model relief): normal-mapped WMO buildings + M2 doodads (and WMO parallax) from the
     // same offline relief maps.
     ours(
