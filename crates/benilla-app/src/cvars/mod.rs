@@ -1246,6 +1246,11 @@ pub(crate) const SEEDED_DEVIATIONS: &[(&str, &str, &str)] = &[(
     "350",
     "owner decision: the High preset is the first-boot default, and High's view distance is the \
      reference's own slider maximum, 777 yd; Classic keeps 350",
+), (
+    // MONKEY (aniso)
+    "anisotropic",
+    "1",
+    "High seeds 8x against the reference's 1: near-free sharpness at grazing angles; Classic keeps 1",
 )];
 
 /// **The one place the Graphics Preset is written down**: one line per governed row, one column
@@ -1285,6 +1290,9 @@ pub(crate) const GRAPHICS_PRESETS: &[(&str, [&str; 5])] = &[
     ("groundRelief",         ["0",    "0",   "0",      "0",    "0"]),
     // MONKEY (model relief): the same opt-in experiment on WMO + doodad textures — off everywhere.
     ("modelRelief",          ["0",    "0",   "0",      "0",    "0"]),
+    // MONKEY (aniso): anisotropic filtering keeps the ground sharp at a grazing angle (near free on
+    // any current GPU); Classic and Low keep the reference's off. Latched at boot like the cvar.
+    ("anisotropic",          ["1",    "1",   "4",      "8",    "16"]),
 ];
 
 /// The column of a rung, matched case-insensitively; `None` for `Custom` or anything else.
@@ -2352,7 +2360,7 @@ mod tests {
     /// disjointness that lets both labels be right at once.
     #[test]
     fn graphics_rows_are_registered_and_disjoint_from_the_lighting_ladder() {
-        assert_eq!(GRAPHICS_PRESETS.len(), 15, "add the row count with the row"); // MONKEY (ground relief): + groundRelief; MONKEY (model relief): + modelRelief
+        assert_eq!(GRAPHICS_PRESETS.len(), 16, "add the row count with the row"); // MONKEY (aniso): + anisotropic; // MONKEY (ground relief): + groundRelief; MONKEY (model relief): + modelRelief
         let cvars = fresh_registry();
         for (k, values) in GRAPHICS_PRESETS {
             assert!(cvars.get(k).is_some(), "{k}: not registered");
@@ -2421,7 +2429,9 @@ mod tests {
         assert_eq!(cvars.get("farclip"), cvars.default_of("farclip"));
         for (k, values) in GRAPHICS_PRESETS {
             if !matches!(*k, "lightingQuality" | "farclip") {
-                assert!(same_value(values[0], "0"), "{k}: Classic leaves it on");
+                // MONKEY (aniso): `anisotropic` has no 0 - its off is the reference's 1.
+                let off = if *k == "anisotropic" { "1" } else { "0" };
+                assert!(same_value(values[0], off), "{k}: Classic leaves it on");
             }
         }
         // Ultra is the one rung past the reference's 777, and inside the extended clamp.
@@ -2455,6 +2465,9 @@ mod tests {
                         v - 60.0
                     } else if *k == "farclip" {
                         v + 60.0
+                    } else if *k == "anisotropic" {
+                        // MONKEY (aniso): valid range is 1..16, so 0 would be vetoed.
+                        if v == 1.0 { 2.0 } else { 1.0 }
                     } else if v == 0.0 {
                         1.0
                     } else {
@@ -2673,6 +2686,8 @@ mod tests {
                     "groundRelief" => video.ground_relief as f32,
                     // MONKEY (model relief)
                     "modelRelief" => video.model_relief as f32,
+                    // MONKEY (aniso): the texture filter's own resource.
+                    "anisotropic" => res::<benilla_assets::TexFilterSetting>(&app).aniso as f32,
                     _ => panic!("add the observer readback for {k}"),
                 };
                 assert_eq!(applied, value.parse::<f32>().unwrap(), "{name}/{k}");
