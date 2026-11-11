@@ -708,6 +708,17 @@ pub(crate) const REGISTERED: &[Registered] = &[
         "0.2",
         "benilla's own: transition depth of the terrain height blend, 0.01..0.2 (0.2 = default, lower = harder edges)",
     ),
+    // MONKEY (ground anti-tile): colour-only anti-tiling of the repeating terrain layers.
+    ours(
+        "groundAntiTile",
+        "1",
+        "benilla's own: terrain texture anti-tiling, 0 Off / 1 Macro (low-frequency colour variation) / 2 Macro + far dual-scale taps",
+    ),
+    ours(
+        "groundAntiTileStrength",
+        "1",
+        "benilla's own: strength of the terrain anti-tiling, 0..2 (1 = default)",
+    ),
     // MONKEY (model relief): normal-mapped WMO buildings + M2 doodads (and WMO parallax) from the
     // same offline relief maps.
     ours(

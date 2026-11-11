@@ -96,6 +96,8 @@ fn bridge(
             depth: video.ground_relief_depth,
             height_blend: video.ground_height_blend,
             height_blend_depth: video.ground_height_blend_depth,
+            anti_tile: video.ground_anti_tile,
+            anti_tile_strength: video.ground_anti_tile_strength,
         };
         if *ground_relief != want {
             *ground_relief = want;

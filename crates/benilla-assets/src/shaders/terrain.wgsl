@@ -47,6 +47,8 @@ const SHADOW_SUN_FLOOR: f32 = 0.45;
 //   3 +POM self-shadow, 4 debug height, 5 debug normal), z = this tile's relief layer count (0 = the
 //   tile has no relief map), w = POM depth in tiled-UV units (`groundReliefDepth`).
 //   MONKEY (ground height blend): params_b — x = height-aware layer blend on, y = its depth.
+//   MONKEY (ground anti-tile): params_b — z = mode (0 off, 1 macro variation, 2 + far dual-scale),
+//   w = strength (0..2).
 struct TerrainParams {
     params: vec4<f32>,
     params_b: vec4<f32>,
@@ -674,6 +676,57 @@ fn relief_sample(uv: vec2<f32>, li: vec4<i32>, a: vec4<f32>, count: i32, gx: vec
     return ReliefW(relief_blend(uv, li, a, count, gx, gy), layer_weights(a));
 }
 
+// ── MONKEY (ground anti-tile) ───────────────────────────────────────────────────────────────
+// Colour-only anti-tiling for the repeating splat layers. Mode 1: a low-frequency value noise of
+// WORLD xz (continuous across chunk / tile borders, period `ANTITILE_PERIOD_YD` ~ 6 texture
+// repeats) nudges the final layer colour: brightness +-8% and a saturation / warm-cool shift,
+// both scaled by the strength (the noise is zero-mean, so the average is kept). ALU only.
+// Mode 2 adds, beyond `ANTITILE_FAR_START_YD` (full by `ANTITILE_FAR_END_YD`), a second tap of
+// each layer at `ANTITILE_FAR_FREQ` x the UV frequency mixed into the colour (4 extra fetches,
+// gated on the mode UNIFORM; the taps live in `antitile_far_colour`, a function body top level).
+// The relief normal / cavity / POM are untouched. Mode 0 never runs any of it.
+const ANTITILE_PERIOD_YD: f32 = 25.0;
+const ANTITILE_FAR_START_YD: f32 = 30.0;
+const ANTITILE_FAR_END_YD: f32 = 80.0;
+const ANTITILE_FAR_FREQ: f32 = 0.37;
+
+fn antitile_hash(p: vec2<f32>) -> vec2<f32> {
+    var p3 = fract(vec3<f32>(p.x, p.y, p.x) * vec3<f32>(0.1031, 0.1030, 0.0973));
+    p3 = p3 + vec3<f32>(dot(p3, p3.yzx + vec3<f32>(33.33)));
+    return fract((p3.xx + p3.yz) * p3.zy);
+}
+
+// Smooth value noise, two independent channels, each in 0..1.
+fn antitile_noise(p: vec2<f32>) -> vec2<f32> {
+    let i = floor(p);
+    let f = fract(p);
+    let u = f * f * (vec2<f32>(3.0) - 2.0 * f);
+    let a = antitile_hash(i);
+    let b = antitile_hash(i + vec2<f32>(1.0, 0.0));
+    let c = antitile_hash(i + vec2<f32>(0.0, 1.0));
+    let d = antitile_hash(i + vec2<f32>(1.0, 1.0));
+    return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
+}
+
+fn antitile_macro(color: vec3<f32>, world_xz: vec2<f32>, strength: f32) -> vec3<f32> {
+    let c = antitile_noise(world_xz / ANTITILE_PERIOD_YD) * 2.0 - vec2<f32>(1.0);
+    let l = dot(color, vec3<f32>(0.299, 0.587, 0.114));
+    let sat = 1.0 + 0.15 * strength * c.y;
+    var o = mix(vec3<f32>(l), color, sat);
+    o = o * vec3<f32>(1.0 + 0.03 * strength * c.y, 1.0, 1.0 - 0.03 * strength * c.y);
+    return max(o * (1.0 + 0.08 * strength * c.x), vec3<f32>(0.0));
+}
+
+// The second, lower-frequency colour tap of the four layers, weighted like the main colour.
+fn antitile_far_colour(uv: vec2<f32>, li: vec4<i32>, w: vec4<f32>) -> vec3<f32> {
+    let fuv = uv * ANTITILE_FAR_FREQ + vec2<f32>(0.37, 0.11);
+    let f0 = textureSampleBias(layer_array, splat_samp, fuv, li.x, view.mip_bias).rgb;
+    let f1 = textureSampleBias(layer_array, splat_samp, fuv, li.y, view.mip_bias).rgb;
+    let f2 = textureSampleBias(layer_array, splat_samp, fuv, li.z, view.mip_bias).rgb;
+    let f3 = textureSampleBias(layer_array, splat_samp, fuv, li.w, view.mip_bias).rgb;
+    return f0 * w.x + f1 * w.y + f2 * w.z + f3 * w.w;
+}
+
 // Tangent-space normal from a blended texel: `(byte-128)/127`, so 128 is exactly flat.
 fn relief_normal_ts(r: vec4<f32>) -> vec3<f32> {
     let xy = clamp((r.rg * 255.0 - 128.0) / 127.0, vec2<f32>(-1.0), vec2<f32>(1.0));
@@ -893,6 +946,23 @@ fn fragment(in: TerrainVsOut) -> @location(0) vec4<f32> {
     specmask = mix(specmask, s3.a, a.b);
     if (hb_on) {
         specmask = s0.a * hb_w.x + s1.a * hb_w.y + s2.a * hb_w.z + s3.a * hb_w.w;
+    }
+
+    // MONKEY (ground anti-tile): uniform gates; mode 0 runs none of this.
+    let at_mode = i32(clamp(t.params_b.z + 0.5, 0.0, 2.0));
+    let at_str = clamp(t.params_b.w, 0.0, 2.0);
+    if (at_mode >= 2 && at_str > 0.0) {
+        var at_w = layer_weights(a);
+        if (hb_on) {
+            at_w = hb_w;
+        }
+        let at_far = antitile_far_colour(tiled, li, at_w);
+        let at_d = distance(in.world_position.xyz, view.world_position.xyz);
+        let at_k = smoothstep(ANTITILE_FAR_START_YD, ANTITILE_FAR_END_YD, at_d) * clamp(0.5 * at_str, 0.0, 1.0);
+        color = mix(color, at_far, at_k);
+    }
+    if (at_mode >= 1 && at_str > 0.0) {
+        color = antitile_macro(color, in.world_position.xz, at_str);
     }
 
     // Sun/ambient arrives unclamped from the vertex stage; selected local lights join per

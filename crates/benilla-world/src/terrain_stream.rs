@@ -82,6 +82,18 @@ pub struct GroundRelief {
     pub height_blend: bool,
     /// The blend's transition depth, 0.01..0.2. `MONKEY_GROUND_HEIGHTBLEND_DEPTH=<f>`.
     pub height_blend_depth: f32,
+    /// MONKEY (ground anti-tile): 0 off / 1 macro variation / 2 + far dual-scale (`groundAntiTile`,
+    /// `MONKEY_GROUND_ANTITILE`), and its strength 0..2 (`MONKEY_GROUND_ANTITILE_STRENGTH`).
+    pub anti_tile: u8,
+    pub anti_tile_strength: f32,
+}
+
+/// MONKEY (ground anti-tile): the env seeds for the mode and strength (`None` = unset): mode 1 and
+/// strength 1 by default, a bad or out-of-range value clamps / falls back.
+pub fn anti_tile_from_env(mode: Option<&str>, strength: Option<&str>) -> (u8, f32) {
+    let m = mode.and_then(|v| v.trim().parse::<f32>().ok()).map_or(1, |v| v.clamp(0.0, 2.0) as u8);
+    let s = strength.and_then(|v| v.trim().parse::<f32>().ok()).map_or(1.0, |v| v.clamp(0.0, 2.0));
+    (m, s)
 }
 
 /// MONKEY (ground height blend): the env seeds for the two blend dials, parsed apart so a test can
@@ -104,7 +116,13 @@ impl Default for GroundRelief {
             std::env::var("MONKEY_GROUND_HEIGHTBLEND").ok().as_deref(),
             std::env::var("MONKEY_GROUND_HEIGHTBLEND_DEPTH").ok().as_deref(),
         );
+        let (anti_tile, anti_tile_strength) = anti_tile_from_env(
+            std::env::var("MONKEY_GROUND_ANTITILE").ok().as_deref(),
+            std::env::var("MONKEY_GROUND_ANTITILE_STRENGTH").ok().as_deref(),
+        );
         Self {
+            anti_tile,
+            anti_tile_strength,
             mode: env.first().map_or(0, |m| m.clamp(0.0, 5.0) as u8),
             depth: env.get(1).map_or(0.06, |d| d.clamp(0.0, 0.2)),
             height_blend,
@@ -120,7 +138,12 @@ fn monkey_sync_ground_relief(
     mut materials: ResMut<Assets<TerrainMaterial>>,
 ) {
     let (mode, depth) = (f32::from(relief.mode), relief.depth);
-    let blend = Vec4::new(f32::from(u8::from(relief.height_blend)), relief.height_blend_depth, 0.0, 0.0);
+    let blend = Vec4::new(
+        f32::from(u8::from(relief.height_blend)),
+        relief.height_blend_depth,
+        f32::from(relief.anti_tile),
+        relief.anti_tile_strength,
+    );
     let stale: Vec<AssetId<TerrainMaterial>> = materials
         .iter()
         .filter(|(_, m)| {
@@ -1146,8 +1169,9 @@ fn spawn_streamed_tiles(
                 params_b: Vec4::new(
                     f32::from(u8::from(ground_relief.height_blend)),
                     ground_relief.height_blend_depth,
-                    0.0,
-                    0.0,
+                    // MONKEY (ground anti-tile): z = mode, w = strength.
+                    f32::from(ground_relief.anti_tile),
+                    ground_relief.anti_tile_strength,
                 ),
                 relief_array: adt.relief_array.clone(),
                 light_buf: shared_light.0.clone(),
@@ -2336,5 +2360,16 @@ mod height_blend_env_tests {
         assert_eq!(height_blend_from_env(Some("0"), Some("0.05")), (false, 0.05));
         assert_eq!(height_blend_from_env(Some("1"), Some("9")), (true, 0.2));
         assert_eq!(height_blend_from_env(Some("x"), Some("-1")), (true, 0.01));
+    }
+
+    /// MONKEY (ground anti-tile): mode 1 / strength 1 by default, env overrides, clamps.
+    #[test]
+    fn the_anti_tile_dials_seed_from_the_environment() {
+        use super::anti_tile_from_env;
+        assert_eq!(anti_tile_from_env(None, None), (1, 1.0));
+        assert_eq!(anti_tile_from_env(Some("0"), Some("0.5")), (0, 0.5));
+        assert_eq!(anti_tile_from_env(Some("2"), Some("9")), (2, 2.0));
+        assert_eq!(anti_tile_from_env(Some("7"), Some("-3")), (2, 0.0));
+        assert_eq!(anti_tile_from_env(Some("x"), Some("y")), (1, 1.0));
     }
 }

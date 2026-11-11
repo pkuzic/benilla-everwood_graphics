@@ -204,6 +204,9 @@ pub(crate) struct VideoConfig {
     /// MONKEY (ground height blend): height-aware layer blending toggle + its depth.
     pub(crate) ground_height_blend: bool,
     pub(crate) ground_height_blend_depth: f32,
+    /// MONKEY (ground anti-tile): mode 0 off / 1 macro / 2 + far dual-scale, and strength 0..2.
+    pub(crate) ground_anti_tile: u8,
+    pub(crate) ground_anti_tile_strength: f32,
     // MONKEY (model relief): WMO + doodad relief mode 0..5 (0 = today's models exactly; 1 normals,
     // 2/3 + WMO parallax, 4/5 debug) and the parallax depth (base-texture UV units). Bridged to
     // `benilla_world::model_render::ModelRelief` by `dynamic_interior::bridge`.
@@ -490,6 +493,8 @@ impl Default for VideoConfig {
             ground_relief_depth: 0.06,
             ground_height_blend: true,
             ground_height_blend_depth: 0.2,
+            ground_anti_tile: 1,
+            ground_anti_tile_strength: 1.0,
             // MONKEY (model relief): opt-in experiment, off in every preset.
             model_relief: 0,
             model_relief_depth: 0.05, // MONKEY (model relief): yards
@@ -715,6 +720,9 @@ impl VideoKnobs<'_> {
             "groundreliefdepth" => cfg.ground_relief_depth = v.clamp(0.0, 0.2),
             "groundheightblend" => cfg.ground_height_blend = v != 0.0,
             "groundheightblenddepth" => cfg.ground_height_blend_depth = v.clamp(0.01, 0.2),
+            // MONKEY (ground anti-tile): 0 is meaningful (today's colour, bit for bit).
+            "groundantitile" => cfg.ground_anti_tile = v.clamp(0.0, 2.0) as u8,
+            "groundantitilestrength" => cfg.ground_anti_tile_strength = v.clamp(0.0, 2.0),
             // MONKEY (model relief): 0 is meaningful (today's models, bit for bit).
             "modelrelief" => cfg.model_relief = v.clamp(0.0, 5.0) as u8,
             "modelreliefdepth" => cfg.model_relief_depth = v.clamp(0.0, 0.2), // MONKEY (model relief): yards

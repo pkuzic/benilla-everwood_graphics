@@ -1290,6 +1290,8 @@ pub(crate) const GRAPHICS_PRESETS: &[(&str, [&str; 5])] = &[
     ("groundRelief",         ["0",    "0",   "0",      "0",    "0"]),
     // MONKEY (model relief): the same opt-in experiment on WMO + doodad textures — off everywhere.
     ("modelRelief",          ["0",    "0",   "0",      "0",    "0"]),
+    // MONKEY (ground anti-tile): colour-only anti-tiling; Macro is ALU-only, 2 adds 4 far taps.
+    ("groundAntiTile",       ["0",    "0",   "1",      "2",    "2"]),
     // MONKEY (aniso): anisotropic filtering keeps the ground sharp at a grazing angle (near free on
     // any current GPU); Classic and Low keep the reference's off. Latched at boot like the cvar.
     ("anisotropic",          ["1",    "1",   "4",      "8",    "16"]),
@@ -1383,6 +1385,13 @@ fn session_values(world: &World) -> Vec<(&'static str, Option<String>)> {
     if set("WOW_RENDER_SCALE") {
         let v = world.get_resource::<crate::world_backdrop::RenderScale>();
         out.push(("renderScale", v.map(|r| r.0.to_string())));
+    }
+    // MONKEY (ground anti-tile): the env levers seed `GroundRelief`; the session owns the rows so a
+    // capture's value is never written into the file.
+    if set("MONKEY_GROUND_ANTITILE") || set("MONKEY_GROUND_ANTITILE_STRENGTH") {
+        let v = world.get_resource::<benilla_world::terrain_stream::GroundRelief>();
+        out.push(("groundAntiTile", v.map(|g| g.anti_tile.to_string())));
+        out.push(("groundAntiTileStrength", v.map(|g| g.anti_tile_strength.to_string())));
     }
     // `$WOW_HOST` is the session's realmlist, which a test run must never write into the file.
     if set("WOW_HOST") {
@@ -2102,7 +2111,7 @@ mod tests {
         let shadows = VideoConfig::default();
         let flag = |b: bool| if b { 1.0 } else { 0.0 };
         // MONKEY (volumetric fog): include the atmospheric tier in this fixed-size default table.
-        let lighting: [(&str, f32); 47] = [
+        let lighting: [(&str, f32); 49] = [
             // GFX (volumetric light) / (moonlight): the three new rows.
             ("volumetricLight", shadows.volumetric_light as f32),
             ("volumetricLightStrength", shadows.volumetric_light_strength),
@@ -2112,6 +2121,8 @@ mod tests {
             ("groundReliefDepth", shadows.ground_relief_depth),
             ("groundHeightBlend", flag(shadows.ground_height_blend)),
             ("groundHeightBlendDepth", shadows.ground_height_blend_depth),
+            ("groundAntiTile", shadows.ground_anti_tile as f32),
+            ("groundAntiTileStrength", shadows.ground_anti_tile_strength),
             // MONKEY (model relief): the model relief mode and its parallax depth.
             ("modelRelief", shadows.model_relief as f32),
             ("modelReliefDepth", shadows.model_relief_depth),
@@ -2182,7 +2193,7 @@ mod tests {
         // VideoConfig rows, 38 welds (MONKEY lampfog: + lampFog). MONKEY (wind): `foliageWind` is a world resource bridge.
         let welded: std::collections::BTreeSet<&str> = lighting.iter().map(|(n, _)| *n).collect();
         // MONKEY (volumetric fog): the atmospheric tier joins the default-consumer weld.
-        assert_eq!(welded.len(), 47, "the lighting lane welds 47 distinct rows"); // MONKEY (ground height blend): + groundHeightBlend, groundHeightBlendDepth; // MONKEY (ground relief): + groundRelief, groundReliefDepth; MONKEY (model relief): + modelRelief, modelReliefDepth
+        assert_eq!(welded.len(), 49, "the lighting lane welds 49 distinct rows"); // MONKEY (ground anti-tile): + groundAntiTile, groundAntiTileStrength; // MONKEY (ground height blend): + groundHeightBlend, groundHeightBlendDepth; // MONKEY (ground relief): + groundRelief, groundReliefDepth; MONKEY (model relief): + modelRelief, modelReliefDepth
         for name in &welded {
             assert!(
                 REGISTERED.iter().any(|r| r.name == *name),
@@ -2360,7 +2371,7 @@ mod tests {
     /// disjointness that lets both labels be right at once.
     #[test]
     fn graphics_rows_are_registered_and_disjoint_from_the_lighting_ladder() {
-        assert_eq!(GRAPHICS_PRESETS.len(), 16, "add the row count with the row"); // MONKEY (aniso): + anisotropic; // MONKEY (ground relief): + groundRelief; MONKEY (model relief): + modelRelief
+        assert_eq!(GRAPHICS_PRESETS.len(), 17, "add the row count with the row"); // MONKEY (ground anti-tile): + groundAntiTile; MONKEY (aniso): + anisotropic; // MONKEY (ground relief): + groundRelief; MONKEY (model relief): + modelRelief
         let cvars = fresh_registry();
         for (k, values) in GRAPHICS_PRESETS {
             assert!(cvars.get(k).is_some(), "{k}: not registered");
@@ -2686,6 +2697,8 @@ mod tests {
                     "groundRelief" => video.ground_relief as f32,
                     // MONKEY (model relief)
                     "modelRelief" => video.model_relief as f32,
+                    // MONKEY (ground anti-tile)
+                    "groundAntiTile" => video.ground_anti_tile as f32,
                     // MONKEY (aniso): the texture filter's own resource.
                     "anisotropic" => res::<benilla_assets::TexFilterSetting>(&app).aniso as f32,
                     _ => panic!("add the observer readback for {k}"),

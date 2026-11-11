@@ -538,6 +538,8 @@ pub struct TerrainExtension {
     /// MONKEY (ground height blend): second uniform lane of binding 106 (WGSL `TerrainParams.params_b`):
     /// `x` = height-aware layer blend on (0/1), `y` = its transition depth (0.01..0.2). Only read
     /// while the relief lane is on, so it never changes today's path.
+    /// MONKEY (ground anti-tile): `z` = anti-tile mode (0 off, 1 macro variation, 2 + far
+    /// dual-scale), `w` = its strength (0..2). `z == 0` is today's shader path exactly.
     #[uniform(106)]
     pub params_b: Vec4,
 
@@ -740,6 +742,127 @@ mod tests {
             "let score = h * g + w;",
             "let b = max(score - vec4<f32>(m), vec4<f32>(0.0)) * g;",
             "let hb_on = relief_on && t.params_b.x > 0.5;",
+        ] {
+            assert!(terrain.contains(needle), "terrain.wgsl drifted from the mirror: {needle}");
+        }
+    }
+
+    // ── MONKEY (ground anti-tile): Rust mirrors of `terrain.wgsl`'s anti-tile formulas ──────────
+    fn at_fract(x: f32) -> f32 {
+        x - x.floor()
+    }
+
+    fn at_hash(p: [f32; 2]) -> [f32; 2] {
+        let mut p3 = [
+            at_fract(p[0] * 0.1031),
+            at_fract(p[1] * 0.1030),
+            at_fract(p[0] * 0.0973),
+        ];
+        let d = p3[0] * (p3[1] + 33.33) + p3[1] * (p3[2] + 33.33) + p3[2] * (p3[0] + 33.33);
+        for c in &mut p3 {
+            *c += d;
+        }
+        [at_fract((p3[0] + p3[1]) * p3[2]), at_fract((p3[0] + p3[2]) * p3[1])]
+    }
+
+    fn at_noise(p: [f32; 2]) -> [f32; 2] {
+        let (i, f) = ([p[0].floor(), p[1].floor()], [at_fract(p[0]), at_fract(p[1])]);
+        let u = f.map(|x| x * x * (3.0 - 2.0 * x));
+        let h = |dx: f32, dy: f32| at_hash([i[0] + dx, i[1] + dy]);
+        let (a, b, c, d) = (h(0.0, 0.0), h(1.0, 0.0), h(0.0, 1.0), h(1.0, 1.0));
+        [0, 1].map(|k| {
+            let lo = a[k] + (b[k] - a[k]) * u[0];
+            let hi = c[k] + (d[k] - c[k]) * u[0];
+            lo + (hi - lo) * u[1]
+        })
+    }
+
+    /// Returns the colour factor and the final colour for a mid-grey-ish input.
+    fn at_macro(color: [f32; 3], xz: [f32; 2], strength: f32) -> [f32; 3] {
+        let n = at_noise([xz[0] / 25.0, xz[1] / 25.0]);
+        let c = [n[0] * 2.0 - 1.0, n[1] * 2.0 - 1.0];
+        let l = 0.299 * color[0] + 0.587 * color[1] + 0.114 * color[2];
+        let sat = 1.0 + 0.15 * strength * c[1];
+        let tint = [1.0 + 0.03 * strength * c[1], 1.0, 1.0 - 0.03 * strength * c[1]];
+        let bright = 1.0 + 0.08 * strength * c[0];
+        [0, 1, 2].map(|k| ((l + (color[k] - l) * sat) * tint[k] * bright).max(0.0))
+    }
+
+    fn at_far_k(dist: f32, strength: f32) -> f32 {
+        let t = ((dist - 30.0) / 50.0).clamp(0.0, 1.0);
+        t * t * (3.0 - 2.0 * t) * (0.5 * strength).clamp(0.0, 1.0)
+    }
+
+    #[test]
+    fn the_anti_tile_noise_is_bounded_continuous_and_zero_mean() {
+        let (mut sum, mut n) = ([0.0f64; 2], 0u32);
+        let mut prev: Option<[f32; 2]> = None;
+        for i in 0..4000 {
+            // A line crossing many cells, including negative coordinates (tile borders).
+            let x = -9000.0 + i as f32 * 0.37;
+            let v = at_noise([x / 25.0, 1234.5 / 25.0]);
+            assert!(v.iter().all(|c| (0.0..=1.0).contains(c)), "{v:?}");
+            if let Some(p) = prev {
+                // 0.37 yd is 0.0148 of a cell: the noise cannot jump.
+                assert!((v[0] - p[0]).abs() < 0.08 && (v[1] - p[1]).abs() < 0.08, "pops at {x}");
+            }
+            prev = Some(v);
+            sum[0] += v[0] as f64;
+            sum[1] += v[1] as f64;
+            n += 1;
+        }
+        for s in sum {
+            let mean = s / n as f64;
+            assert!((mean - 0.5).abs() < 0.06, "noise mean {mean} (zero-mean after *2-1)");
+        }
+    }
+
+    #[test]
+    fn the_anti_tile_macro_stays_inside_its_brightness_budget() {
+        let grey = [0.5, 0.5, 0.5];
+        let (mut lo, mut hi) = (f32::MAX, f32::MIN);
+        for i in 0..2000 {
+            let o = at_macro(grey, [i as f32 * 3.1 - 3000.0, i as f32 * 1.7], 1.0);
+            lo = lo.min(o[1]);
+            hi = hi.max(o[1]);
+        }
+        // Grey has no saturation to shift; the green channel carries only the +-8% brightness.
+        assert!(lo >= 0.5 * 0.92 - 1e-4 && hi <= 0.5 * 1.08 + 1e-4, "{lo}..{hi}");
+        assert!(hi - lo > 0.02, "the variation is actually there: {lo}..{hi}");
+        // Strength 0 is the identity.
+        assert_eq!(at_macro([0.3, 0.5, 0.2], [10.0, 20.0], 0.0), [0.3, 0.5, 0.2]);
+    }
+
+    #[test]
+    fn the_anti_tile_far_blend_ramps_between_30_and_80_yards() {
+        assert_eq!(at_far_k(0.0, 1.0), 0.0);
+        assert_eq!(at_far_k(30.0, 1.0), 0.0);
+        assert!((at_far_k(80.0, 1.0) - 0.5).abs() < 1e-6);
+        assert!((at_far_k(500.0, 2.0) - 1.0).abs() < 1e-6);
+        assert_eq!(at_far_k(500.0, 0.0), 0.0);
+        let mut prev = 0.0;
+        for d in 0..=1000 {
+            let k = at_far_k(d as f32 * 0.1, 1.0);
+            assert!(k >= prev, "monotonic");
+            prev = k;
+        }
+    }
+
+    #[test]
+    fn the_wgsl_uses_the_mirrored_anti_tile_formulas() {
+        let terrain = include_str!("shaders/terrain.wgsl");
+        for needle in [
+            "const ANTITILE_PERIOD_YD: f32 = 25.0;",
+            "const ANTITILE_FAR_START_YD: f32 = 30.0;",
+            "const ANTITILE_FAR_END_YD: f32 = 80.0;",
+            "const ANTITILE_FAR_FREQ: f32 = 0.37;",
+            "var p3 = fract(vec3<f32>(p.x, p.y, p.x) * vec3<f32>(0.1031, 0.1030, 0.0973));",
+            "let u = f * f * (vec2<f32>(3.0) - 2.0 * f);",
+            "let sat = 1.0 + 0.15 * strength * c.y;",
+            "o = o * vec3<f32>(1.0 + 0.03 * strength * c.y, 1.0, 1.0 - 0.03 * strength * c.y);",
+            "return max(o * (1.0 + 0.08 * strength * c.x), vec3<f32>(0.0));",
+            "let at_mode = i32(clamp(t.params_b.z + 0.5, 0.0, 2.0));",
+            "let at_k = smoothstep(ANTITILE_FAR_START_YD, ANTITILE_FAR_END_YD, at_d) * clamp(0.5 * at_str, 0.0, 1.0);",
         ] {
             assert!(terrain.contains(needle), "terrain.wgsl drifted from the mirror: {needle}");
         }
