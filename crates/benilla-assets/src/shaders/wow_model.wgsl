@@ -80,6 +80,8 @@ struct ModelParams {
     // MONKEY (model relief): x = 1 when `relief_texture` is this batch's relief map (else 0),
     // y = the `modelRelief` mode (0 off, 1 normals, 2/3 + WMO parallax, 4 debug height, 5 debug
     // normal), z = the parallax depth in world yards (`modelReliefDepth`).
+    // MONKEY (model gloss): w = the metal gloss strength (`modelGloss` * `modelGlossStrength`,
+    // 0 = off).
     relief: vec4<f32>,
 };
 @group(#{MATERIAL_BIND_GROUP}) @binding(100) var<uniform> m: ModelParams;
@@ -1108,6 +1110,48 @@ fn relief_sky_e(n: vec3<f32>, vcol: vec4<f32>, probe_slot: u32, raw_tag: u32, ha
     }
     _ = vertex_light(n, vec4<f32>(0.0), vcol, probe_slot, raw_tag);
     return monkey_vertex_sky;
+}
+
+// ── MONKEY (model gloss) ─────────────────────────────────────────────────────────────────────────
+// A cheap metal gloss on relief-mapped M2 models (weapons, armour, props): a Blinn-Phong sun
+// highlight on the relief-perturbed normal, masked to metal-looking texels. ALU only: the mask
+// reads the base colour and the relief cavity this fragment already has (no fetch). Rust mirror
+// and pin: `benilla_assets::model_relief` tests. **static_gx.wgsl carries the same constants and
+// functions; keep them in sync.**
+const GLOSS_POWER: f32 = 32.0;   // specular exponent
+const GLOSS_GAIN: f32 = 0.55;    // sun highlight gain
+const GLOSS_RIM: f32 = 2.0;      // extra highlight at grazing angles: spec *= 1 + RIM * fresnel
+const GLOSS_ENV: f32 = 0.10;     // fog-colour (sky stand-in) reflection: fog * fresnel * ENV
+const GLOSS_MAX_ADD: f32 = 0.6;  // per-channel cap on the added gloss
+
+// Metal-likeness of a base colour: low saturation at mid-high value (steel, silver), or a warm
+// high-value, mid-saturation hue (gold, brass); times the cavity (B: crevices do not shine).
+fn gloss_mask(c: vec3<f32>, cavity: f32) -> f32 {
+    let mx = max(max(c.r, c.g), c.b);
+    let mn = min(min(c.r, c.g), c.b);
+    let sat = (mx - mn) / max(mx, 1e-3);
+    let neutral = (1.0 - smoothstep(0.15, 0.35, sat)) * smoothstep(0.18, 0.45, mx);
+    let warm = smoothstep(0.0, 0.08, c.r - c.g) * smoothstep(0.0, 0.08, c.g - c.b);
+    let gold = 0.8 * warm * smoothstep(0.35, 0.5, sat) * (1.0 - smoothstep(0.75, 0.95, sat))
+        * smoothstep(0.55, 0.8, mx);
+    return max(neutral, gold) * clamp(cavity, 0.0, 1.0);
+}
+
+// The gloss added to the lit gamma colour. `day` fades the sun term where the sun light is the
+// moon (dim `light_diffuse`); the sky term rides the fog colour; both scale with `mask` and the
+// strength dial, and the sum is capped so it never blows out.
+fn gloss_add(mask: f32, strength: f32, n: vec3<f32>, to_view: vec3<f32>, to_light: vec3<f32>,
+    base: vec3<f32>, sun_rgb: vec3<f32>, sky_rgb: vec3<f32>, shadow: f32) -> vec3<f32> {
+    let h = normalize(to_light + to_view + vec3<f32>(0.0, 1.0e-4, 0.0));
+    let nl = max(dot(n, to_light), 0.0);
+    let fres = pow(1.0 - clamp(dot(n, to_view), 0.0, 1.0), 4.0);
+    let spec = pow(max(dot(n, h), 0.0), GLOSS_POWER) * (1.0 + GLOSS_RIM * fres)
+        * smoothstep(0.0, 0.15, nl);
+    let day = smoothstep(0.2, 0.5, max(max(sun_rgb.r, sun_rgb.g), sun_rgb.b));
+    let tint = mix(vec3<f32>(1.0), base, 0.5);
+    let sun = tint * sun_rgb * (GLOSS_GAIN * spec * shadow * day);
+    let sky = sky_rgb * (fres * GLOSS_ENV);
+    return min((sun + sky) * (mask * strength), vec3<f32>(GLOSS_MAX_ADD));
 }
 
 // The vertex input — bevy 0.18's `forward_io::Vertex` fields at bevy's shader locations (the
@@ -2194,9 +2238,26 @@ fn fragment(in: WowVsOut, @builtin(front_facing) is_front: bool) -> WowFragOut {
         wet = wet_hook::wet_body(rgb, n_shade, rain_wet, instance_wet);
     }
     rgb = wet.albedo;
-    if (wet.boost > 0.0) {
-        rgb = min(rgb + wet_hook::wet_sheen(wet.boost, n_shade, normalize(view.world_position - in.world_position.xyz),
-            L, wow_light.light_diffuse.rgb, wow_light.fog_color.rgb, player_shadow), vec3<f32>(1.0));
+    // MONKEY (model gloss): the metal sun highlight, on a relief-mapped (`relief_on`: lit, plain
+    // blend, no additive / Mod / Mod2x / env / emissive) M2 batch only - never a WMO, an interior
+    // or the glue rig. A UNIFORM gate (the lane, flags, directional-sun enable); with `modelGloss 0`
+    // (`m.relief.w` = 0) or no map nothing below runs but today's wet sheen. It stacks with the
+    // wet look by MAX (one specular, not two): a wet metal shows the stronger of the two.
+    let gloss_on = relief_on && m.relief.w > 0.0 && !is_wmo && !is_interior && !is_rig
+        && wow_light.light_sun.w > 0.5;
+    if (wet.boost > 0.0 || gloss_on) {
+        let to_view = normalize(view.world_position - in.world_position.xyz);
+        var spec_add = vec3<f32>(0.0);
+        if (wet.boost > 0.0) {
+            spec_add = wet_hook::wet_sheen(wet.boost, n_shade, to_view,
+                L, wow_light.light_diffuse.rgb, wow_light.fog_color.rgb, player_shadow);
+        }
+        if (gloss_on) {
+            spec_add = max(spec_add, gloss_add(gloss_mask(base.rgb, relief.b), m.relief.w, n_shade,
+                to_view, L, base.rgb, wow_light.light_diffuse.rgb, wow_light.fog_color.rgb,
+                player_shadow));
+        }
+        rgb = min(rgb + spec_add, vec3<f32>(1.0));
     }
 
     // Linear fog by planar eye depth, as in terrain.wgsl. Per-batch colour policy (`clutter_fade.z`

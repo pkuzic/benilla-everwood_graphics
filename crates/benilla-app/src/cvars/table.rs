@@ -732,6 +732,17 @@ pub(crate) const REGISTERED: &[Registered] = &[
         "0.05",
         "benilla's own: depth of the building parallax relief in yards, 0..0.2 (0.05 = default)",
     ),
+    // MONKEY (model gloss): the sun highlight on metal-looking relief-mapped models.
+    ours(
+        "modelGloss",
+        "1",
+        "benilla's own: sun gloss on metal weapons, armour and props that have a relief map, 0 Off / 1 On",
+    ),
+    ours(
+        "modelGlossStrength",
+        "1",
+        "benilla's own: strength of the model metal gloss, 0..2 (1 = default)",
+    ),
     // MONKEY (p0 skyDither): the FFXGlow combine's deband dither (was env WOW_DITHER only).
     // Default 0 = the reference look; the Graphics preset's High sets 1.
     ours(

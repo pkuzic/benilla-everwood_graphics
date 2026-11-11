@@ -212,6 +212,9 @@ pub(crate) struct VideoConfig {
     // `benilla_world::model_render::ModelRelief` by `dynamic_interior::bridge`.
     pub(crate) model_relief: u8,
     pub(crate) model_relief_depth: f32,
+    /// MONKEY (model gloss): metal gloss on relief-mapped models, on/off and strength 0..2.
+    pub(crate) model_gloss: bool,
+    pub(crate) model_gloss_strength: f32,
     /// Brightness of lava lighting its surroundings, 0..4; 0 disables the glow.
     /// Published to `benilla_world::lighting::LavaLightGain` by `dynamic_interior::bridge`.
     pub(crate) lava_light_gain: f32,
@@ -498,6 +501,8 @@ impl Default for VideoConfig {
             // MONKEY (model relief): opt-in experiment, off in every preset.
             model_relief: 0,
             model_relief_depth: 0.05, // MONKEY (model relief): yards
+            model_gloss: true,        // MONKEY (model gloss)
+            model_gloss_strength: 1.0,
             lava_light_gain: 1.0,
             fire_flicker: 1.0,
             display: if windowed_env() {
@@ -726,6 +731,9 @@ impl VideoKnobs<'_> {
             // MONKEY (model relief): 0 is meaningful (today's models, bit for bit).
             "modelrelief" => cfg.model_relief = v.clamp(0.0, 5.0) as u8,
             "modelreliefdepth" => cfg.model_relief_depth = v.clamp(0.0, 0.2), // MONKEY (model relief): yards
+            // MONKEY (model gloss): 0 is meaningful (today's models, bit for bit).
+            "modelgloss" => cfg.model_gloss = v != 0.0,
+            "modelglossstrength" => cfg.model_gloss_strength = v.clamp(0.0, 2.0),
             "lavalightgain" => cfg.lava_light_gain = v.clamp(0.0, 4.0),
             "worldshadows" => cfg.world_shadows = ev.flag(),
             "charactershadows" => cfg.character_shadows = ev.flag(),

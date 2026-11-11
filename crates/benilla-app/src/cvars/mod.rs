@@ -1290,6 +1290,9 @@ pub(crate) const GRAPHICS_PRESETS: &[(&str, [&str; 5])] = &[
     ("groundRelief",         ["0",    "0",   "0",      "0",    "0"]),
     // MONKEY (model relief): the same opt-in experiment on WMO + doodad textures — off everywhere.
     ("modelRelief",          ["0",    "0",   "0",      "0",    "0"]),
+    // MONKEY (model gloss): the metal sun highlight is ALU-only (no fetch) and acts only where a
+    // relief map is bound; Classic and Low keep the reference's flat models.
+    ("modelGloss",           ["0",    "0",   "1",      "1",    "1"]),
     // MONKEY (ground anti-tile): colour-only anti-tiling; Macro is ALU-only, 2 adds 4 far taps.
     ("groundAntiTile",       ["0",    "0",   "1",      "2",    "2"]),
     // MONKEY (aniso): anisotropic filtering keeps the ground sharp at a grazing angle (near free on
@@ -1392,6 +1395,12 @@ fn session_values(world: &World) -> Vec<(&'static str, Option<String>)> {
         let v = world.get_resource::<benilla_world::terrain_stream::GroundRelief>();
         out.push(("groundAntiTile", v.map(|g| g.anti_tile.to_string())));
         out.push(("groundAntiTileStrength", v.map(|g| g.anti_tile_strength.to_string())));
+    }
+    // MONKEY (model gloss): the env levers seed `ModelRelief`; the session owns the rows.
+    if set("MONKEY_MODEL_GLOSS") || set("MONKEY_MODEL_GLOSS_STRENGTH") {
+        let v = world.get_resource::<benilla_world::model_render::ModelRelief>();
+        out.push(("modelGloss", v.map(|g| if g.gloss > 0.0 { "1" } else { "0" }.to_string())));
+        out.push(("modelGlossStrength", v.map(|g| g.gloss.to_string())));
     }
     // `$WOW_HOST` is the session's realmlist, which a test run must never write into the file.
     if set("WOW_HOST") {
@@ -2111,7 +2120,7 @@ mod tests {
         let shadows = VideoConfig::default();
         let flag = |b: bool| if b { 1.0 } else { 0.0 };
         // MONKEY (volumetric fog): include the atmospheric tier in this fixed-size default table.
-        let lighting: [(&str, f32); 49] = [
+        let lighting: [(&str, f32); 51] = [
             // GFX (volumetric light) / (moonlight): the three new rows.
             ("volumetricLight", shadows.volumetric_light as f32),
             ("volumetricLightStrength", shadows.volumetric_light_strength),
@@ -2126,6 +2135,9 @@ mod tests {
             // MONKEY (model relief): the model relief mode and its parallax depth.
             ("modelRelief", shadows.model_relief as f32),
             ("modelReliefDepth", shadows.model_relief_depth),
+            // MONKEY (model gloss): the metal gloss toggle and its strength.
+            ("modelGloss", flag(shadows.model_gloss)),
+            ("modelGlossStrength", shadows.model_gloss_strength),
             ("waterQuality", shadows.water_quality as f32),
             // MONKEY (volumetric fog): weld registry and renderer defaults.
             ("volumetricFog", shadows.volumetric_fog as f32),
@@ -2193,7 +2205,7 @@ mod tests {
         // VideoConfig rows, 38 welds (MONKEY lampfog: + lampFog). MONKEY (wind): `foliageWind` is a world resource bridge.
         let welded: std::collections::BTreeSet<&str> = lighting.iter().map(|(n, _)| *n).collect();
         // MONKEY (volumetric fog): the atmospheric tier joins the default-consumer weld.
-        assert_eq!(welded.len(), 49, "the lighting lane welds 49 distinct rows"); // MONKEY (ground anti-tile): + groundAntiTile, groundAntiTileStrength; // MONKEY (ground height blend): + groundHeightBlend, groundHeightBlendDepth; // MONKEY (ground relief): + groundRelief, groundReliefDepth; MONKEY (model relief): + modelRelief, modelReliefDepth
+        assert_eq!(welded.len(), 51, "the lighting lane welds 51 distinct rows"); // MONKEY (model gloss): + modelGloss, modelGlossStrength; MONKEY (ground anti-tile): + groundAntiTile, groundAntiTileStrength; // MONKEY (ground height blend): + groundHeightBlend, groundHeightBlendDepth; // MONKEY (ground relief): + groundRelief, groundReliefDepth; MONKEY (model relief): + modelRelief, modelReliefDepth
         for name in &welded {
             assert!(
                 REGISTERED.iter().any(|r| r.name == *name),
@@ -2371,7 +2383,7 @@ mod tests {
     /// disjointness that lets both labels be right at once.
     #[test]
     fn graphics_rows_are_registered_and_disjoint_from_the_lighting_ladder() {
-        assert_eq!(GRAPHICS_PRESETS.len(), 17, "add the row count with the row"); // MONKEY (ground anti-tile): + groundAntiTile; MONKEY (aniso): + anisotropic; // MONKEY (ground relief): + groundRelief; MONKEY (model relief): + modelRelief
+        assert_eq!(GRAPHICS_PRESETS.len(), 18, "add the row count with the row"); // MONKEY (model gloss): + modelGloss; MONKEY (ground anti-tile): + groundAntiTile; MONKEY (aniso): + anisotropic; // MONKEY (ground relief): + groundRelief; MONKEY (model relief): + modelRelief
         let cvars = fresh_registry();
         for (k, values) in GRAPHICS_PRESETS {
             assert!(cvars.get(k).is_some(), "{k}: not registered");
@@ -2697,6 +2709,8 @@ mod tests {
                     "groundRelief" => video.ground_relief as f32,
                     // MONKEY (model relief)
                     "modelRelief" => video.model_relief as f32,
+                    // MONKEY (model gloss)
+                    "modelGloss" => if video.model_gloss { 1.0 } else { 0.0 },
                     // MONKEY (ground anti-tile)
                     "groundAntiTile" => video.ground_anti_tile as f32,
                     // MONKEY (aniso): the texture filter's own resource.

@@ -207,6 +207,20 @@ pub fn set_model_relief_dials(mode: u8, depth: f32) {
     DIAL_DEPTH.store(depth.to_bits(), Ordering::Relaxed);
 }
 
+/// MONKEY (model gloss): the live `modelGloss` * `modelGlossStrength` product (0 = off), as bits.
+static DIAL_GLOSS: AtomicU32 = AtomicU32::new(0);
+
+/// MONKEY (model gloss): publish the gloss dial: `strength` is 0 with `modelGloss 0`, else the
+/// `modelGlossStrength` value (0..2).
+pub fn set_model_gloss_dial(strength: f32) {
+    DIAL_GLOSS.store(strength.clamp(0.0, 2.0).to_bits(), Ordering::Relaxed);
+}
+
+/// MONKEY (model gloss): the gloss strength as last published (0 until then: off).
+pub fn model_gloss_dial() -> f32 {
+    f32::from_bits(DIAL_GLOSS.load(Ordering::Relaxed))
+}
+
 /// MONKEY (model relief): the dials as last published (`0, 0.0` until then: off).
 pub fn model_relief_dials() -> (u8, f32) {
     (
@@ -216,14 +230,15 @@ pub fn model_relief_dials() -> (u8, f32) {
 }
 
 /// MONKEY (model relief): the `WowModelExt::relief` lane for a material with this map:
-/// `x` = 1, `y` = mode, `z` = depth (`Vec4::ZERO` without a map — such a material never reads
+/// `x` = 1, `y` = mode, `z` = depth, `w` = the model gloss strength (MONKEY (model gloss): 0 = off;
+/// `Vec4::ZERO` without a map — such a material never reads
 /// the dials, so a dial change does not touch it).
 pub fn model_relief_params(has_map: bool) -> Vec4 {
     if !has_map {
         return Vec4::ZERO;
     }
     let (mode, depth) = model_relief_dials();
-    Vec4::new(1.0, f32::from(mode), depth, 0.0)
+    Vec4::new(1.0, f32::from(mode), depth, model_gloss_dial())
 }
 
 /// MONKEY (model relief): what a `WowModelExt` builder fills for base texture `texture`: the
@@ -337,5 +352,146 @@ mod tests {
     fn a_material_without_a_map_has_a_zero_lane() {
         assert_eq!(model_relief_params(false), Vec4::ZERO);
         assert_eq!(model_relief_params(true).x, 1.0);
+    }
+
+    // ── MONKEY (model gloss): Rust mirrors of `wow_model.wgsl`'s gloss formulas ─────────────────
+    fn ss(e0: f32, e1: f32, x: f32) -> f32 {
+        let t = ((x - e0) / (e1 - e0)).clamp(0.0, 1.0);
+        t * t * (3.0 - 2.0 * t)
+    }
+
+    fn mirror_gloss_mask(c: [f32; 3], cavity: f32) -> f32 {
+        let mx = c[0].max(c[1]).max(c[2]);
+        let mn = c[0].min(c[1]).min(c[2]);
+        let sat = (mx - mn) / mx.max(1e-3);
+        let neutral = (1.0 - ss(0.15, 0.35, sat)) * ss(0.18, 0.45, mx);
+        let warm = ss(0.0, 0.08, c[0] - c[1]) * ss(0.0, 0.08, c[1] - c[2]);
+        let gold = 0.8 * warm * ss(0.35, 0.5, sat) * (1.0 - ss(0.75, 0.95, sat)) * ss(0.55, 0.8, mx);
+        neutral.max(gold) * cavity.clamp(0.0, 1.0)
+    }
+
+    fn dot3(a: [f32; 3], b: [f32; 3]) -> f32 {
+        a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+    }
+
+    fn norm3(a: [f32; 3]) -> [f32; 3] {
+        let l = dot3(a, a).sqrt();
+        [a[0] / l, a[1] / l, a[2] / l]
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn mirror_gloss_add(
+        mask: f32,
+        strength: f32,
+        n: [f32; 3],
+        v: [f32; 3],
+        l: [f32; 3],
+        base: [f32; 3],
+        sun: [f32; 3],
+        sky: [f32; 3],
+        shadow: f32,
+    ) -> [f32; 3] {
+        let h = norm3([l[0] + v[0], l[1] + v[1] + 1.0e-4, l[2] + v[2]]);
+        let nl = dot3(n, l).max(0.0);
+        let fres = (1.0 - dot3(n, v).clamp(0.0, 1.0)).powf(4.0);
+        let spec = dot3(n, h).max(0.0).powf(32.0) * (1.0 + 2.0 * fres) * ss(0.0, 0.15, nl);
+        let day = ss(0.2, 0.5, sun[0].max(sun[1]).max(sun[2]));
+        let mut out = [0.0; 3];
+        for i in 0..3 {
+            let tint = 0.5 + 0.5 * base[i]; // mix(1, base, 0.5)
+            let s = tint * sun[i] * (0.55 * spec * shadow * day) + sky[i] * (fres * 0.10);
+            out[i] = (s * (mask * strength)).min(0.6);
+        }
+        out
+    }
+
+    #[test]
+    fn the_gloss_mask_picks_metal_and_skips_the_rest() {
+        let steel = mirror_gloss_mask([0.6, 0.62, 0.65], 1.0);
+        let gold = mirror_gloss_mask([0.85, 0.65, 0.25], 1.0);
+        let wood = mirror_gloss_mask([0.45, 0.28, 0.12], 1.0);
+        let red = mirror_gloss_mask([0.8, 0.1, 0.1], 1.0);
+        let dark = mirror_gloss_mask([0.08, 0.08, 0.09], 1.0);
+        let green = mirror_gloss_mask([0.2, 0.7, 0.2], 1.0);
+        assert!(steel > 0.95, "steel {steel}");
+        assert!(gold > 0.4, "gold {gold}");
+        assert!(wood < 0.05, "wood {wood}");
+        assert!(red < 0.05 && green < 0.05, "saturated cloth {red} {green}");
+        assert!(dark < 0.05, "dark metal/leather {dark}");
+        // The cavity scales it; a closed crevice shines nothing.
+        assert_eq!(mirror_gloss_mask([0.6, 0.62, 0.65], 0.0), 0.0);
+        assert!((mirror_gloss_mask([0.6, 0.62, 0.65], 0.5) - steel * 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn the_gloss_highlight_peaks_at_the_half_vector_and_respects_shadow_night_and_cap() {
+        let n = [0.0, 0.0, 1.0];
+        let l = norm3([0.4, 0.0, 1.0]);
+        let v = norm3([-0.4, 0.0, 1.0]); // half vector = n: the mirror direction
+        let base = [0.6, 0.6, 0.6];
+        let day = [0.9, 0.9, 0.85];
+        let sky = [0.5, 0.6, 0.8];
+        let peak = mirror_gloss_add(1.0, 1.0, n, v, l, base, day, sky, 1.0);
+        let off = mirror_gloss_add(1.0, 1.0, n, norm3([-0.9, 0.0, 0.3]), l, base, day, sky, 1.0);
+        assert!(peak[0] > off[0] * 3.0, "tight highlight: {peak:?} vs {off:?}");
+        assert!(peak.iter().all(|c| *c <= 0.6 && *c > 0.0), "{peak:?}");
+        // In shadow only the faint sky term remains (the face-on fresnel is ~0).
+        let shaded = mirror_gloss_add(1.0, 1.0, n, v, l, base, day, sky, 0.0);
+        assert!(shaded[0] < 0.01, "{shaded:?}");
+        // The moon's dim sun light gives no highlight.
+        let night = mirror_gloss_add(1.0, 1.0, n, v, l, base, [0.1, 0.1, 0.2], sky, 1.0);
+        assert!(night[0] < 0.01, "{night:?}");
+        // No mask or no strength: exactly nothing; strength scales linearly below the cap.
+        assert_eq!(mirror_gloss_add(0.0, 1.0, n, v, l, base, day, sky, 1.0), [0.0; 3]);
+        assert_eq!(mirror_gloss_add(1.0, 0.0, n, v, l, base, day, sky, 1.0), [0.0; 3]);
+        let half = mirror_gloss_add(0.5, 1.0, n, v, l, base, day, sky, 1.0);
+        assert!((half[0] - peak[0] * 0.5).abs() < 1e-5);
+        // A grazing view picks up the fresnel sky term.
+        let g = norm3([0.99, 0.0, 0.1]);
+        let graze = mirror_gloss_add(1.0, 1.0, n, g, g, base, day, sky, 1.0);
+        assert!(graze[2] > 0.0);
+    }
+
+    #[test]
+    fn the_wgsl_uses_the_mirrored_gloss_formulas() {
+        let model = include_str!("shaders/wow_model.wgsl");
+        for needle in [
+            "const GLOSS_POWER: f32 = 32.0;",
+            "const GLOSS_GAIN: f32 = 0.55;",
+            "const GLOSS_RIM: f32 = 2.0;",
+            "const GLOSS_ENV: f32 = 0.10;",
+            "const GLOSS_MAX_ADD: f32 = 0.6;",
+            "let sat = (mx - mn) / max(mx, 1e-3);",
+            "let neutral = (1.0 - smoothstep(0.15, 0.35, sat)) * smoothstep(0.18, 0.45, mx);",
+            "let warm = smoothstep(0.0, 0.08, c.r - c.g) * smoothstep(0.0, 0.08, c.g - c.b);",
+            "let gold = 0.8 * warm * smoothstep(0.35, 0.5, sat) * (1.0 - smoothstep(0.75, 0.95, sat))",
+            "* smoothstep(0.55, 0.8, mx);",
+            "return max(neutral, gold) * clamp(cavity, 0.0, 1.0);",
+            "let fres = pow(1.0 - clamp(dot(n, to_view), 0.0, 1.0), 4.0);",
+            "let spec = pow(max(dot(n, h), 0.0), GLOSS_POWER) * (1.0 + GLOSS_RIM * fres)",
+            "* smoothstep(0.0, 0.15, nl);",
+            "let day = smoothstep(0.2, 0.5, max(max(sun_rgb.r, sun_rgb.g), sun_rgb.b));",
+            "let tint = mix(vec3<f32>(1.0), base, 0.5);",
+            "let sun = tint * sun_rgb * (GLOSS_GAIN * spec * shadow * day);",
+            "let sky = sky_rgb * (fres * GLOSS_ENV);",
+            "return min((sun + sky) * (mask * strength), vec3<f32>(GLOSS_MAX_ADD));",
+            // The gate: relief lane, the strength lane, never a WMO / interior / rig.
+            "let gloss_on = relief_on && m.relief.w > 0.0 && !is_wmo && !is_interior && !is_rig",
+            "spec_add = max(spec_add, gloss_add(gloss_mask(base.rgb, relief.b), m.relief.w, n_shade,",
+        ] {
+            assert!(model.contains(needle), "wow_model.wgsl drifted from the gloss mirror: {needle}");
+        }
+    }
+
+    #[test]
+    fn the_gloss_dial_rides_the_relief_lane_w_of_a_mapped_material_only() {
+        // One test owns the process-wide dials (the other test here reads only `.x` / zero).
+        set_model_gloss_dial(1.5);
+        assert_eq!(model_relief_params(true).w, 1.5);
+        assert_eq!(model_relief_params(false), Vec4::ZERO);
+        set_model_gloss_dial(9.0);
+        assert_eq!(model_gloss_dial(), 2.0, "clamped to 0..2");
+        set_model_gloss_dial(0.0);
+        assert_eq!(model_relief_params(true).w, 0.0);
     }
 }

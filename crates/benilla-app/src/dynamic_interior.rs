@@ -85,6 +85,7 @@ fn bridge(
         let want = benilla_world::model_render::ModelRelief {
             mode: video.model_relief,
             depth: video.model_relief_depth,
+            gloss: if video.model_gloss { video.model_gloss_strength } else { 0.0 }, // MONKEY (model gloss)
         };
         if *model_relief != want {
             *model_relief = want;

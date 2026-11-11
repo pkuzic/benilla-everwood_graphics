@@ -21,6 +21,18 @@ use benilla_assets::model_relief::{
 pub struct ModelRelief {
     pub mode: u8,
     pub depth: f32,
+    /// MONKEY (model gloss): the metal gloss strength, `modelGloss` * `modelGlossStrength`
+    /// (0 = off, 0..2). Rides the `relief` lane's `w`, so it only reaches materials with a relief
+    /// map. `MONKEY_MODEL_GLOSS=0|1`, `MONKEY_MODEL_GLOSS_STRENGTH=<0..2>` seed it.
+    pub gloss: f32,
+}
+
+/// MONKEY (model gloss): the env seeds, parsed apart so a test can drive them (`None` = unset):
+/// on by default at strength 1; the result is the single strength dial (0 when switched off).
+pub fn gloss_from_env(on: Option<&str>, strength: Option<&str>) -> f32 {
+    let on = on.and_then(|v| v.trim().parse::<f32>().ok()).map_or(true, |v| v != 0.0);
+    let s = strength.and_then(|v| v.trim().parse::<f32>().ok()).map_or(1.0, |v| v.clamp(0.0, 2.0));
+    if on { s } else { 0.0 }
 }
 
 impl Default for ModelRelief {
@@ -34,6 +46,10 @@ impl Default for ModelRelief {
         Self {
             mode: env.first().map_or(0, |m| m.clamp(0.0, 5.0) as u8),
             depth: env.get(1).map_or(0.05, |d| d.clamp(0.0, 0.2)), // MONKEY (model relief): yards
+            gloss: gloss_from_env(
+                std::env::var("MONKEY_MODEL_GLOSS").ok().as_deref(),
+                std::env::var("MONKEY_MODEL_GLOSS_STRENGTH").ok().as_deref(),
+            ),
         }
     }
 }
@@ -74,6 +90,7 @@ pub(super) fn monkey_sync_model_relief(
     let dials_changed = relief.is_changed();
     if dials_changed {
         set_model_relief_dials(relief.mode, relief.depth);
+        benilla_assets::model_relief::set_model_gloss_dial(relief.gloss); // MONKEY (model gloss)
     }
     let added: Vec<AssetId<WowModelMaterial>> = events
         .read()
@@ -107,6 +124,41 @@ pub(super) fn monkey_sync_model_relief(
         if let Some(m) = materials.get_mut(id) {
             m.extension.relief_texture = tex;
             m.extension.relief = lane;
+        }
+    }
+}
+
+#[cfg(test)]
+mod gloss_tests {
+    use super::gloss_from_env;
+
+    /// MONKEY (model gloss): on at strength 1 by default; off wins; the strength clamps to 0..2.
+    #[test]
+    fn the_gloss_env_seeds_parse_and_clamp() {
+        assert_eq!(gloss_from_env(None, None), 1.0);
+        assert_eq!(gloss_from_env(Some("0"), None), 0.0);
+        assert_eq!(gloss_from_env(Some("1"), Some("0.5")), 0.5);
+        assert_eq!(gloss_from_env(None, Some("9")), 2.0);
+        assert_eq!(gloss_from_env(Some("0"), Some("2")), 0.0);
+        assert_eq!(gloss_from_env(Some("x"), Some("y")), 1.0);
+    }
+
+    /// MONKEY (model gloss): the retained pass carries the same gloss constants and gate as the
+    /// entity shader, and never glosses a WMO surface.
+    #[test]
+    fn static_gx_carries_the_same_gloss_and_skips_wmo() {
+        let src = include_str!("../shaders/static_gx.wgsl");
+        for needle in [
+            "const GLOSS_POWER: f32 = 32.0;",
+            "const GLOSS_GAIN: f32 = 0.55;",
+            "const GLOSS_RIM: f32 = 2.0;",
+            "const GLOSS_ENV: f32 = 0.10;",
+            "const GLOSS_MAX_ADD: f32 = 0.6;",
+            "return max(neutral, gold) * clamp(cavity, 0.0, 1.0);",
+            "return min((sun + sky) * (mask * strength), vec3<f32>(GLOSS_MAX_ADD));",
+            "let gloss_on = relief_on && relief_dial.dial.z > 0.0 && (in.word & WORD_WMO) == 0u",
+        ] {
+            assert!(src.contains(needle), "static_gx.wgsl drifted from the gloss mirror: {needle}");
         }
     }
 }

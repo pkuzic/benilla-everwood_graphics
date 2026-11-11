@@ -228,7 +228,13 @@ impl GxReliefPool {
         } else {
             (0, 0.0)
         };
-        let words = [f32::from(mode), depth, 0.0, 0.0];
+        // MONKEY (model gloss): z = the metal gloss strength (0 = off).
+        let words = [
+            f32::from(mode),
+            depth,
+            benilla_assets::model_relief::model_gloss_dial(),
+            0.0,
+        ];
         if self.dial_written != Some(words) {
             render_queue.write_buffer(&self.dial, 0, bytemuck::cast_slice(&words));
             self.dial_written = Some(words);

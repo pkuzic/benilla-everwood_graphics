@@ -151,6 +151,8 @@ pub struct WowModelExt {
     /// parallax depth (`modelReliefDepth`, world yards). Zero on every material without a map, so a
     /// dial change re-prepares only relief materials (`benilla_world`'s
     /// `monkey_sync_model_relief`). `x == 0` or `y == 0` is today's shader path exactly.
+    /// MONKEY (model gloss): `w` = the metal gloss strength (`modelGloss` * `modelGlossStrength`,
+    /// 0..2; 0 = off, the shader then runs today's instructions).
     #[uniform(100)]
     pub relief: Vec4,
     /// Stage 1's texture, sampled when `stage1.x` is set; `None` binds the fallback image, unread.

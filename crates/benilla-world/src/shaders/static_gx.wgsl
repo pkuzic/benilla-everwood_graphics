@@ -108,11 +108,54 @@ struct GxCell {
 @group(1) @binding(5) var relief_array: texture_2d_array<f32>;
 // MONKEY (model relief): the live `modelRelief` dials, one buffer shared by every region: x = the
 // mode (0 off, 1 normals, 2/3 + WMO parallax, 4 debug height, 5 debug normal), y = the parallax
-// depth in world yards (`modelReliefDepth`). A dial change rewrites only this.
+// depth in world yards (`modelReliefDepth`), z = MONKEY (model gloss): the metal gloss strength
+// (`modelGloss` * `modelGlossStrength`, 0 = off). A dial change rewrites only this.
 struct GxReliefDial {
     dial: vec4<f32>,
 }
 @group(1) @binding(6) var<uniform> relief_dial: GxReliefDial;
+
+// ── MONKEY (model gloss) ─────────────────────────────────────────────────────────────────────────
+// A cheap metal gloss on relief-mapped M2 models (weapons, armour, props): a Blinn-Phong sun
+// highlight on the relief-perturbed normal, masked to metal-looking texels. ALU only: the mask
+// reads the base colour and the relief cavity this fragment already has (no fetch). Rust mirror
+// and pin: `benilla_assets::model_relief` tests. **this is the retained pass's copy of wow_model.wgsl's constants
+// and functions; keep them in sync.**
+const GLOSS_POWER: f32 = 32.0;   // specular exponent
+const GLOSS_GAIN: f32 = 0.55;    // sun highlight gain
+const GLOSS_RIM: f32 = 2.0;      // extra highlight at grazing angles: spec *= 1 + RIM * fresnel
+const GLOSS_ENV: f32 = 0.10;     // fog-colour (sky stand-in) reflection: fog * fresnel * ENV
+const GLOSS_MAX_ADD: f32 = 0.6;  // per-channel cap on the added gloss
+
+// Metal-likeness of a base colour: low saturation at mid-high value (steel, silver), or a warm
+// high-value, mid-saturation hue (gold, brass); times the cavity (B: crevices do not shine).
+fn gloss_mask(c: vec3<f32>, cavity: f32) -> f32 {
+    let mx = max(max(c.r, c.g), c.b);
+    let mn = min(min(c.r, c.g), c.b);
+    let sat = (mx - mn) / max(mx, 1e-3);
+    let neutral = (1.0 - smoothstep(0.15, 0.35, sat)) * smoothstep(0.18, 0.45, mx);
+    let warm = smoothstep(0.0, 0.08, c.r - c.g) * smoothstep(0.0, 0.08, c.g - c.b);
+    let gold = 0.8 * warm * smoothstep(0.35, 0.5, sat) * (1.0 - smoothstep(0.75, 0.95, sat))
+        * smoothstep(0.55, 0.8, mx);
+    return max(neutral, gold) * clamp(cavity, 0.0, 1.0);
+}
+
+// The gloss added to the lit gamma colour. `day` fades the sun term where the sun light is the
+// moon (dim `light_diffuse`); the sky term rides the fog colour; both scale with `mask` and the
+// strength dial, and the sum is capped so it never blows out.
+fn gloss_add(mask: f32, strength: f32, n: vec3<f32>, to_view: vec3<f32>, to_light: vec3<f32>,
+    base: vec3<f32>, sun_rgb: vec3<f32>, sky_rgb: vec3<f32>, shadow: f32) -> vec3<f32> {
+    let h = normalize(to_light + to_view + vec3<f32>(0.0, 1.0e-4, 0.0));
+    let nl = max(dot(n, to_light), 0.0);
+    let fres = pow(1.0 - clamp(dot(n, to_view), 0.0, 1.0), 4.0);
+    let spec = pow(max(dot(n, h), 0.0), GLOSS_POWER) * (1.0 + GLOSS_RIM * fres)
+        * smoothstep(0.0, 0.15, nl);
+    let day = smoothstep(0.2, 0.5, max(max(sun_rgb.r, sun_rgb.g), sun_rgb.b));
+    let tint = mix(vec3<f32>(1.0), base, 0.5);
+    let sun = tint * sun_rgb * (GLOSS_GAIN * spec * shadow * day);
+    let sky = sky_rgb * (fres * GLOSS_ENV);
+    return min((sun + sky) * (mask * strength), vec3<f32>(GLOSS_MAX_ADD));
+}
 
 // ── MONKEY (model relief) ────────────────────────────────────────────────────────────────────────
 // The entity lane's relief (`wow_model.wgsl`, "MONKEY (model relief)") ported to the retained
@@ -1485,6 +1528,18 @@ fn gx_wet_sheen(boost: f32, n_lit: vec3<f32>, P: vec3<f32>, shadow: f32) -> vec3
         wow_light.light_diffuse.rgb, wow_light.fog_color.rgb, shadow);
 }
 
+// MONKEY (model gloss): the metal gloss of a fragment, the sun its highlight. Lives here (not in
+// the fragment) because the fragment never reads the light rows; zero without a directional sun.
+fn gx_gloss(mask: f32, strength: f32, n: vec3<f32>, P: vec3<f32>, base: vec3<f32>, shadow: f32)
+    -> vec3<f32> {
+    if (wow_light.light_sun.w <= 0.5) {
+        return vec3<f32>(0.0);
+    }
+    let L = -normalize(wow_light.light_sun.xyz);
+    return gloss_add(mask, strength, n, normalize(view.world_position - P), L, base,
+        wow_light.light_diffuse.rgb, wow_light.fog_color.rgb, shadow);
+}
+
 // The lit colour at one vertex, `wow_model.wgsl`'s `vertex_light` over the flag words: the
 // reference lights per vertex and interpolates the clamped colour, the vertex colour inside the
 // clamp as the lit material. Both faces light from the submitted normal (no
@@ -2447,10 +2502,21 @@ fn fragment(in: GxVsOut) -> @location(0) vec4<f32> {
         select(1.0, 0.0, (in.word & (WORD_INTERIOR | WORD_UNLIT | WORD_WINDOW)) != 0u) * wet_open,
         wow_light.monkey);
     rgb = wet.albedo;
-    if (wet.boost > 0.0) {
-        // MONKEY (model relief): the wet sheen takes the shading normal.
-        rgb = min(rgb + gx_wet_sheen(wet.boost, n_shade, in.world_position.xyz, world_shadow),
-            vec3<f32>(1.0));
+    // MONKEY (model gloss): wow_model.wgsl's metal gloss, on relief-mapped doodad (M2) statics only:
+    // not a WMO surface, not an interior batch, not wind foliage. Stacks with the wet sheen by MAX.
+    let gloss_on = relief_on && relief_dial.dial.z > 0.0 && (in.word & WORD_WMO) == 0u
+        && (in.word & (WORD_INTERIOR | WORD_FOLIAGE_WIND)) == 0u;
+    if (wet.boost > 0.0 || gloss_on) {
+        var spec_add = vec3<f32>(0.0);
+        if (wet.boost > 0.0) {
+            // MONKEY (model relief): the wet sheen takes the shading normal.
+            spec_add = gx_wet_sheen(wet.boost, n_shade, in.world_position.xyz, world_shadow);
+        }
+        if (gloss_on) {
+            spec_add = max(spec_add, gx_gloss(gloss_mask(base.rgb, relief.b), relief_dial.dial.z,
+                n_shade, in.world_position.xyz, base.rgb, world_shadow));
+        }
+        rgb = min(rgb + spec_add, vec3<f32>(1.0));
     }
     // Planar eye-Z fog; other fog modes belong to blends never admitted here. The interior triple
     // keys on the per-frame record bit, not `WORD_INTERIOR`: the client sets it per group under
